@@ -168,4 +168,6 @@ check-cfg = [
     'cfg(target_has_reliable_f16_math)',
     'cfg(target_has_reliable_f128)',
     'cfg(target_has_reliable_f128_math)',
+    # #[cfg(bootstrap)] rtems
+    'cfg(target_os, values("rtems", "blueos"))',
 ]

@@ -32,6 +32,7 @@ use libc::fstatat64;
     target_os = "solaris",
     target_os = "vita",
     target_os = "wasi",
+    target_os = "blueos",
     all(target_os = "linux", target_env = "musl"),
 ))]
 use libc::readdir as readdir64;
@@ -49,6 +50,7 @@ use libc::readdir as readdir64;
     target_os = "solaris",
     target_os = "vita",
     target_os = "wasi",
+    target_os = "blueos",
 )))]
 use libc::readdir_r as readdir64_r;
 #[cfg(any(all(target_os = "linux", not(target_env = "musl")), target_os = "hurd"))]
@@ -414,6 +416,7 @@ fn get_path_from_fd(fd: c_int) -> Option<PathBuf> {
     target_os = "solaris",
     target_os = "vita",
     target_os = "wasi",
+    target_os = "blueos",
 ))]
 pub struct DirEntry {
     dir: Arc<InnerReadDir>,
@@ -440,6 +443,7 @@ pub struct DirEntry {
     target_os = "solaris",
     target_os = "vita",
     target_os = "wasi",
+    target_os = "blueos",
 ))]
 struct dirent64_min {
     d_ino: u64,
@@ -449,6 +453,7 @@ struct dirent64_min {
         target_os = "aix",
         target_os = "nto",
         target_os = "vita",
+        target_os = "blueos",
     )))]
     d_type: u8,
 }
@@ -466,6 +471,7 @@ struct dirent64_min {
     target_os = "solaris",
     target_os = "vita",
     target_os = "wasi",
+    target_os = "blueos",
 )))]
 pub struct DirEntry {
     dir: Arc<InnerReadDir>,
@@ -621,6 +627,7 @@ impl FileAttr {
         target_os = "hurd",
         target_os = "rtems",
         target_os = "nuttx",
+        target_os = "blueos",
     )))]
     pub fn modified(&self) -> io::Result<SystemTime> {
         #[cfg(target_pointer_width = "32")]
@@ -638,6 +645,7 @@ impl FileAttr {
         target_os = "espidf",
         target_os = "vita",
         target_os = "rtems",
+        target_os = "blueos",
     ))]
     pub fn modified(&self) -> io::Result<SystemTime> {
         SystemTime::new(self.stat.st_mtime as i64, 0)
@@ -661,6 +669,7 @@ impl FileAttr {
         target_os = "hurd",
         target_os = "rtems",
         target_os = "nuttx",
+        target_os = "blueos",
     )))]
     pub fn accessed(&self) -> io::Result<SystemTime> {
         #[cfg(target_pointer_width = "32")]
@@ -678,6 +687,7 @@ impl FileAttr {
         target_os = "espidf",
         target_os = "vita",
         target_os = "rtems"
+        target_os = "blueos",
     ))]
     pub fn accessed(&self) -> io::Result<SystemTime> {
         SystemTime::new(self.stat.st_atime as i64, 0)
@@ -709,6 +719,7 @@ impl FileAttr {
         target_os = "vita",
         target_vendor = "apple",
         target_os = "cygwin",
+        target_os = "blueos",
     )))]
     pub fn created(&self) -> io::Result<SystemTime> {
         cfg_has_statx! {
@@ -730,7 +741,7 @@ impl FileAttr {
         ))
     }
 
-    #[cfg(target_os = "vita")]
+    #[cfg(any(target_os = "vita", target_os = "blueos"))]
     pub fn created(&self) -> io::Result<SystemTime> {
         SystemTime::new(self.stat.st_ctime as i64, 0)
     }
@@ -858,6 +869,7 @@ impl Iterator for ReadDir {
         target_os = "solaris",
         target_os = "vita",
         target_os = "wasi",
+        target_os = "blueos",
     ))]
     fn next(&mut self) -> Option<io::Result<DirEntry>> {
         use crate::sys::io::{errno, set_errno};
@@ -927,6 +939,7 @@ impl Iterator for ReadDir {
                         target_os = "illumos",
                         target_os = "aix",
                         target_os = "nto",
+                        target_os = "blueos",
                     )))]
                     d_type: (*entry_ptr).d_type as u8,
                 };
@@ -956,6 +969,7 @@ impl Iterator for ReadDir {
         target_os = "solaris",
         target_os = "vita",
         target_os = "wasi",
+        target_os = "blueos",
     )))]
     fn next(&mut self) -> Option<io::Result<DirEntry>> {
         if self.end_of_stream {
@@ -1022,6 +1036,7 @@ impl Drop for DirStream {
             target_os = "vxworks",
             target_os = "rtems",
             target_os = "nuttx",
+            target_os = "blueos",
         )))]
         {
             let fd = unsafe { libc::dirfd(self.0) };
@@ -1104,6 +1119,7 @@ impl DirEntry {
         target_os = "aix",
         target_os = "nto",
         target_os = "vita",
+        target_os = "blueos",
     ))]
     pub fn file_type(&self) -> io::Result<FileType> {
         self.metadata().map(|m| m.file_type())
@@ -1117,6 +1133,7 @@ impl DirEntry {
         target_os = "aix",
         target_os = "nto",
         target_os = "vita",
+        target_os = "blueos",
     )))]
     pub fn file_type(&self) -> io::Result<FileType> {
         match self.entry.d_type {
@@ -1153,6 +1170,7 @@ impl DirEntry {
         target_os = "vxworks",
         target_os = "wasi",
         target_vendor = "apple",
+        target_os = "blueos",
     ))]
     pub fn ino(&self) -> u64 {
         self.entry.d_ino as u64
@@ -1208,6 +1226,7 @@ impl DirEntry {
         target_os = "vita",
         target_os = "hurd",
         target_os = "wasi",
+        target_os = "blueos",
     )))]
     fn name_cstr(&self) -> &CStr {
         unsafe { CStr::from_ptr(self.entry.d_name.as_ptr()) }
@@ -1225,6 +1244,7 @@ impl DirEntry {
         target_os = "vita",
         target_os = "hurd",
         target_os = "wasi",
+        target_os = "blueos",
     ))]
     fn name_cstr(&self) -> &CStr {
         &self.name
@@ -2151,6 +2171,7 @@ pub fn link(original: &CStr, link: &CStr) -> io::Result<()> {
             target_os = "horizon",
             target_os = "vita",
             target_env = "nto70",
+            target_os = "blueos",
         ) => {
             cvt(unsafe { libc::link(original.as_ptr(), link.as_ptr()) })?;
         }
@@ -2515,6 +2536,7 @@ pub use remove_dir_impl::remove_dir_all;
     target_os = "espidf",
     target_os = "horizon",
     target_os = "vita",
+    target_os = "blueos",
     target_os = "nto",
     target_os = "vxworks",
     miri
@@ -2531,6 +2553,7 @@ mod remove_dir_impl {
     target_os = "vita",
     target_os = "nto",
     target_os = "vxworks",
+    target_os = "blueos",
     miri
 )))]
 mod remove_dir_impl {

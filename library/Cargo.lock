@@ -40,9 +40,7 @@ dependencies = [
 
 [[package]]
 name = "cc"
-version = "1.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1aeb932158bd710538c73702db6945cb68a8fb08c519e6e12706b94263b36db8"
+version = "1.2.28"
 dependencies = [
  "shlex",
 ]
@@ -147,8 +145,6 @@ dependencies = [
 [[package]]
 name = "libc"
 version = "0.2.183"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b5b646652bf6661599e1da8901b3b9522896f01e736bad5f723fe7a3a27f899d"
 dependencies = [
  "rustc-std-workspace-core",
 ]

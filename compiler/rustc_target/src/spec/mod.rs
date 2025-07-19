@@ -1828,6 +1828,12 @@ supported_targets! {
     ("x86_64-unknown-linux-gnuasan", x86_64_unknown_linux_gnuasan),
     ("x86_64-unknown-linux-gnumsan", x86_64_unknown_linux_gnumsan),
     ("x86_64-unknown-linux-gnutsan", x86_64_unknown_linux_gnutsan),
+    ("thumbv7m-vivo-blueos-newlibeabi", thumbv7m_vivo_blueos_newlibeabi),
+    ("thumbv8m.main-vivo-blueos-newlibeabihf", thumbv8m_main_vivo_blueos_newlibeabihf),
+    ("aarch64-vivo-blueos-newlib", aarch64_vivo_blueos_newlib),
+    ("riscv64-vivo-blueos", riscv64_vivo_blueos),
+    ("riscv32-vivo-blueos", riscv32_vivo_blueos),
+    ("riscv32imc-vivo-blueos", riscv32imc_vivo_blueos),
 }
 
 /// Cow-Vec-Str: Cow<'static, [Cow<'static, str>]>

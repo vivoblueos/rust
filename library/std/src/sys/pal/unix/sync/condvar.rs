@@ -142,6 +142,7 @@ impl Condvar {
     target_os = "l4re",
     target_os = "redox",
     target_os = "teeos",
+    target_os = "blueos",
 )))]
 impl Condvar {
     pub const PRECISE_TIMEOUT: bool = true;
@@ -197,6 +198,7 @@ impl Condvar {
     target_os = "l4re",
     target_os = "redox",
     target_os = "teeos",
+    target_os = "blueos",
 ))]
 impl Condvar {
     pub const PRECISE_TIMEOUT: bool = false;
