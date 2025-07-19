@@ -80,6 +80,7 @@ pub unsafe fn init(argc: isize, argv: *const *const u8, sigpipe: u8) {
             target_os = "rtems",
             // The poll on Darwin doesn't set POLLNVAL for closed fds.
             target_vendor = "apple",
+            target_os = "blueos",
         )))]
         'poll: {
             #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
@@ -135,6 +136,7 @@ pub unsafe fn init(argc: isize, argv: *const *const u8, sigpipe: u8) {
             target_os = "l4re",
             target_os = "horizon",
             target_os = "vita",
+            target_os = "blueos",
         )))]
         {
             #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
@@ -167,6 +169,7 @@ pub unsafe fn init(argc: isize, argv: *const *const u8, sigpipe: u8) {
             // Unikraft's `signal` implementation is currently broken:
             // https://github.com/unikraft/lib-musl/issues/57
             target_vendor = "unikraft",
+            target_os = "blueos",
         )))]
         {
             // We don't want to add this as a public type to std, nor do we
@@ -211,6 +214,7 @@ pub unsafe fn init(argc: isize, argv: *const *const u8, sigpipe: u8) {
     target_os = "horizon",
     target_os = "vxworks",
     target_os = "vita",
+    target_os = "blueos",
 )))]
 static ON_BROKEN_PIPE_FLAG_USED: crate::sync::atomic::AtomicBool =
     crate::sync::atomic::AtomicBool::new(false);
@@ -223,6 +227,7 @@ static ON_BROKEN_PIPE_FLAG_USED: crate::sync::atomic::AtomicBool =
     target_os = "vxworks",
     target_os = "vita",
     target_os = "nuttx",
+    target_os = "blueos",
 )))]
 pub(crate) fn on_broken_pipe_flag_used() -> bool {
     ON_BROKEN_PIPE_FLAG_USED.load(crate::sync::atomic::Ordering::Relaxed)
@@ -426,7 +431,13 @@ cfg_if::cfg_if! {
     }
 }
 
-#[cfg(any(target_os = "espidf", target_os = "horizon", target_os = "vita", target_os = "nuttx"))]
+#[cfg(any(
+    target_os = "espidf",
+    target_os = "horizon",
+    target_os = "vita",
+    target_os = "nuttx",
+    target_os = "blueos",
+))]
 mod unsupported {
     use crate::io;
 

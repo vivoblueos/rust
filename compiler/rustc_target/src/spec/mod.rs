@@ -1947,7 +1947,12 @@ supported_targets! {
     ("riscv32imafc-unknown-nuttx-elf", riscv32imafc_unknown_nuttx_elf),
     ("riscv64imac-unknown-nuttx-elf", riscv64imac_unknown_nuttx_elf),
     ("riscv64gc-unknown-nuttx-elf", riscv64gc_unknown_nuttx_elf),
-
+    ("thumbv7m-vivo-blueos-newlibeabi", thumbv7m_vivo_blueos_newlibeabi),
+    ("thumbv8m.main-vivo-blueos-newlibeabihf", thumbv8m_main_vivo_blueos_newlibeabihf),
+    ("aarch64-vivo-blueos-newlib", aarch64_vivo_blueos_newlib),
+    ("riscv64-vivo-blueos", riscv64_vivo_blueos),
+    ("riscv32-vivo-blueos", riscv32_vivo_blueos),
+    ("riscv32imc-vivo-blueos", riscv32imc_vivo_blueos),
 }
 
 /// Cow-Vec-Str: Cow<'static, [Cow<'static, str>]>

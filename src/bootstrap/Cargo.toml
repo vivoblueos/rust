@@ -91,3 +91,8 @@ debug = 0
 [profile.dev.package]
 # Only use debuginfo=1 to further reduce compile times.
 bootstrap.debug = 1
+
+[patch.crates-io]
+# We're using https://source.android.com/docs/setup/reference/repo to manage BlueOS project
+# and repo manages the hierarchy of the project.
+cc = { path = "../../../cc-rs" }

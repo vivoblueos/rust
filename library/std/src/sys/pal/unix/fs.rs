@@ -28,6 +28,7 @@ use libc::fstatat64;
     target_os = "aix",
     target_os = "nto",
     target_os = "vita",
+    target_os = "blueos",
     all(target_os = "linux", target_env = "musl"),
 ))]
 use libc::readdir as readdir64;
@@ -43,6 +44,7 @@ use libc::readdir as readdir64;
     target_os = "aix",
     target_os = "nto",
     target_os = "vita",
+    target_os = "blueos",
     target_os = "hurd",
 )))]
 use libc::readdir_r as readdir64_r;
@@ -276,6 +278,7 @@ unsafe impl Sync for Dir {}
     target_os = "aix",
     target_os = "nto",
     target_os = "vita",
+    target_os = "blueos",
     target_os = "hurd",
 ))]
 pub struct DirEntry {
@@ -300,6 +303,7 @@ pub struct DirEntry {
     target_os = "aix",
     target_os = "nto",
     target_os = "vita",
+    target_os = "blueos",
     target_os = "hurd",
 ))]
 struct dirent64_min {
@@ -310,6 +314,7 @@ struct dirent64_min {
         target_os = "aix",
         target_os = "nto",
         target_os = "vita",
+        target_os = "blueos",
     )))]
     d_type: u8,
 }
@@ -324,6 +329,7 @@ struct dirent64_min {
     target_os = "aix",
     target_os = "nto",
     target_os = "vita",
+    target_os = "blueos",
     target_os = "hurd",
 )))]
 pub struct DirEntry {
@@ -477,6 +483,7 @@ impl FileAttr {
         target_os = "espidf",
         target_os = "horizon",
         target_os = "vita",
+        target_os = "blueos",
         target_os = "hurd",
         target_os = "rtems",
         target_os = "nuttx",
@@ -496,6 +503,7 @@ impl FileAttr {
         target_os = "vxworks",
         target_os = "espidf",
         target_os = "vita",
+        target_os = "blueos",
         target_os = "rtems",
     ))]
     pub fn modified(&self) -> io::Result<SystemTime> {
@@ -512,6 +520,7 @@ impl FileAttr {
         target_os = "espidf",
         target_os = "horizon",
         target_os = "vita",
+        target_os = "blueos",
         target_os = "hurd",
         target_os = "rtems",
         target_os = "nuttx",
@@ -531,6 +540,7 @@ impl FileAttr {
         target_os = "vxworks",
         target_os = "espidf",
         target_os = "vita",
+        target_os = "blueos",
         target_os = "rtems"
     ))]
     pub fn accessed(&self) -> io::Result<SystemTime> {
@@ -551,6 +561,7 @@ impl FileAttr {
         target_os = "freebsd",
         target_os = "openbsd",
         target_os = "vita",
+        target_os = "blueos",
         target_vendor = "apple",
     )))]
     pub fn created(&self) -> io::Result<SystemTime> {
@@ -574,7 +585,7 @@ impl FileAttr {
         ))
     }
 
-    #[cfg(target_os = "vita")]
+    #[cfg(any(target_os = "vita", target_os = "blueos"))]
     pub fn created(&self) -> io::Result<SystemTime> {
         SystemTime::new(self.stat.st_ctime as i64, 0)
     }
@@ -698,6 +709,7 @@ impl Iterator for ReadDir {
         target_os = "aix",
         target_os = "nto",
         target_os = "vita",
+        target_os = "blueos",
         target_os = "hurd",
     ))]
     fn next(&mut self) -> Option<io::Result<DirEntry>> {
@@ -775,6 +787,7 @@ impl Iterator for ReadDir {
                         target_os = "illumos",
                         target_os = "aix",
                         target_os = "nto",
+                        target_os = "blueos",
                     )))]
                     d_type: *offset_ptr!(entry_ptr, d_type) as u8,
                 };
@@ -801,6 +814,7 @@ impl Iterator for ReadDir {
         target_os = "aix",
         target_os = "nto",
         target_os = "vita",
+        target_os = "blueos",
         target_os = "hurd",
     )))]
     fn next(&mut self) -> Option<io::Result<DirEntry>> {
@@ -862,6 +876,7 @@ impl Drop for Dir {
             target_os = "redox",
             target_os = "nto",
             target_os = "vita",
+            target_os = "blueos",
             target_os = "hurd",
             target_os = "espidf",
             target_os = "fuchsia",
@@ -942,6 +957,7 @@ impl DirEntry {
         target_os = "aix",
         target_os = "nto",
         target_os = "vita",
+        target_os = "blueos",
     ))]
     pub fn file_type(&self) -> io::Result<FileType> {
         self.metadata().map(|m| m.file_type())
@@ -955,6 +971,7 @@ impl DirEntry {
         target_os = "aix",
         target_os = "nto",
         target_os = "vita",
+        target_os = "blueos",
     )))]
     pub fn file_type(&self) -> io::Result<FileType> {
         match self.entry.d_type {
@@ -983,6 +1000,7 @@ impl DirEntry {
         target_os = "espidf",
         target_os = "horizon",
         target_os = "vita",
+        target_os = "blueos",
         target_os = "aix",
         target_os = "nto",
         target_os = "hurd",
@@ -1047,6 +1065,7 @@ impl DirEntry {
         target_os = "aix",
         target_os = "nto",
         target_os = "vita",
+        target_os = "blueos",
         target_os = "hurd",
     )))]
     fn name_cstr(&self) -> &CStr {
@@ -1062,6 +1081,7 @@ impl DirEntry {
         target_os = "aix",
         target_os = "nto",
         target_os = "vita",
+        target_os = "blueos",
         target_os = "hurd",
     ))]
     fn name_cstr(&self) -> &CStr {
@@ -1859,7 +1879,7 @@ pub fn link(original: &Path, link: &Path) -> io::Result<()> {
     run_path_with_cstr(original, &|original| {
         run_path_with_cstr(link, &|link| {
             cfg_if::cfg_if! {
-                if #[cfg(any(target_os = "vxworks", target_os = "redox", target_os = "android", target_os = "espidf", target_os = "horizon", target_os = "vita", target_env = "nto70"))] {
+                if #[cfg(any(target_os = "vxworks", target_os = "redox", target_os = "android", target_os = "espidf", target_os = "horizon", target_os = "vita", target_env = "nto70", target_os = "blueos",))] {
                     // VxWorks, Redox and ESP-IDF lack `linkat`, so use `link` instead. POSIX leaves
                     // it implementation-defined whether `link` follows symlinks, so rely on the
                     // `symlink_hard_link` test in library/std/src/fs/tests.rs to check the behavior.
@@ -2112,6 +2132,7 @@ pub use remove_dir_impl::remove_dir_all;
     target_os = "espidf",
     target_os = "horizon",
     target_os = "vita",
+    target_os = "blueos",
     target_os = "nto",
     target_os = "vxworks",
     miri
@@ -2126,6 +2147,7 @@ mod remove_dir_impl {
     target_os = "espidf",
     target_os = "horizon",
     target_os = "vita",
+    target_os = "blueos",
     target_os = "nto",
     target_os = "vxworks",
     miri

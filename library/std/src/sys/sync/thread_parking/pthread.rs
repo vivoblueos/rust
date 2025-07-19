@@ -109,6 +109,7 @@ impl Parker {
                 target_os = "android",
                 target_os = "redox",
                 target_os = "vita",
+                target_os = "blueos",
                 target_vendor = "apple",
             ))] {
                 (&raw mut (*parker).cvar).write(UnsafeCell::new(libc::PTHREAD_COND_INITIALIZER));

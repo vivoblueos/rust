@@ -228,7 +228,7 @@ mod imp {
     }
 }
 
-#[cfg(any(target_os = "espidf", target_os = "vita"))]
+#[cfg(any(target_os = "espidf", target_os = "vita", target_os = "blueos"))]
 mod imp {
     use crate::ffi::c_char;
     use crate::ptr;

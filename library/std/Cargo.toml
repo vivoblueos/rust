@@ -145,5 +145,5 @@ check-cfg = [
     # of declared features, we therefor expect any feature cfg
     'cfg(feature, values(any()))',
     # #[cfg(bootstrap)] rtems
-    'cfg(target_os, values("rtems"))',
+    'cfg(target_os, values("rtems", "blueos"))',
 ]

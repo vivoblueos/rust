@@ -75,6 +75,7 @@ const fn max_iov() -> usize {
     target_os = "openbsd",
     target_os = "horizon",
     target_os = "vita",
+    target_os = "blueos",
     target_vendor = "apple",
 )))]
 const fn max_iov() -> usize {
@@ -102,6 +103,7 @@ impl FileDesc {
         target_os = "espidf",
         target_os = "horizon",
         target_os = "vita",
+        target_os = "blueos",
         target_os = "nuttx"
     )))]
     pub fn read_vectored(&self, bufs: &mut [IoSliceMut<'_>]) -> io::Result<usize> {
@@ -119,6 +121,7 @@ impl FileDesc {
         target_os = "espidf",
         target_os = "horizon",
         target_os = "vita",
+        target_os = "blueos",
         target_os = "nuttx"
     ))]
     pub fn read_vectored(&self, bufs: &mut [IoSliceMut<'_>]) -> io::Result<usize> {
@@ -131,6 +134,7 @@ impl FileDesc {
             target_os = "espidf",
             target_os = "horizon",
             target_os = "vita",
+            target_os = "blueos",
             target_os = "nuttx"
         )))
     }
@@ -316,6 +320,7 @@ impl FileDesc {
         target_os = "espidf",
         target_os = "horizon",
         target_os = "vita",
+        target_os = "blueos",
         target_os = "nuttx"
     )))]
     pub fn write_vectored(&self, bufs: &[IoSlice<'_>]) -> io::Result<usize> {
@@ -333,6 +338,7 @@ impl FileDesc {
         target_os = "espidf",
         target_os = "horizon",
         target_os = "vita",
+        target_os = "blueos",
         target_os = "nuttx"
     ))]
     pub fn write_vectored(&self, bufs: &[IoSlice<'_>]) -> io::Result<usize> {
@@ -345,6 +351,7 @@ impl FileDesc {
             target_os = "espidf",
             target_os = "horizon",
             target_os = "vita",
+            target_os = "blueos",
             target_os = "nuttx"
         )))
     }
@@ -516,7 +523,12 @@ impl FileDesc {
     #[cfg(any(
         all(
             target_env = "newlib",
-            not(any(target_os = "espidf", target_os = "horizon", target_os = "vita"))
+            not(any(
+                target_os = "espidf",
+                target_os = "horizon",
+                target_os = "vita",
+                target_os = "blueos",
+            ))
         ),
         target_os = "solaris",
         target_os = "illumos",
@@ -539,7 +551,12 @@ impl FileDesc {
             Ok(())
         }
     }
-    #[cfg(any(target_os = "espidf", target_os = "horizon", target_os = "vita"))]
+    #[cfg(any(
+        target_os = "espidf",
+        target_os = "horizon",
+        target_os = "vita",
+        target_os = "blueos",
+    ))]
     pub fn set_cloexec(&self) -> io::Result<()> {
         // FD_CLOEXEC is not supported in ESP-IDF, Horizon OS and Vita but there's no need to,
         // because none of them supports spawning processes.

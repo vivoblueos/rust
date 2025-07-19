@@ -5,7 +5,13 @@ pub use crate::ffi::OsString as EnvKey;
 #[cfg_attr(any(target_os = "espidf", target_os = "horizon", target_os = "nuttx"), allow(unused))]
 mod process_common;
 
-#[cfg(any(target_os = "espidf", target_os = "horizon", target_os = "vita", target_os = "nuttx"))]
+#[cfg(any(
+    target_os = "espidf",
+    target_os = "horizon",
+    target_os = "vita",
+    target_os = "blueos",
+    target_os = "nuttx",
+))]
 mod process_unsupported;
 
 cfg_if::cfg_if! {
@@ -16,7 +22,7 @@ cfg_if::cfg_if! {
     } else if #[cfg(target_os = "vxworks")] {
         #[path = "process_vxworks.rs"]
         mod process_inner;
-    } else if #[cfg(any(target_os = "espidf", target_os = "horizon", target_os = "vita", target_os = "nuttx"))] {
+    } else if #[cfg(any(target_os = "espidf", target_os = "horizon", target_os = "vita", target_os = "blueos", target_os = "nuttx",))] {
         mod process_inner {
             pub use super::process_unsupported::*;
         }
