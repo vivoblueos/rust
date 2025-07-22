@@ -12,7 +12,7 @@ linker = "arm-none-eabi-gcc"
 ar = "arm-none-eabi-ar"
 ranlib = "arm-none-eabi-ranlib"
 
-[target."thumbv8m.main-vivo-blueos-newlibeabi"]
+[target."thumbv8m.main-vivo-blueos-newlibeabihf"]
 cc = "arm-none-eabi-gcc"
 cxx = "arm-none-eabi-g++"
 linker = "arm-none-eabi-gcc"
