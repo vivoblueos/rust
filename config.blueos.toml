@@ -49,9 +49,11 @@ ranlib = "llvm-ranlib"
 
 [target.x86_64-unknown-linux-gnu]
 profiler = true
+sanitizers = true
 
 [target.aarch64-apple-darwin]
 profiler = true
+sanitizers = true
 
 [rust]
 omit-git-hash = false
