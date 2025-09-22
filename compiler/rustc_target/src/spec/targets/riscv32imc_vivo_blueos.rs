@@ -1,4 +1,4 @@
-use crate::spec::{PanicStrategy, RelocModel, Target, TargetOptions, cvs};
+use crate::spec::{PanicStrategy, RelocModel, Target, TargetOptions, TlsModel, cvs};
 
 pub(crate) fn target() -> Target {
     Target {
@@ -16,6 +16,7 @@ pub(crate) fn target() -> Target {
             families: cvs!["unix"],
             os: "blueos".into(),
             env: "newlib".into(),
+            tls_model: TlsModel::Emulated,
             vendor: "vivo".into(),
             linker: Some("rust-lld".into()),
             cpu: "generic-rv32".into(),
