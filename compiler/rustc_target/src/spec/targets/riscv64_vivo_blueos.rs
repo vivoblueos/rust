@@ -29,7 +29,7 @@ pub(crate) fn target() -> Target {
             max_atomic_width: Some(64),
             features: "+m,+a,+c".into(),
             panic_strategy: PanicStrategy::Abort,
-            relocation_model: RelocModel::Static,
+            relocation_model: RelocModel::Pic,
             code_model: Some(CodeModel::Medium),
             emit_debug_gdb_scripts: false,
             eh_frame_header: false,
