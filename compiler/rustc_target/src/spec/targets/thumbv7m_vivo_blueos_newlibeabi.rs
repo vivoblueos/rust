@@ -1,6 +1,6 @@
 // Targets the Cortex-M4 processor (ARMv7-M)
 
-use crate::spec::{Cc, LinkerFlavor, Lld, Target, TargetOptions, TlsModel, base, cvs};
+use crate::spec::{Cc, LinkerFlavor, Lld, RelocModel, Target, TargetOptions, TlsModel, base, cvs};
 
 pub(crate) fn target() -> Target {
     Target {
@@ -24,6 +24,8 @@ pub(crate) fn target() -> Target {
             max_atomic_width: Some(32),
             linker: Some("arm-none-eabi-gcc".into()),
             linker_flavor: LinkerFlavor::Gnu(Cc::Yes, Lld::No),
+            relocation_model: RelocModel::Pic,
+            dynamic_linking: true,
             ..base::thumb::opts()
         },
     }
