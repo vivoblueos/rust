@@ -64,5 +64,4 @@ strip = true
 compression-formats = ["xz"]
 
 [llvm]
-clang = true
 download-ci-llvm = false
