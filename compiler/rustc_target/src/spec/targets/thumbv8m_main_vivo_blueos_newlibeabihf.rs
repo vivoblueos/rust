@@ -1,9 +1,14 @@
 // Targets the Cortex-M33 processor (Armv8-M Mainline architecture profile),
 // with the Floating Point extension.
 
-use crate::spec::{Cc, LinkerFlavor, Lld, Target, TargetOptions, TlsModel, base, cvs};
+use crate::spec::{Cc, LinkerFlavor, Lld, RelocModel, Target, TargetOptions, TlsModel, base, cvs};
 
 pub(crate) fn target() -> Target {
+    let mut base = base::thumb::opts();
+    base.add_pre_link_args(
+        LinkerFlavor::Gnu(Cc::Yes, Lld::No),
+        &["-mfloat-abi=hard", "-march=armv8.1-m.main+mve.fp+fp.dp"],
+    );
     Target {
         llvm_target: "thumbv8m.main-none-eabihf".into(),
         metadata: crate::spec::TargetMetadata {
@@ -26,7 +31,9 @@ pub(crate) fn target() -> Target {
             max_atomic_width: Some(32),
             linker: Some("arm-none-eabi-gcc".into()),
             linker_flavor: LinkerFlavor::Gnu(Cc::Yes, Lld::No),
-            ..base::thumb::opts()
+            relocation_model: RelocModel::Pic,
+            dynamic_linking: true,
+            ..base
         },
     }
 }
