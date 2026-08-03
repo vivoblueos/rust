@@ -2,7 +2,7 @@ pub use self::process_common::{Command, CommandArgs, ExitCode, Stdio, StdioPipes
 pub use self::process_inner::{ExitStatus, ExitStatusError, Process};
 pub use crate::ffi::OsString as EnvKey;
 
-#[cfg_attr(any(target_os = "espidf", target_os = "horizon", target_os = "nuttx"), allow(unused))]
+#[cfg_attr(any(target_os = "espidf", target_os = "horizon", target_os = "nuttx", target_os = "blueos"), allow(unused))]
 mod process_common;
 
 #[cfg(any(
