@@ -1,4 +1,4 @@
-#[cfg_attr(any(target_os = "espidf", target_os = "horizon", target_os = "nuttx"), allow(unused))]
+#[cfg_attr(any(target_os = "espidf", target_os = "horizon", target_os = "nuttx", target_os = "blueos"), allow(unused))]
 mod common;
 
 cfg_select! {
