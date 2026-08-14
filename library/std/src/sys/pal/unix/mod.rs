@@ -39,7 +39,7 @@ pub unsafe fn init(argc: isize, argv: *const *const u8, sigpipe: u8) {
     reset_sigpipe(sigpipe);
 
     stack_overflow::init();
-    #[cfg(not(target_os = "vita"))]
+    #[cfg(not(any(target_os = "vita", target_os = "blueos")))]
     crate::sys::args::init(argc, argv);
 
     // Normally, `thread::spawn` will call `Thread::set_name` but since this thread

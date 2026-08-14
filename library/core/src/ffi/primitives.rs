@@ -108,10 +108,14 @@ mod c_char_definition {
         //   architecture defaults). As we only have a target for userspace apps so there are no
         //   special cases for L4Re below.
         //   https://github.com/rust-lang/rust/pull/132975#issuecomment-2484645240
+        //
+        // BlueOS:
+        //   BlueOS compiles C code with `-fsigned-char`, so c_char is i8.
         all(
             not(windows),
             not(target_vendor = "apple"),
             not(target_os = "vita"),
+            not(target_os = "blueos"),
             any(
                 target_arch = "aarch64",
                 target_arch = "arm",

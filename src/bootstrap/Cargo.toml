@@ -98,4 +98,4 @@ bootstrap.debug = 1
 [patch.crates-io]
 # We're using https://source.android.com/docs/setup/reference/repo to manage BlueOS project
 # and repo manages the hierarchy of the project.
-cc = { path = "../../../cc-rs" }
+cc = { git = "https://github.com/wangchen-vivo/cc-rs", branch = "blueos/cc-v1.2.28", version = "=1.2.28" }

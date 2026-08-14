@@ -1,12 +1,12 @@
 use crate::spec::{
-    Cc, CodeModel, LinkerFlavor, Lld, PanicStrategy, RelocModel, SanitizerSet, Target,
-    TargetOptions, TlsModel, cvs,
+    Arch, Cc, CodeModel, Env, LinkerFlavor, LlvmAbi, Lld, Os, PanicStrategy, RelocModel,
+    SanitizerSet, Target, TargetMetadata, TargetOptions, TlsModel, cvs,
 };
 
 pub(crate) fn target() -> Target {
     Target {
         data_layout: "e-m:e-p:64:64-i64:64-i128:128-n32:64-S128".into(),
-        metadata: crate::spec::TargetMetadata {
+        metadata: TargetMetadata {
             description: Some("vivo BlueOS on Bare RISC-V (RV64IMAC ISA)".into()),
             tier: Some(3),
             host_tools: Some(false),
@@ -14,17 +14,17 @@ pub(crate) fn target() -> Target {
         },
         llvm_target: "riscv64".into(),
         pointer_width: 64,
-        arch: "riscv64".into(),
+        arch: Arch::RiscV64,
 
         options: TargetOptions {
             families: cvs!["unix"],
             vendor: "vivo".into(),
-            os: "blueos".into(),
-            env: "newlib".into(),
+            os: Os::Other("blueos".into()),
+            env: Env::Newlib,
             tls_model: TlsModel::Emulated,
             linker_flavor: LinkerFlavor::Gnu(Cc::No, Lld::Yes),
             linker: Some("rust-lld".into()),
-            llvm_abiname: "lp64".into(),
+            llvm_abiname: LlvmAbi::Lp64,
             cpu: "generic-rv64".into(),
             max_atomic_width: Some(64),
             features: "+m,+a,+c".into(),
