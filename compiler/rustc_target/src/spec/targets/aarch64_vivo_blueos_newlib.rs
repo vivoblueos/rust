@@ -7,7 +7,7 @@
 // For example, `-C target-cpu=cortex-a53`.
 
 use crate::spec::{
-    Arch, Cc, LinkerFlavor, Lld, Os, Env, PanicStrategy, RelocModel, SanitizerSet, StackProbeType,
+    Arch, Cc, Env, LinkerFlavor, Lld, Os, PanicStrategy, RelocModel, SanitizerSet, StackProbeType,
     Target, TargetMetadata, TargetOptions, TlsModel, cvs,
 };
 
@@ -16,9 +16,10 @@ pub(crate) fn target() -> Target {
         linker_flavor: LinkerFlavor::Gnu(Cc::Yes, Lld::No),
         linker: Some("aarch64-none-elf-gcc".into()),
         // Enable the Cortex-A53 errata 843419 mitigation by default
-        pre_link_args: TargetOptions::link_args(LinkerFlavor::Gnu(Cc::No, Lld::No), &[
-            "--fix-cortex-a53-843419",
-        ]),
+        pre_link_args: TargetOptions::link_args(
+            LinkerFlavor::Gnu(Cc::No, Lld::No),
+            &["--fix-cortex-a53-843419"],
+        ),
         features: "+v8a,+strict-align,+neon,+fp-armv8".into(),
         supported_sanitizers: SanitizerSet::KCFI | SanitizerSet::KERNELADDRESS,
         relocation_model: RelocModel::Static,

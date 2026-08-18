@@ -1,5 +1,5 @@
 use crate::spec::{
-    Arch, Cc, CodeModel, Env, LinkerFlavor, LlvmAbi, Lld, Os, PanicStrategy, RelocModel,
+    Arch, Cc, CodeModel, Env, LinkerFlavor, Lld, LlvmAbi, Os, PanicStrategy, RelocModel,
     SanitizerSet, Target, TargetMetadata, TargetOptions, TlsModel, cvs,
 };
 
