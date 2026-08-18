@@ -87,5 +87,5 @@ rustc-std-workspace-alloc = { path = 'rustc-std-workspace-alloc' }
 rustc-std-workspace-std = { path = 'rustc-std-workspace-std' }
 # BlueOS forks: add custom target support (BlueOS libc and cc-rs patches).
 # These must be kept in sync with each other and with the target specs.
-libc = { git = "https://github.com/wangchen-vivo/libc", branch = "blueos/0.2.183", version = "=0.2.183" }
-cc = { git = "https://github.com/wangchen-vivo/cc-rs", branch = "blueos/cc-v1.2.28", version = "=1.2.28" }
+libc = { git = "https://github.com/vivoblueos/libc", branch = "blueos-dev", version = "=0.2.183" }
+cc = { git = "https://github.com/vivoblueos/cc-rs", branch = "blueos-dev", version = "=1.2.28" }
