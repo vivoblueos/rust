@@ -13,7 +13,7 @@ use crate::sys::{AsInner, AsInnerMut, FromInner, IntoInner};
 use crate::{io, process, sys};
 
 cfg_select! {
-    any(target_os = "vxworks", target_os = "espidf", target_os = "horizon", target_os = "vita") => {
+    any(target_os = "vxworks", target_os = "espidf", target_os = "horizon", target_os = "vita", target_os = "blueos") => {
         type UserId = u16;
         type GroupId = u16;
     }

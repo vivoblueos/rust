@@ -31,13 +31,8 @@ ENV PATH="/node/bin:${PATH}"
 COPY scripts/sccache.sh /scripts/
 RUN sh /scripts/sccache.sh
 
-COPY host-x86_64/pr-check-1/reuse-requirements.txt /tmp/
-RUN pip3 install --no-deps --no-cache-dir --require-hashes -r /tmp/reuse-requirements.txt \
-  && pip3 install virtualenv
-
-COPY host-x86_64/pr-check-1/validate-toolstate.sh /scripts/
+RUN pip3 install virtualenv
 
 # NOTE: intentionally uses python2 for x.py so we can test it still works.
-# validate-toolstate only runs in our CI, so it's ok for it to only support python3.
 ENV SCRIPT="TIDY_PRINT_DIFF=1 python2.7 ../x.py test \
   src/tools/tidy tidyselftest --extra-checks=py,cpp,js,spellcheck"
