@@ -96,7 +96,7 @@ dependencies = [
 [[package]]
 name = "cc"
 version = "1.2.28"
-source = "git+https://github.com/vivoblueos/cc-rs?branch=blueos-dev#9d607663f64397e108b281355b4aa043d36c0662"
+source = "git+https://github.com/vivoblueos/cc-rs?branch=v1.2.28#a6a2b5ec11fd25437781d12b7d7c882427ae9875"
 dependencies = [
  "shlex",
 ]
