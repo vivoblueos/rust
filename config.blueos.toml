@@ -29,36 +29,39 @@ ranlib = "aarch64-none-elf-ranlib"
 [target."riscv64-vivo-blueos"]
 cc = "clang"
 cxx = "clang++"
-linker = "clang"
+linker = "rust-lld"
 ar = "llvm-ar"
 ranlib = "llvm-ranlib"
 
 [target."riscv32-vivo-blueos"]
 cc = "clang"
 cxx = "clang++"
-linker = "clang"
+linker = "rust-lld"
 ar = "llvm-ar"
 ranlib = "llvm-ranlib"
 
 [target."riscv32imc-vivo-blueos"]
 cc = "clang"
 cxx = "clang++"
-linker = "clang"
+linker = "rust-lld"
 ar = "llvm-ar"
 ranlib = "llvm-ranlib"
 
 [target.x86_64-unknown-linux-gnu]
 profiler = true
 sanitizers = true
+rpath = true
 
 [target.aarch64-apple-darwin]
 profiler = true
 sanitizers = true
+rpath = true
 
 [rust]
 omit-git-hash = false
 deny-warnings = false
 strip = true
+rpath = false
 
 [dist]
 compression-formats = ["xz"]

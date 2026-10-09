@@ -16,12 +16,14 @@ pub(crate) fn target() -> Target {
         linker_flavor: LinkerFlavor::Gnu(Cc::Yes, Lld::No),
         linker: Some("aarch64-none-elf-gcc".into()),
         // Enable the Cortex-A53 errata 843419 mitigation by default
-        pre_link_args: TargetOptions::link_args(LinkerFlavor::Gnu(Cc::No, Lld::No), &[
-            "--fix-cortex-a53-843419",
-        ]),
+        pre_link_args: TargetOptions::link_args(
+            LinkerFlavor::Gnu(Cc::No, Lld::No),
+            &["--fix-cortex-a53-843419"],
+        ),
         features: "+v8a,+strict-align,+neon,+fp-armv8".into(),
         supported_sanitizers: SanitizerSet::KCFI | SanitizerSet::KERNELADDRESS,
-        relocation_model: RelocModel::Static,
+        relocation_model: RelocModel::Pic,
+        dynamic_linking: true,
         disable_redzone: true,
         max_atomic_width: Some(128),
         stack_probes: StackProbeType::Inline,
@@ -36,7 +38,7 @@ pub(crate) fn target() -> Target {
     Target {
         llvm_target: "aarch64-unknown-none".into(),
         metadata: crate::spec::TargetMetadata {
-            description: Some("Bare ARM64, hardfloat".into()),
+            description: Some("vivo BlueOS on Bare ARM64, hardfloat".into()),
             tier: Some(3),
             host_tools: Some(false),
             std: Some(true),

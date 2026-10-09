@@ -1,4 +1,6 @@
-use crate::spec::{PanicStrategy, RelocModel, Target, TargetOptions, TlsModel, cvs};
+use crate::spec::{
+    Cc, LinkerFlavor, Lld, PanicStrategy, RelocModel, Target, TargetOptions, TlsModel, cvs,
+};
 
 pub(crate) fn target() -> Target {
     Target {
@@ -18,6 +20,7 @@ pub(crate) fn target() -> Target {
             env: "newlib".into(),
             tls_model: TlsModel::Emulated,
             vendor: "vivo".into(),
+            linker_flavor: LinkerFlavor::Gnu(Cc::No, Lld::Yes),
             linker: Some("rust-lld".into()),
             cpu: "generic-rv32".into(),
             // While the RiscV32IMC architecture does not natively
@@ -33,7 +36,8 @@ pub(crate) fn target() -> Target {
             features: "+m,+c".into(),
             llvm_abiname: "ilp32".into(),
             panic_strategy: PanicStrategy::Abort,
-            relocation_model: RelocModel::Static,
+            relocation_model: RelocModel::Pic,
+            dynamic_linking: true,
             emit_debug_gdb_scripts: false,
             eh_frame_header: false,
             ..Default::default()
