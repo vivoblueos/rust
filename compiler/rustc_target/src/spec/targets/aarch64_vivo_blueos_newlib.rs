@@ -22,7 +22,8 @@ pub(crate) fn target() -> Target {
         ),
         features: "+v8a,+strict-align,+neon,+fp-armv8".into(),
         supported_sanitizers: SanitizerSet::KCFI | SanitizerSet::KERNELADDRESS,
-        relocation_model: RelocModel::Static,
+        relocation_model: RelocModel::Pic,
+        dynamic_linking: true,
         disable_redzone: true,
         max_atomic_width: Some(128),
         stack_probes: StackProbeType::Inline,
@@ -37,7 +38,7 @@ pub(crate) fn target() -> Target {
     Target {
         llvm_target: "aarch64-unknown-none".into(),
         metadata: TargetMetadata {
-            description: Some("Bare ARM64, hardfloat".into()),
+            description: Some("vivo BlueOS on Bare ARM64, hardfloat".into()),
             tier: Some(3),
             host_tools: Some(false),
             std: Some(true),

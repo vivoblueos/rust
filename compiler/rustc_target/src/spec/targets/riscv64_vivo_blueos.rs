@@ -30,6 +30,7 @@ pub(crate) fn target() -> Target {
             features: "+m,+a,+c".into(),
             panic_strategy: PanicStrategy::Abort,
             relocation_model: RelocModel::Pic,
+            dynamic_linking: true,
             code_model: Some(CodeModel::Medium),
             emit_debug_gdb_scripts: false,
             eh_frame_header: false,
