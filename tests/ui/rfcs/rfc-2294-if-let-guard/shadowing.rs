@@ -1,8 +1,6 @@
 // Check shadowing in if let guards works as expected.
-//@ check-pass
 
-#![feature(if_let_guard)]
-#![feature(let_chains)]
+//@ check-pass
 
 fn main() {
     let x: Option<Option<i32>> = Some(Some(6));

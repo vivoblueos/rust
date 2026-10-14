@@ -1,18 +1,18 @@
 error[E0429]: `self` imports are only allowed within a { } list
-  --> $DIR/use-mod-4.rs:1:8
+  --> $DIR/use-mod-4.rs:1:15
    |
-LL | use foo::self;
-   |        ^^^^^^
+LL | use crate::foo::self;
+   |               ^^^^^^
    |
 help: consider importing the module directly
    |
-LL - use foo::self;
-LL + use foo;
+LL - use crate::foo::self;
+LL + use crate::foo;
    |
 help: alternatively, use the multi-path `use` syntax to import `self`
    |
-LL | use foo::{self};
-   |          +    +
+LL | use crate::foo::{self};
+   |                 +    +
 
 error[E0429]: `self` imports are only allowed within a { } list
   --> $DIR/use-mod-4.rs:4:13
@@ -30,11 +30,16 @@ help: alternatively, use the multi-path `use` syntax to import `self`
 LL | use std::mem::{self};
    |               +    +
 
-error[E0432]: unresolved import `foo`
-  --> $DIR/use-mod-4.rs:1:5
+error[E0432]: unresolved import `crate::foo`
+  --> $DIR/use-mod-4.rs:1:12
    |
-LL | use foo::self;
-   |     ^^^^^^^^^ no `foo` in the root
+LL | use crate::foo::self;
+   |            ^^^ use of unresolved module or unlinked crate `foo`
+   |
+help: you might be missing a crate named `foo`, add it to your project and import it in your code
+   |
+LL + extern crate foo;
+   |
 
 error: aborting due to 3 previous errors
 

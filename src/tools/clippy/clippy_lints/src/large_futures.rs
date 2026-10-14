@@ -2,11 +2,11 @@ use clippy_config::Conf;
 use clippy_utils::diagnostics::span_lint_and_sugg;
 use clippy_utils::source::snippet;
 use clippy_utils::ty::implements_trait;
+use rustc_abi::Size;
 use rustc_errors::Applicability;
-use rustc_hir::{Expr, ExprKind, LangItem, MatchSource, QPath};
+use rustc_hir::{Expr, ExprKind, LangItem, MatchSource};
 use rustc_lint::{LateContext, LateLintPass};
 use rustc_session::impl_lint_pass;
-use rustc_target::abi::Size;
 
 declare_clippy_lint! {
     /// ### What it does
@@ -40,6 +40,8 @@ declare_clippy_lint! {
     "large future may lead to unexpected stack overflows"
 }
 
+impl_lint_pass!(LargeFuture => [LARGE_FUTURES]);
+
 pub struct LargeFuture {
     future_size_threshold: u64,
 }
@@ -52,13 +54,12 @@ impl LargeFuture {
     }
 }
 
-impl_lint_pass!(LargeFuture => [LARGE_FUTURES]);
-
 impl<'tcx> LateLintPass<'tcx> for LargeFuture {
     fn check_expr(&mut self, cx: &LateContext<'tcx>, expr: &'tcx Expr<'tcx>) {
         if let ExprKind::Match(scrutinee, _, MatchSource::AwaitDesugar) = expr.kind
             && let ExprKind::Call(func, [arg]) = scrutinee.kind
-            && let ExprKind::Path(QPath::LangItem(LangItem::IntoFutureIntoFuture, ..)) = func.kind
+            && let ExprKind::Path(qpath) = func.kind
+            && cx.tcx.qpath_is_lang_item(qpath, LangItem::IntoFutureIntoFuture)
             && !expr.span.from_expansion()
             && let ty = cx.typeck_results().expr_ty(arg)
             && let Some(future_trait_def_id) = cx.tcx.lang_items().future_trait()

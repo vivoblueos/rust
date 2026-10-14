@@ -1,5 +1,6 @@
 //@ stderr-per-bitwidth
-
+//@ dont-require-annotations: NOTE
+//@ ignore-parallel-frontend different alloc ids
 #[repr(C)]
 union DummyUnion {
     unit: (),
@@ -29,15 +30,13 @@ union Bar {
 }
 
 // the value is not valid for bools
-const BAD_BOOL: bool = unsafe { DummyUnion { u8: 42 }.bool};
-//~^ ERROR it is undefined behavior to use this value
-const UNINIT_BOOL: bool = unsafe { DummyUnion { unit: () }.bool};
-//~^ ERROR evaluation of constant value failed
-//~| uninitialized
+const BAD_BOOL: bool = unsafe { DummyUnion { u8: 42 }.bool };
+//~^ ERROR invalid value
+const UNINIT_BOOL: bool = unsafe { DummyUnion { unit: () }.bool };
+//~^ ERROR uninitialized
 
 // The value is not valid for any union variant, but that's fine
 // unions are just a convenient way to transmute bits around
 const BAD_UNION: Foo = unsafe { Bar { u8: 42 }.foo };
-
 
 fn main() {}

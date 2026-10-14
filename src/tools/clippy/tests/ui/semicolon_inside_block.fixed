@@ -3,9 +3,11 @@
     clippy::unused_unit,
     clippy::unnecessary_operation,
     clippy::no_effect,
-    clippy::single_element_loop
+    clippy::single_element_loop,
+    clippy::double_parens
 )]
 #![warn(clippy::semicolon_inside_block)]
+#![feature(try_blocks)]
 
 macro_rules! m {
     (()) => {
@@ -36,7 +38,9 @@ fn main() {
     }
 
     { unit_fn_block(); }
+    //~^ semicolon_inside_block
     unsafe { unit_fn_block(); }
+    //~^ semicolon_inside_block
 
     { unit_fn_block(); }
     unsafe { unit_fn_block(); }
@@ -45,6 +49,7 @@ fn main() {
     unsafe { unit_fn_block(); };
 
     {
+    //~^ semicolon_inside_block
         unit_fn_block();
         unit_fn_block();
     }
@@ -58,6 +63,7 @@ fn main() {
     };
 
     { m!(()); }
+    //~^ semicolon_inside_block
     { m!(()); }
     { m!(()); };
     m!(0);
@@ -81,4 +87,31 @@ fn main() {
     { unit_fn_block(); };
 
     unit_fn_block()
+}
+
+#[rustfmt::skip]
+fn issue15380() {
+    ( {0;0});
+
+    ({
+        0;
+        0
+    });
+
+    (({ 0 }))      ;
+
+    ( ( { 0 } ) ) ;
+}
+
+pub fn issue15388() {
+    #[rustfmt::skip]
+    {0; 0};
+}
+
+fn issue_try_blocks() {
+    // try blocks should NOT trigger semicolon_inside_block:
+    // moving `;` inside changes the return type (e.g. `Option<i32>` -> `Option<()>`)
+    // which in turn changes the type constraints on `?` operators inside the block,
+    // causing type errors.
+    try { Some(1)? };
 }

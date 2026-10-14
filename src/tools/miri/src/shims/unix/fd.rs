@@ -1,16 +1,16 @@
 //! General management of file descriptors, and support for
 //! standard file descriptors (stdin/stdout/stderr).
 
-use std::any::Any;
-use std::collections::BTreeMap;
-use std::io::{self, ErrorKind, IsTerminal, Read, SeekFrom, Write};
-use std::ops::Deref;
-use std::rc::{Rc, Weak};
+use std::io;
+use std::io::ErrorKind;
 
+use rand::Rng;
 use rustc_abi::Size;
+use rustc_target::spec::Os;
 
-use crate::helpers::check_min_arg_count;
-use crate::shims::unix::linux::epoll::EpollReadyEvents;
+use crate::shims::files::FileDescription;
+use crate::shims::sig::check_min_vararg_count;
+use crate::shims::unix::linux_like::epoll::EpollEvents;
 use crate::shims::unix::*;
 use crate::*;
 
@@ -21,40 +21,8 @@ pub(crate) enum FlockOp {
     Unlock,
 }
 
-/// Represents an open file description.
-pub trait FileDescription: std::fmt::Debug + Any {
-    fn name(&self) -> &'static str;
-
-    /// Reads as much as possible into the given buffer `ptr`.
-    /// `len` indicates how many bytes we should try to read.
-    /// `dest` is where the return value should be stored: number of bytes read, or `-1` in case of error.
-    fn read<'tcx>(
-        &self,
-        _self_ref: &FileDescriptionRef,
-        _communicate_allowed: bool,
-        _ptr: Pointer,
-        _len: usize,
-        _dest: &MPlaceTy<'tcx>,
-        _ecx: &mut MiriInterpCx<'tcx>,
-    ) -> InterpResult<'tcx> {
-        throw_unsup_format!("cannot read from {}", self.name());
-    }
-
-    /// Writes as much as possible from the given buffer `ptr`.
-    /// `len` indicates how many bytes we should try to write.
-    /// `dest` is where the return value should be stored: number of bytes written, or `-1` in case of error.
-    fn write<'tcx>(
-        &self,
-        _self_ref: &FileDescriptionRef,
-        _communicate_allowed: bool,
-        _ptr: Pointer,
-        _len: usize,
-        _dest: &MPlaceTy<'tcx>,
-        _ecx: &mut MiriInterpCx<'tcx>,
-    ) -> InterpResult<'tcx> {
-        throw_unsup_format!("cannot write to {}", self.name());
-    }
-
+/// Represents unix-specific file descriptions.
+pub trait UnixFileDescription: FileDescription {
     /// Reads as much as possible into the given buffer `ptr` from a given offset.
     /// `len` indicates how many bytes we should try to read.
     /// `dest` is where the return value should be stored: number of bytes read, or `-1` in case of error.
@@ -64,8 +32,8 @@ pub trait FileDescription: std::fmt::Debug + Any {
         _offset: u64,
         _ptr: Pointer,
         _len: usize,
-        _dest: &MPlaceTy<'tcx>,
         _ecx: &mut MiriInterpCx<'tcx>,
+        _finish: DynMachineCallback<'tcx, Result<usize, IoError>>,
     ) -> InterpResult<'tcx> {
         throw_unsup_format!("cannot pread from {}", self.name());
     }
@@ -80,28 +48,10 @@ pub trait FileDescription: std::fmt::Debug + Any {
         _ptr: Pointer,
         _len: usize,
         _offset: u64,
-        _dest: &MPlaceTy<'tcx>,
         _ecx: &mut MiriInterpCx<'tcx>,
+        _finish: DynMachineCallback<'tcx, Result<usize, IoError>>,
     ) -> InterpResult<'tcx> {
         throw_unsup_format!("cannot pwrite to {}", self.name());
-    }
-
-    /// Seeks to the given offset (which can be relative to the beginning, end, or current position).
-    /// Returns the new position from the start of the stream.
-    fn seek<'tcx>(
-        &self,
-        _communicate_allowed: bool,
-        _offset: SeekFrom,
-    ) -> InterpResult<'tcx, io::Result<u64>> {
-        throw_unsup_format!("cannot seek on {}", self.name());
-    }
-
-    fn close<'tcx>(
-        self: Box<Self>,
-        _communicate_allowed: bool,
-        _ecx: &mut MiriInterpCx<'tcx>,
-    ) -> InterpResult<'tcx, io::Result<()>> {
-        throw_unsup_format!("cannot close {}", self.name());
     }
 
     fn flock<'tcx>(
@@ -112,308 +62,9 @@ pub trait FileDescription: std::fmt::Debug + Any {
         throw_unsup_format!("cannot flock {}", self.name());
     }
 
-    fn is_tty(&self, _communicate_allowed: bool) -> bool {
-        // Most FDs are not tty's and the consequence of a wrong `false` are minor,
-        // so we use a default impl here.
-        false
-    }
-
-    /// Check the readiness of file description.
-    fn get_epoll_ready_events<'tcx>(&self) -> InterpResult<'tcx, EpollReadyEvents> {
+    /// Return which epoll events are currently active.
+    fn epoll_active_events<'tcx>(&self) -> InterpResult<'tcx, EpollEvents> {
         throw_unsup_format!("{}: epoll does not support this file description", self.name());
-    }
-}
-
-impl dyn FileDescription {
-    #[inline(always)]
-    pub fn downcast<T: Any>(&self) -> Option<&T> {
-        (self as &dyn Any).downcast_ref()
-    }
-}
-
-impl FileDescription for io::Stdin {
-    fn name(&self) -> &'static str {
-        "stdin"
-    }
-
-    fn read<'tcx>(
-        &self,
-        _self_ref: &FileDescriptionRef,
-        communicate_allowed: bool,
-        ptr: Pointer,
-        len: usize,
-        dest: &MPlaceTy<'tcx>,
-        ecx: &mut MiriInterpCx<'tcx>,
-    ) -> InterpResult<'tcx> {
-        let mut bytes = vec![0; len];
-        if !communicate_allowed {
-            // We want isolation mode to be deterministic, so we have to disallow all reads, even stdin.
-            helpers::isolation_abort_error("`read` from stdin")?;
-        }
-        let result = Read::read(&mut { self }, &mut bytes);
-        match result {
-            Ok(read_size) => ecx.return_read_success(ptr, &bytes, read_size, dest),
-            Err(e) => ecx.set_last_error_and_return(e, dest),
-        }
-    }
-
-    fn is_tty(&self, communicate_allowed: bool) -> bool {
-        communicate_allowed && self.is_terminal()
-    }
-}
-
-impl FileDescription for io::Stdout {
-    fn name(&self) -> &'static str {
-        "stdout"
-    }
-
-    fn write<'tcx>(
-        &self,
-        _self_ref: &FileDescriptionRef,
-        _communicate_allowed: bool,
-        ptr: Pointer,
-        len: usize,
-        dest: &MPlaceTy<'tcx>,
-        ecx: &mut MiriInterpCx<'tcx>,
-    ) -> InterpResult<'tcx> {
-        let bytes = ecx.read_bytes_ptr_strip_provenance(ptr, Size::from_bytes(len))?;
-        // We allow writing to stderr even with isolation enabled.
-        let result = Write::write(&mut { self }, bytes);
-        // Stdout is buffered, flush to make sure it appears on the
-        // screen.  This is the write() syscall of the interpreted
-        // program, we want it to correspond to a write() syscall on
-        // the host -- there is no good in adding extra buffering
-        // here.
-        io::stdout().flush().unwrap();
-        match result {
-            Ok(write_size) => ecx.return_write_success(write_size, dest),
-            Err(e) => ecx.set_last_error_and_return(e, dest),
-        }
-    }
-
-    fn is_tty(&self, communicate_allowed: bool) -> bool {
-        communicate_allowed && self.is_terminal()
-    }
-}
-
-impl FileDescription for io::Stderr {
-    fn name(&self) -> &'static str {
-        "stderr"
-    }
-
-    fn write<'tcx>(
-        &self,
-        _self_ref: &FileDescriptionRef,
-        _communicate_allowed: bool,
-        ptr: Pointer,
-        len: usize,
-        dest: &MPlaceTy<'tcx>,
-        ecx: &mut MiriInterpCx<'tcx>,
-    ) -> InterpResult<'tcx> {
-        let bytes = ecx.read_bytes_ptr_strip_provenance(ptr, Size::from_bytes(len))?;
-        // We allow writing to stderr even with isolation enabled.
-        // No need to flush, stderr is not buffered.
-        let result = Write::write(&mut { self }, bytes);
-        match result {
-            Ok(write_size) => ecx.return_write_success(write_size, dest),
-            Err(e) => ecx.set_last_error_and_return(e, dest),
-        }
-    }
-
-    fn is_tty(&self, communicate_allowed: bool) -> bool {
-        communicate_allowed && self.is_terminal()
-    }
-}
-
-/// Like /dev/null
-#[derive(Debug)]
-pub struct NullOutput;
-
-impl FileDescription for NullOutput {
-    fn name(&self) -> &'static str {
-        "stderr and stdout"
-    }
-
-    fn write<'tcx>(
-        &self,
-        _self_ref: &FileDescriptionRef,
-        _communicate_allowed: bool,
-        _ptr: Pointer,
-        len: usize,
-        dest: &MPlaceTy<'tcx>,
-        ecx: &mut MiriInterpCx<'tcx>,
-    ) -> InterpResult<'tcx> {
-        // We just don't write anything, but report to the user that we did.
-        ecx.return_write_success(len, dest)
-    }
-}
-
-/// Structure contains both the file description and its unique identifier.
-#[derive(Clone, Debug)]
-pub struct FileDescWithId<T: FileDescription + ?Sized> {
-    id: FdId,
-    file_description: Box<T>,
-}
-
-#[derive(Clone, Debug)]
-pub struct FileDescriptionRef(Rc<FileDescWithId<dyn FileDescription>>);
-
-impl Deref for FileDescriptionRef {
-    type Target = dyn FileDescription;
-
-    fn deref(&self) -> &Self::Target {
-        &*self.0.file_description
-    }
-}
-
-impl FileDescriptionRef {
-    fn new(fd: impl FileDescription, id: FdId) -> Self {
-        FileDescriptionRef(Rc::new(FileDescWithId { id, file_description: Box::new(fd) }))
-    }
-
-    pub fn close<'tcx>(
-        self,
-        communicate_allowed: bool,
-        ecx: &mut MiriInterpCx<'tcx>,
-    ) -> InterpResult<'tcx, io::Result<()>> {
-        // Destroy this `Rc` using `into_inner` so we can call `close` instead of
-        // implicitly running the destructor of the file description.
-        let id = self.get_id();
-        match Rc::into_inner(self.0) {
-            Some(fd) => {
-                // Remove entry from the global epoll_event_interest table.
-                ecx.machine.epoll_interests.remove(id);
-
-                fd.file_description.close(communicate_allowed, ecx)
-            }
-            None => interp_ok(Ok(())),
-        }
-    }
-
-    pub fn downgrade(&self) -> WeakFileDescriptionRef {
-        WeakFileDescriptionRef { weak_ref: Rc::downgrade(&self.0) }
-    }
-
-    pub fn get_id(&self) -> FdId {
-        self.0.id
-    }
-}
-
-/// Holds a weak reference to the actual file description.
-#[derive(Clone, Debug, Default)]
-pub struct WeakFileDescriptionRef {
-    weak_ref: Weak<FileDescWithId<dyn FileDescription>>,
-}
-
-impl WeakFileDescriptionRef {
-    pub fn upgrade(&self) -> Option<FileDescriptionRef> {
-        if let Some(file_desc_with_id) = self.weak_ref.upgrade() {
-            return Some(FileDescriptionRef(file_desc_with_id));
-        }
-        None
-    }
-}
-
-impl VisitProvenance for WeakFileDescriptionRef {
-    fn visit_provenance(&self, _visit: &mut VisitWith<'_>) {
-        // A weak reference can never be the only reference to some pointer or place.
-        // Since the actual file description is tracked by strong ref somewhere,
-        // it is ok to make this a NOP operation.
-    }
-}
-
-/// A unique id for file descriptions. While we could use the address, considering that
-/// is definitely unique, the address would expose interpreter internal state when used
-/// for sorting things. So instead we generate a unique id per file description that stays
-/// the same even if a file descriptor is duplicated and gets a new integer file descriptor.
-#[derive(Debug, Copy, Clone, Default, Eq, PartialEq, Ord, PartialOrd)]
-pub struct FdId(usize);
-
-/// The file descriptor table
-#[derive(Debug)]
-pub struct FdTable {
-    pub fds: BTreeMap<i32, FileDescriptionRef>,
-    /// Unique identifier for file description, used to differentiate between various file description.
-    next_file_description_id: FdId,
-}
-
-impl VisitProvenance for FdTable {
-    fn visit_provenance(&self, _visit: &mut VisitWith<'_>) {
-        // All our FileDescription instances do not have any tags.
-    }
-}
-
-impl FdTable {
-    fn new() -> Self {
-        FdTable { fds: BTreeMap::new(), next_file_description_id: FdId(0) }
-    }
-    pub(crate) fn init(mute_stdout_stderr: bool) -> FdTable {
-        let mut fds = FdTable::new();
-        fds.insert_new(io::stdin());
-        if mute_stdout_stderr {
-            assert_eq!(fds.insert_new(NullOutput), 1);
-            assert_eq!(fds.insert_new(NullOutput), 2);
-        } else {
-            assert_eq!(fds.insert_new(io::stdout()), 1);
-            assert_eq!(fds.insert_new(io::stderr()), 2);
-        }
-        fds
-    }
-
-    pub fn new_ref(&mut self, fd: impl FileDescription) -> FileDescriptionRef {
-        let file_handle = FileDescriptionRef::new(fd, self.next_file_description_id);
-        self.next_file_description_id = FdId(self.next_file_description_id.0.strict_add(1));
-        file_handle
-    }
-
-    /// Insert a new file description to the FdTable.
-    pub fn insert_new(&mut self, fd: impl FileDescription) -> i32 {
-        let fd_ref = self.new_ref(fd);
-        self.insert(fd_ref)
-    }
-
-    pub fn insert(&mut self, fd_ref: FileDescriptionRef) -> i32 {
-        self.insert_with_min_num(fd_ref, 0)
-    }
-
-    /// Insert a file description, giving it a file descriptor that is at least `min_fd_num`.
-    fn insert_with_min_num(&mut self, file_handle: FileDescriptionRef, min_fd_num: i32) -> i32 {
-        // Find the lowest unused FD, starting from min_fd. If the first such unused FD is in
-        // between used FDs, the find_map combinator will return it. If the first such unused FD
-        // is after all other used FDs, the find_map combinator will return None, and we will use
-        // the FD following the greatest FD thus far.
-        let candidate_new_fd =
-            self.fds.range(min_fd_num..).zip(min_fd_num..).find_map(|((fd_num, _fd), counter)| {
-                if *fd_num != counter {
-                    // There was a gap in the fds stored, return the first unused one
-                    // (note that this relies on BTreeMap iterating in key order)
-                    Some(counter)
-                } else {
-                    // This fd is used, keep going
-                    None
-                }
-            });
-        let new_fd_num = candidate_new_fd.unwrap_or_else(|| {
-            // find_map ran out of BTreeMap entries before finding a free fd, use one plus the
-            // maximum fd in the map
-            self.fds.last_key_value().map(|(fd_num, _)| fd_num.strict_add(1)).unwrap_or(min_fd_num)
-        });
-
-        self.fds.try_insert(new_fd_num, file_handle).unwrap();
-        new_fd_num
-    }
-
-    pub fn get(&self, fd_num: i32) -> Option<FileDescriptionRef> {
-        let fd = self.fds.get(&fd_num)?;
-        Some(fd.clone())
-    }
-
-    pub fn remove(&mut self, fd_num: i32) -> Option<FileDescriptionRef> {
-        self.fds.remove(&fd_num)
-    }
-
-    pub fn is_fd_num(&self, fd_num: i32) -> bool {
-        self.fds.contains_key(&fd_num)
     }
 }
 
@@ -439,7 +90,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
             // If old_fd and new_fd point to the same description, then `dup_fd` ensures we keep the underlying file description alive.
             if let Some(old_new_fd) = this.machine.fds.fds.insert(new_fd_num, fd) {
                 // Ignore close error (not interpreter's) according to dup2() doc.
-                old_new_fd.close(this.machine.communicate(), this)?.ok();
+                old_new_fd.close_ref(this.machine.communicate(), this)?.ok();
             }
         }
         interp_ok(Scalar::from_i32(new_fd_num))
@@ -472,17 +123,19 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
             throw_unsup_format!("unsupported flags {:#x}", op);
         };
 
-        let result = fd.flock(this.machine.communicate(), parsed_op)?;
-        drop(fd);
+        let result = fd.as_unix(this).flock(this.machine.communicate(), parsed_op)?;
         // return `0` if flock is successful
         let result = result.map(|()| 0i32);
         interp_ok(Scalar::from_i32(this.try_unwrap_io_result(result)?))
     }
 
-    fn fcntl(&mut self, args: &[OpTy<'tcx>]) -> InterpResult<'tcx, Scalar> {
+    fn fcntl(
+        &mut self,
+        fd_num: &OpTy<'tcx>,
+        cmd: &OpTy<'tcx>,
+        varargs: &[OpTy<'tcx>],
+    ) -> InterpResult<'tcx, Scalar> {
         let this = self.eval_context_mut();
-
-        let [fd_num, cmd] = check_min_arg_count("fcntl", args)?;
 
         let fd_num = this.read_scalar(fd_num)?.to_i32()?;
         let cmd = this.read_scalar(cmd)?.to_i32()?;
@@ -490,6 +143,8 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         let f_getfd = this.eval_libc_i32("F_GETFD");
         let f_dupfd = this.eval_libc_i32("F_DUPFD");
         let f_dupfd_cloexec = this.eval_libc_i32("F_DUPFD_CLOEXEC");
+        let f_getfl = this.eval_libc_i32("F_GETFL");
+        let f_setfl = this.eval_libc_i32("F_SETFL");
 
         // We only support getting the flags for a descriptor.
         match cmd {
@@ -515,7 +170,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                     "fcntl(fd, F_DUPFD_CLOEXEC, ...)"
                 };
 
-                let [_, _, start] = check_min_arg_count(cmd_name, args)?;
+                let [start] = check_min_vararg_count(cmd_name, varargs)?;
                 let start = this.read_scalar(start)?.to_i32()?;
 
                 if let Some(fd) = this.machine.fds.get(fd_num) {
@@ -524,7 +179,38 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                     this.set_last_error_and_return_i32(LibcError("EBADF"))
                 }
             }
-            cmd if this.tcx.sess.target.os == "macos"
+            cmd if cmd == f_getfl => {
+                // Check if this is a valid open file descriptor.
+                let Some(fd) = this.machine.fds.get(fd_num) else {
+                    return this.set_last_error_and_return_i32(LibcError("EBADF"));
+                };
+
+                fd.get_flags(this)
+            }
+            cmd if cmd == f_setfl => {
+                // Check if this is a valid open file descriptor.
+                let Some(fd) = this.machine.fds.get(fd_num) else {
+                    return this.set_last_error_and_return_i32(LibcError("EBADF"));
+                };
+
+                let [flag] = check_min_vararg_count("fcntl(fd, F_SETFL, ...)", varargs)?;
+                let flag = this.read_scalar(flag)?.to_i32()?;
+
+                // Ignore flags that never get stored by SETFL.
+                // "File access mode (O_RDONLY, O_WRONLY, O_RDWR) and file
+                // creation flags (i.e., O_CREAT, O_EXCL, O_NOCTTY, O_TRUNC)
+                // in arg are ignored."
+                let ignored_flags = this.eval_libc_i32("O_RDONLY")
+                    | this.eval_libc_i32("O_WRONLY")
+                    | this.eval_libc_i32("O_RDWR")
+                    | this.eval_libc_i32("O_CREAT")
+                    | this.eval_libc_i32("O_EXCL")
+                    | this.eval_libc_i32("O_NOCTTY")
+                    | this.eval_libc_i32("O_TRUNC");
+
+                fd.set_flags(flag & !ignored_flags, this)
+            }
+            cmd if this.tcx.sess.target.os == Os::MacOs
                 && cmd == this.eval_libc_i32("F_FULLFSYNC") =>
             {
                 // Reject if isolation is enabled.
@@ -549,7 +235,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         let Some(fd) = this.machine.fds.remove(fd_num) else {
             return this.set_last_error_and_return_i32(LibcError("EBADF"));
         };
-        let result = fd.close(this.machine.communicate(), this)?;
+        let result = fd.close_ref(this.machine.communicate(), this)?;
         // return `0` if close is successful
         let result = result.map(|()| 0i32);
         interp_ok(Scalar::from_i32(this.try_unwrap_io_result(result)?))
@@ -575,7 +261,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         trace!("Reading from FD {}, size {}", fd_num, count);
 
         // Check that the *entire* buffer is actually valid memory.
-        this.check_ptr_access(buf, Size::from_bytes(count), CheckInAllocMsg::MemoryAccessTest)?;
+        this.check_ptr_access(buf, Size::from_bytes(count), CheckInAllocMsg::MemoryAccess)?;
 
         // We cap the number of read bytes to the largest value that we are able to fit in both the
         // host's and target's `isize`. This saves us from having to handle overflows later.
@@ -585,24 +271,64 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         let count = usize::try_from(count).unwrap(); // now it fits in a `usize`
         let communicate = this.machine.communicate();
 
-        // We temporarily dup the FD to be able to retain mutable access to `this`.
+        // Get the FD.
         let Some(fd) = this.machine.fds.get(fd_num) else {
             trace!("read: FD not found");
             return this.set_last_error_and_return(LibcError("EBADF"), dest);
         };
 
+        // Handle the zero-sized case. The man page says:
+        // > If count is zero, read() may detect the errors described below.  In the absence of any
+        // > errors, or if read() does not check for errors, a read() with a count of 0 returns zero
+        // > and has no other effects.
+        if count == 0 {
+            this.write_null(dest)?;
+            return interp_ok(());
+        }
+        // Non-deterministically decide to further reduce the count, simulating a partial read (but
+        // never to 0, that would indicate EOF).
+        let count = if this.machine.short_fd_operations
+            && fd.short_fd_operations()
+            && count >= 2
+            && this.machine.rng.get_mut().random()
+        {
+            count / 2 // since `count` is at least 2, the result is still at least 1
+        } else {
+            count
+        };
+
         trace!("read: FD mapped to {fd:?}");
         // We want to read at most `count` bytes. We are sure that `count` is not negative
-        // because it was a target's `usize`. Also we are sure that its smaller than
+        // because it was a target's `usize`. Also we are sure that it's smaller than
         // `usize::MAX` because it is bounded by the host's `isize`.
 
+        let finish = {
+            let dest = dest.clone();
+            callback!(
+                @capture<'tcx> {
+                    count: usize,
+                    dest: MPlaceTy<'tcx>,
+                }
+                |this, result: Result<usize, IoError>| {
+                    match result {
+                        Ok(read_size) => {
+                            assert!(read_size <= count);
+                            // This must fit since `count` fits.
+                            this.write_int(u64::try_from(read_size).unwrap(), &dest)
+                        }
+                        Err(e) => {
+                            this.set_last_error_and_return(e, &dest)
+                        }
+                }}
+            )
+        };
         match offset {
-            None => fd.read(&fd, communicate, buf, count, dest, this)?,
+            None => fd.read(communicate, buf, count, this, finish)?,
             Some(offset) => {
                 let Ok(offset) = u64::try_from(offset) else {
                     return this.set_last_error_and_return(LibcError("EINVAL"), dest);
                 };
-                fd.pread(communicate, offset, buf, count, dest, this)?
+                fd.as_unix(this).pread(communicate, offset, buf, count, this, finish)?
             }
         };
         interp_ok(())
@@ -621,7 +347,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         // Isolation check is done via `FileDescription` trait.
 
         // Check that the *entire* buffer is actually valid memory.
-        this.check_ptr_access(buf, Size::from_bytes(count), CheckInAllocMsg::MemoryAccessTest)?;
+        this.check_ptr_access(buf, Size::from_bytes(count), CheckInAllocMsg::MemoryAccess)?;
 
         // We cap the number of written bytes to the largest value that we are able to fit in both the
         // host's and target's `isize`. This saves us from having to handle overflows later.
@@ -636,52 +362,59 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
             return this.set_last_error_and_return(LibcError("EBADF"), dest);
         };
 
+        // Handle the zero-sized case. The man page says:
+        // > If count is zero and fd refers to a regular file, then write() may return a failure
+        // > status if one of the errors below is detected.  If no errors are detected, or error
+        // > detection is not performed, 0 is returned without causing any other effect.   If  count
+        // > is  zero  and  fd refers to a file other than a regular file, the results are not
+        // > specified.
+        if count == 0 {
+            // For now let's not open the can of worms of what exactly "not specified" could mean...
+            this.write_null(dest)?;
+            return interp_ok(());
+        }
+        // Non-deterministically decide to further reduce the count, simulating a partial write.
+        // We avoid reducing the write size to 0: the docs seem to be entirely fine with that,
+        // but the standard library is not (https://github.com/rust-lang/rust/issues/145959).
+        let count = if this.machine.short_fd_operations
+            && fd.short_fd_operations()
+            && count >= 2
+            && this.machine.rng.get_mut().random()
+        {
+            count / 2
+        } else {
+            count
+        };
+
+        let finish = {
+            let dest = dest.clone();
+            callback!(
+                @capture<'tcx> {
+                    count: usize,
+                    dest: MPlaceTy<'tcx>,
+                }
+                |this, result: Result<usize, IoError>| {
+                    match result {
+                        Ok(write_size) => {
+                            assert!(write_size <= count);
+                            // This must fit since `count` fits.
+                            this.write_int(u64::try_from(write_size).unwrap(), &dest)
+                        }
+                        Err(e) => {
+                            this.set_last_error_and_return(e, &dest)
+                        }
+                }}
+            )
+        };
         match offset {
-            None => fd.write(&fd, communicate, buf, count, dest, this)?,
+            None => fd.write(communicate, buf, count, this, finish)?,
             Some(offset) => {
                 let Ok(offset) = u64::try_from(offset) else {
                     return this.set_last_error_and_return(LibcError("EINVAL"), dest);
                 };
-                fd.pwrite(communicate, buf, count, offset, dest, this)?
+                fd.as_unix(this).pwrite(communicate, buf, count, offset, this, finish)?
             }
         };
-        interp_ok(())
-    }
-
-    /// Helper to implement `FileDescription::read`:
-    /// This is only used when `read` is successful.
-    /// `actual_read_size` should be the return value of some underlying `read` call that used
-    /// `bytes` as its output buffer.
-    /// The length of `bytes` must not exceed either the host's or the target's `isize`.
-    /// `bytes` is written to `buf` and the size is written to `dest`.
-    fn return_read_success(
-        &mut self,
-        buf: Pointer,
-        bytes: &[u8],
-        actual_read_size: usize,
-        dest: &MPlaceTy<'tcx>,
-    ) -> InterpResult<'tcx> {
-        let this = self.eval_context_mut();
-        // If reading to `bytes` did not fail, we write those bytes to the buffer.
-        // Crucially, if fewer than `bytes.len()` bytes were read, only write
-        // that much into the output buffer!
-        this.write_bytes_ptr(buf, bytes[..actual_read_size].iter().copied())?;
-
-        // The actual read size is always less than what got originally requested so this cannot fail.
-        this.write_int(u64::try_from(actual_read_size).unwrap(), dest)?;
-        interp_ok(())
-    }
-
-    /// Helper to implement `FileDescription::write`:
-    /// This function is only used when `write` is successful, and writes `actual_write_size` to `dest`
-    fn return_write_success(
-        &mut self,
-        actual_write_size: usize,
-        dest: &MPlaceTy<'tcx>,
-    ) -> InterpResult<'tcx> {
-        let this = self.eval_context_mut();
-        // The actual write size is always less than what got originally requested so this cannot fail.
-        this.write_int(u64::try_from(actual_write_size).unwrap(), dest)?;
         interp_ok(())
     }
 }

@@ -18,10 +18,16 @@ def unwrap_unique_or_non_null(unique_or_nonnull):
     return ptr if ptr.type.code == gdb.TYPE_CODE_PTR else ptr[ptr.type.fields()[0]]
 
 
+def unwrap_scalar_wrappers(wrapper):
+    while not wrapper.type.is_scalar:
+        wrapper = wrapper[wrapper.type.fields()[0]]
+    return wrapper
+
+
 # GDB 14 has a tag class that indicates that extension methods are ok
 # to call.  Use of this tag only requires that printers hide local
 # attributes and methods by prefixing them with "_".
-if hasattr(gdb, 'ValuePrinter'):
+if hasattr(gdb, "ValuePrinter"):
     printer_base = gdb.ValuePrinter
 else:
     printer_base = object
@@ -71,7 +77,7 @@ class StdOsStringProvider(printer_base):
         self._valobj = valobj
         buf = self._valobj["inner"]["inner"]
         is_windows = "Wtf8Buf" in buf.type.name
-        vec = buf[ZERO_FIELD] if is_windows else buf
+        vec = buf["bytes"] if is_windows else buf
 
         self._length = int(vec["len"])
         self._data_ptr = unwrap_unique_or_non_null(vec["buf"]["inner"]["ptr"])
@@ -98,7 +104,7 @@ class StdStrProvider(printer_base):
 
 
 def _enumerate_array_elements(element_ptrs):
-    for (i, element_ptr) in enumerate(element_ptrs):
+    for i, element_ptr in enumerate(element_ptrs):
         key = "[{}]".format(i)
         element = element_ptr.dereference()
 
@@ -128,6 +134,9 @@ class StdSliceProvider(printer_base):
             self._data_ptr + index for index in xrange(self._length)
         )
 
+    def num_children(self):
+        return self._length
+
     @staticmethod
     def display_hint():
         return "array"
@@ -148,6 +157,9 @@ class StdVecProvider(printer_base):
         return _enumerate_array_elements(
             self._data_ptr + index for index in xrange(self._length)
         )
+
+    def num_children(self):
+        return self._length
 
     @staticmethod
     def display_hint():
@@ -173,8 +185,12 @@ class StdVecDequeProvider(printer_base):
 
     def children(self):
         return _enumerate_array_elements(
-            (self._data_ptr + ((self._head + index) % self._cap)) for index in xrange(self._size)
+            (self._data_ptr + ((self._head + index) % self._cap))
+            for index in xrange(self._size)
         )
+
+    def num_children(self):
+        return self._size
 
     @staticmethod
     def display_hint():
@@ -187,8 +203,8 @@ class StdRcProvider(printer_base):
         self._is_atomic = is_atomic
         self._ptr = unwrap_unique_or_non_null(valobj["ptr"])
         self._value = self._ptr["data" if is_atomic else "value"]
-        self._strong = self._ptr["strong"]["v" if is_atomic else "value"]["value"]
-        self._weak = self._ptr["weak"]["v" if is_atomic else "value"]["value"] - 1
+        self._strong = unwrap_scalar_wrappers(self._ptr["strong"])
+        self._weak = unwrap_scalar_wrappers(self._ptr["weak"]) - 1
 
     def to_string(self):
         if self._is_atomic:
@@ -251,15 +267,15 @@ class StdNonZeroNumberProvider(printer_base):
     def __init__(self, valobj):
         fields = valobj.type.fields()
         assert len(fields) == 1
-        field = list(fields)[0]
+        field = fields[0]
 
-        inner_valobj = valobj[field.name]
+        inner_valobj = valobj[field]
 
         inner_fields = inner_valobj.type.fields()
         assert len(inner_fields) == 1
-        inner_field = list(inner_fields)[0]
+        inner_field = inner_fields[0]
 
-        self._value = str(inner_valobj[inner_field.name])
+        self._value = inner_valobj[inner_field]
 
     def to_string(self):
         return self._value
@@ -270,7 +286,9 @@ def children_of_btree_map(map):
     # Yields each key/value pair in the node and in any child nodes.
     def children_of_node(node_ptr, height):
         def cast_to_internal(node):
-            internal_type_name = node.type.target().name.replace("LeafNode", "InternalNode", 1)
+            internal_type_name = node.type.target().name.replace(
+                "LeafNode", "InternalNode", 1
+            )
             internal_type = gdb.lookup_type(internal_type_name)
             return node.cast(internal_type.pointer())
 
@@ -286,15 +304,23 @@ def children_of_btree_map(map):
 
         for i in xrange(0, length + 1):
             if height > 0:
-                child_ptr = edges[i]["value"]["value"]
+                child_ptr = edges[i]["value"]["value"][ZERO_FIELD]
                 for child in children_of_node(child_ptr, height - 1):
                     yield child
             if i < length:
                 # Avoid "Cannot perform pointer math on incomplete type" on zero-sized arrays.
                 key_type_size = keys.type.sizeof
                 val_type_size = vals.type.sizeof
-                key = keys[i]["value"]["value"] if key_type_size > 0 else gdb.parse_and_eval("()")
-                val = vals[i]["value"]["value"] if val_type_size > 0 else gdb.parse_and_eval("()")
+                key = (
+                    keys[i]["value"]["value"][ZERO_FIELD]
+                    if key_type_size > 0
+                    else gdb.parse_and_eval("()")
+                )
+                val = (
+                    vals[i]["value"]["value"][ZERO_FIELD]
+                    if val_type_size > 0
+                    else gdb.parse_and_eval("()")
+                )
                 yield key, val
 
     if map["length"] > 0:
@@ -352,7 +378,7 @@ class StdOldHashMapProvider(printer_base):
         self._hashes = self._table["hashes"]
         self._hash_uint_type = self._hashes.type
         self._hash_uint_size = self._hashes.type.sizeof
-        self._modulo = 2 ** self._hash_uint_size
+        self._modulo = 2**self._hash_uint_size
         self._data_ptr = self._hashes[ZERO_FIELD]["pointer"]
 
         self._capacity_mask = int(self._table["capacity_mask"])
@@ -382,8 +408,14 @@ class StdOldHashMapProvider(printer_base):
 
         hashes = self._hash_uint_size * self._capacity
         align = self._pair_type_size
-        len_rounded_up = (((((hashes + align) % self._modulo - 1) % self._modulo) & ~(
-                (align - 1) % self._modulo)) % self._modulo - hashes) % self._modulo
+        len_rounded_up = (
+            (
+                (((hashes + align) % self._modulo - 1) % self._modulo)
+                & ~((align - 1) % self._modulo)
+            )
+            % self._modulo
+            - hashes
+        ) % self._modulo
 
         pairs_offset = hashes + len_rounded_up
         pairs_start = gdb.Value(start + pairs_offset).cast(self._pair_type.pointer())
@@ -460,6 +492,12 @@ class StdHashMapProvider(printer_base):
                 yield "val{}".format(index), element[FIRST_FIELD]
             else:
                 yield "[{}]".format(index), element[ZERO_FIELD]
+
+    def num_children(self):
+        result = self._size
+        if self._show_values:
+            result *= 2
+        return result
 
     def display_hint(self):
         return "map" if self._show_values else "array"

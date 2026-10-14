@@ -1,4 +1,7 @@
-use crate::spec::{Cc, LinkerFlavor, Lld, StackProbeType, Target, TargetOptions, base};
+use crate::spec::{
+    Arch, Cc, CfgAbi, LinkerFlavor, Lld, LlvmAbi, StackProbeType, Target, TargetMetadata,
+    TargetOptions, base,
+};
 
 pub(crate) fn target() -> Target {
     let mut base = base::freebsd::opts();
@@ -6,18 +9,20 @@ pub(crate) fn target() -> Target {
     base.add_pre_link_args(LinkerFlavor::Gnu(Cc::Yes, Lld::No), &["-m64"]);
     base.max_atomic_width = Some(64);
     base.stack_probes = StackProbeType::Inline;
+    base.cfg_abi = CfgAbi::ElfV2;
+    base.llvm_abiname = LlvmAbi::ElfV2;
 
     Target {
         llvm_target: "powerpc64le-unknown-freebsd".into(),
-        metadata: crate::spec::TargetMetadata {
+        metadata: TargetMetadata {
             description: Some("PPC64LE FreeBSD".into()),
             tier: Some(3),
-            host_tools: Some(false),
-            std: Some(false),
+            host_tools: Some(true),
+            std: Some(true),
         },
         pointer_width: 64,
-        data_layout: "e-m:e-Fn32-i64:64-n32:64".into(),
-        arch: "powerpc64".into(),
+        data_layout: "e-m:e-Fn32-i64:64-i128:128-n32:64".into(),
+        arch: Arch::PowerPC64,
         options: TargetOptions { mcount: "_mcount".into(), ..base },
     }
 }

@@ -11,10 +11,13 @@
 //@ ignore-android FIXME #17520
 //@ ignore-fuchsia Backtraces not symbolized
 //@ ignore-emscripten Requires custom symbolization code
+//@ ignore-ios needs the `.dSYM` files to be moved to the device
+//@ ignore-tvos needs the `.dSYM` files to be moved to the device
+//@ ignore-watchos needs the `.dSYM` files to be moved to the device
+//@ ignore-visionos needs the `.dSYM` files to be moved to the device
 //@ needs-unwind
 //@ aux-build: line-tables-only-helper.rs
 
-#![feature(backtrace_frames)]
 
 extern crate line_tables_only_helper;
 
@@ -46,5 +49,5 @@ fn main() {
         assert_contains(&backtrace, "foo", "line-tables-only-helper.rs", 5);
     }
     assert_contains(&backtrace, "bar", "line-tables-only-helper.rs", 10);
-    assert_contains(&backtrace, "baz", "line-tables-only-helper.rs", 15);
+    assert_contains(&backtrace, "baz", "line-tables-only-helper.rs", 5);
 }

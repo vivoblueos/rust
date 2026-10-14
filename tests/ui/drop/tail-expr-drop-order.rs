@@ -1,6 +1,6 @@
 //@ aux-build:edition-2021-macros.rs
 //@ aux-build:edition-2024-macros.rs
-//@ compile-flags: -Z validate-mir -Zunstable-options
+//@ compile-flags: -Z validate-mir
 //@ edition: 2024
 //@ run-pass
 
@@ -28,11 +28,11 @@ impl Drop for LoudDrop<'_> {
 }
 
 impl DropOrderCollector {
-    fn option_loud_drop(&self, n: u32) -> Option<LoudDrop> {
+    fn option_loud_drop(&self, n: u32) -> Option<LoudDrop<'_>> {
         Some(LoudDrop(self, n))
     }
 
-    fn loud_drop(&self, n: u32) -> LoudDrop {
+    fn loud_drop(&self, n: u32) -> LoudDrop<'_> {
         LoudDrop(self, n)
     }
 

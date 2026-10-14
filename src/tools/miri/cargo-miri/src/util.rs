@@ -129,7 +129,8 @@ pub fn exec(mut cmd: Command) -> ! {
     // On non-Unix imitate POSIX exec as closely as we can
     #[cfg(not(unix))]
     {
-        let exit_status = cmd.status().expect("failed to run command");
+        let exit_status =
+            cmd.status().unwrap_or_else(|err| panic!("failed to run `{cmd:?}`:\n{err}"));
         std::process::exit(exit_status.code().unwrap_or(-1))
     }
     // On Unix targets, actually exec.
@@ -138,48 +139,28 @@ pub fn exec(mut cmd: Command) -> ! {
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
-        let error = cmd.exec();
-        panic!("failed to run command: {error}")
+        let err = cmd.exec();
+        panic!("failed to run `{cmd:?}`:\n{err}")
     }
 }
 
-/// Execute the `Command`, where possible by replacing the current process with a new process
-/// described by the `Command`. Then exit this process with the exit code of the new process.
-/// `input` is also piped to the new process's stdin, on cfg(unix) platforms by writing its
-/// contents to `path` first, then setting stdin to that file.
-pub fn exec_with_pipe<P>(mut cmd: Command, input: &[u8], path: P) -> !
-where
-    P: AsRef<Path>,
-{
-    #[cfg(unix)]
-    {
-        // Write the bytes we want to send to stdin out to a file
-        std::fs::write(&path, input).unwrap();
-        // Open the file for reading, and set our new stdin to it
-        let stdin = File::open(&path).unwrap();
-        cmd.stdin(stdin);
-        // Unlink the file so that it is fully cleaned up as soon as the new process exits
-        std::fs::remove_file(&path).unwrap();
-        // Finally, we can hand off control.
-        exec(cmd)
-    }
-    #[cfg(not(unix))]
-    {
-        drop(path); // We don't need the path, we can pipe the bytes directly
-        cmd.stdin(std::process::Stdio::piped());
-        let mut child = cmd.spawn().expect("failed to spawn process");
-        let child_stdin = child.stdin.take().unwrap();
-        // Write stdin in a background thread, as it may block.
-        let exit_status = std::thread::scope(|s| {
-            s.spawn(|| {
-                let mut child_stdin = child_stdin;
-                // Ignore failure, it is most likely due to the process having terminated.
-                let _ = child_stdin.write_all(input);
-            });
-            child.wait().expect("failed to run command")
+/// Execute the `Command`, then exit this process with the exit code of the new process.
+/// `input` is also piped to the new process's stdin.
+pub fn exec_with_pipe(mut cmd: Command, input: &[u8]) -> ! {
+    // We can't use `exec` since then the background thread will stop running.
+    cmd.stdin(std::process::Stdio::piped());
+    let mut child = cmd.spawn().expect("failed to spawn process");
+    let child_stdin = child.stdin.take().unwrap();
+    // Write stdin in a background thread, as it may block.
+    let exit_status = std::thread::scope(|s| {
+        s.spawn(|| {
+            let mut child_stdin = child_stdin;
+            // Ignore failure, it is most likely due to the process having terminated.
+            let _ = child_stdin.write_all(input);
         });
-        std::process::exit(exit_status.code().unwrap_or(-1))
-    }
+        child.wait().expect("failed to run command")
+    });
+    std::process::exit(exit_status.code().unwrap_or(-1))
 }
 
 pub fn ask_to_run(mut cmd: Command, ask: bool, text: &str) {
@@ -232,7 +213,11 @@ fn cargo_extra_flags() -> Vec<String> {
 
 pub fn get_cargo_metadata() -> Metadata {
     // This will honor the `CARGO` env var the same way our `cargo()` does.
-    MetadataCommand::new().no_deps().other_options(cargo_extra_flags()).exec().unwrap()
+    MetadataCommand::new()
+        .no_deps()
+        .other_options(cargo_extra_flags())
+        .exec()
+        .unwrap_or_else(|err| show_error!("{}", err))
 }
 
 /// Pulls all the crates in this workspace from the cargo metadata.
@@ -318,25 +303,4 @@ pub fn clean_target_dir(meta: &Metadata) {
     eprintln!("Cleaning target directory at {}", target_dir.display());
 
     remove_dir_all_idem(&target_dir).unwrap_or_else(|err| show_error!("{}", err))
-}
-
-/// Run `f` according to the many-seeds argument. In single-seed mode, `f` will only
-/// be called once, with `None`.
-pub fn run_many_seeds(many_seeds: Option<String>, f: impl Fn(Option<u32>)) {
-    let Some(many_seeds) = many_seeds else {
-        return f(None);
-    };
-    let (from, to) = many_seeds
-        .split_once("..")
-        .unwrap_or_else(|| show_error!("invalid format for `--many-seeds`: expected `from..to`"));
-    let from: u32 = if from.is_empty() {
-        0
-    } else {
-        from.parse().unwrap_or_else(|_| show_error!("invalid `from` in `--many-seeds=from..to"))
-    };
-    let to: u32 =
-        to.parse().unwrap_or_else(|_| show_error!("invalid `to` in `--many-seeds=from..to"));
-    for seed in from..to {
-        f(Some(seed));
-    }
 }

@@ -5,9 +5,9 @@ use std::ops;
 
 use rustc_hir as hir;
 use rustc_lint::builtin::MISSING_DOCS;
-use rustc_middle::lint::LintLevelSource;
+use rustc_middle::lint::{LevelAndSource, LintLevelSource};
 use rustc_session::lint;
-use rustc_span::FileName;
+use rustc_span::{FileName, RemapPathScopeComponents};
 use serde::Serialize;
 use tracing::debug;
 
@@ -118,13 +118,13 @@ fn limit_filename_len(filename: String) -> String {
     }
 }
 
-impl<'a, 'b> CoverageCalculator<'a, 'b> {
+impl CoverageCalculator<'_, '_> {
     fn to_json(&self) -> String {
         serde_json::to_string(
             &self
                 .items
                 .iter()
-                .map(|(k, v)| (k.prefer_local().to_string(), v))
+                .map(|(k, v)| (k.display(RemapPathScopeComponents::COVERAGE).to_string(), v))
                 .collect::<BTreeMap<String, &ItemCount>>(),
         )
         .expect("failed to convert JSON data to string")
@@ -167,7 +167,9 @@ impl<'a, 'b> CoverageCalculator<'a, 'b> {
         for (file, &count) in &self.items {
             if let Some(percentage) = count.percentage() {
                 print_table_record(
-                    &limit_filename_len(file.prefer_local().to_string_lossy().into()),
+                    &limit_filename_len(
+                        file.display(RemapPathScopeComponents::COVERAGE).to_string(),
+                    ),
                     count,
                     percentage,
                     count.examples_percentage().unwrap_or(0.),
@@ -188,7 +190,7 @@ impl<'a, 'b> CoverageCalculator<'a, 'b> {
     }
 }
 
-impl<'a, 'b> DocVisitor<'_> for CoverageCalculator<'a, 'b> {
+impl DocVisitor<'_> for CoverageCalculator<'_, '_> {
     fn visit_item(&mut self, i: &clean::Item) {
         if !i.item_id.is_local() {
             // non-local items are skipped because they can be out of the users control,
@@ -199,6 +201,10 @@ impl<'a, 'b> DocVisitor<'_> for CoverageCalculator<'a, 'b> {
         match i.kind {
             clean::StrippedItem(..) => {
                 // don't count items in stripped modules
+                return;
+            }
+            clean::PlaceholderImplItem => {
+                // The "real" impl items are handled below.
                 return;
             }
             // docs on `use` and `extern crate` statements are not displayed, so they're not
@@ -212,11 +218,12 @@ impl<'a, 'b> DocVisitor<'_> for CoverageCalculator<'a, 'b> {
                 let has_docs = !i.attrs.doc_strings.is_empty();
                 let mut tests = Tests { found_tests: 0 };
 
-                find_testable_code(&i.doc_value(), &mut tests, ErrorCodes::No, false, None);
+                find_testable_code(&i.doc_value(), &mut tests, ErrorCodes::No, None);
 
                 let has_doc_example = tests.found_tests != 0;
                 let hir_id = DocContext::as_local_hir_id(self.ctx.tcx, i.item_id).unwrap();
-                let (level, source) = self.ctx.tcx.lint_level_at_node(MISSING_DOCS, hir_id);
+                let LevelAndSource { level, src, .. } =
+                    self.ctx.tcx.lint_level_at_node(MISSING_DOCS, hir_id);
 
                 // In case we have:
                 //
@@ -232,7 +239,7 @@ impl<'a, 'b> DocVisitor<'_> for CoverageCalculator<'a, 'b> {
                     .item_id
                     .as_def_id()
                     .and_then(|def_id| self.ctx.tcx.opt_parent(def_id))
-                    .and_then(|def_id| self.ctx.tcx.hir().get_if_local(def_id))
+                    .and_then(|def_id| self.ctx.tcx.hir_get_if_local(def_id))
                     .map(|node| {
                         matches!(
                             node,
@@ -240,7 +247,7 @@ impl<'a, 'b> DocVisitor<'_> for CoverageCalculator<'a, 'b> {
                                 data: hir::VariantData::Tuple(_, _, _),
                                 ..
                             }) | hir::Node::Item(hir::Item {
-                                kind: hir::ItemKind::Struct(hir::VariantData::Tuple(_, _, _), _),
+                                kind: hir::ItemKind::Struct(_, _, hir::VariantData::Tuple(_, _, _)),
                                 ..
                             })
                         )
@@ -251,7 +258,7 @@ impl<'a, 'b> DocVisitor<'_> for CoverageCalculator<'a, 'b> {
                 // unless the user had an explicit `allow`.
                 //
                 let should_have_docs = !should_be_ignored
-                    && (level != lint::Level::Allow || matches!(source, LintLevelSource::Default));
+                    && (level != lint::Level::Allow || matches!(src, LintLevelSource::Default));
 
                 if let Some(span) = i.span(self.ctx.tcx) {
                     let filename = span.filename(self.ctx.sess());

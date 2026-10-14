@@ -1,5 +1,8 @@
-use rustc_abi::ExternAbi;
+use rustc_abi::CanonAbi;
+use rustc_middle::ty::Ty;
 use rustc_span::Symbol;
+use rustc_target::callconv::FnAbi;
+use rustc_target::spec::Arch;
 
 use crate::*;
 
@@ -8,7 +11,7 @@ pub(super) trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
     fn emulate_x86_bmi_intrinsic(
         &mut self,
         link_name: Symbol,
-        abi: ExternAbi,
+        abi: &FnAbi<'tcx, Ty<'tcx>>,
         args: &[OpTy<'tcx>],
         dest: &MPlaceTy<'tcx>,
     ) -> InterpResult<'tcx, EmulateItemResult> {
@@ -29,12 +32,11 @@ pub(super) trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         let target_feature = if unprefixed_name == "bextr" { "bmi1" } else { "bmi2" };
         this.expect_target_feature_for_intrinsic(link_name, target_feature)?;
 
-        if is_64_bit && this.tcx.sess.target.arch != "x86_64" {
+        if is_64_bit && this.tcx.sess.target.arch != Arch::X86_64 {
             return interp_ok(EmulateItemResult::NotSupported);
         }
 
-        let [left, right] =
-            this.check_shim(abi, ExternAbi::C { unwind: false }, link_name, args)?;
+        let [left, right] = this.check_shim_sig_lenient(abi, CanonAbi::C, link_name, args)?;
         let left = this.read_scalar(left)?;
         let right = this.read_scalar(right)?;
 
@@ -42,7 +44,7 @@ pub(super) trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         let right = if is_64_bit { right.to_u64()? } else { u64::from(right.to_u32()?) };
 
         let result = match unprefixed_name {
-            // Extract a contigous range of bits from an unsigned integer.
+            // Extract a contiguous range of bits from an unsigned integer.
             // https://www.intel.com/content/www/us/en/docs/intrinsics-guide/index.html#text=_bextr_u32
             "bextr" => {
                 let start = u32::try_from(right & 0xff).unwrap();

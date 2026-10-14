@@ -1,19 +1,19 @@
-// Only works on Unix targets
-//@ignore-target: windows wasm
-//@only-on-host
+//@revisions: trace notrace
+//@[trace] only-target: x86_64-unknown-linux-gnu i686-unknown-linux-gnu
+//@[trace] compile-flags: -Zmiri-native-lib-enable-tracing
+//@compile-flags: -Zmiri-permissive-provenance
+
+use std::ptr::NonNull;
 
 fn main() {
-    test_pointer();
-
-    test_simple();
-
-    test_nested();
-
-    test_static();
+    test_access_pointer();
+    test_access_simple();
+    test_access_nested();
+    test_access_static();
 }
 
-// Test void function that dereferences a pointer and prints its contents from C.
-fn test_pointer() {
+/// Test function that dereferences an int pointer and prints its contents from C.
+fn test_access_pointer() {
     extern "C" {
         fn print_pointer(ptr: *const i32);
     }
@@ -23,8 +23,8 @@ fn test_pointer() {
     unsafe { print_pointer(&x) };
 }
 
-// Test function that dereferences a simple struct pointer and accesses a field.
-fn test_simple() {
+/// Test function that dereferences a simple struct pointer and accesses a field.
+fn test_access_simple() {
     #[repr(C)]
     struct Simple {
         field: i32,
@@ -32,15 +32,19 @@ fn test_simple() {
 
     extern "C" {
         fn access_simple(s_ptr: *const Simple) -> i32;
+        fn access_simple2(s_ptr: NonNull<Simple>) -> i32;
+        fn access_simple3(s_ptr: Option<NonNull<Simple>>) -> i32;
     }
 
     let simple = Simple { field: -42 };
 
     assert_eq!(unsafe { access_simple(&simple) }, -42);
+    assert_eq!(unsafe { access_simple2(NonNull::from(&simple)) }, -42);
+    assert_eq!(unsafe { access_simple3(Some(NonNull::from(&simple))) }, -42);
 }
 
-// Test function that dereferences nested struct pointers and accesses fields.
-fn test_nested() {
+/// Test function that dereferences nested struct pointers and accesses fields.
+fn test_access_nested() {
     use std::ptr::NonNull;
 
     #[derive(Debug, PartialEq, Eq)]
@@ -61,8 +65,8 @@ fn test_nested() {
     assert_eq!(unsafe { access_nested(&nested_2) }, 97);
 }
 
-// Test function that dereferences static struct pointers and accesses fields.
-fn test_static() {
+/// Test function that dereferences a static struct pointer and accesses fields.
+fn test_access_static() {
     #[repr(C)]
     struct Static {
         value: i32,

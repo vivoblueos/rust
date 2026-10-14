@@ -5,14 +5,20 @@ error: error reading Clippy's configuration file: unknown field `foobar`, expect
            accept-comment-above-statement
            allow-comparison-to-zero
            allow-dbg-in-tests
+           allow-exact-repetitions
+           allow-expect-in-consts
            allow-expect-in-tests
+           allow-indexing-slicing-in-tests
+           allow-large-stack-frames-in-tests
            allow-mixed-uninlined-format-args
            allow-one-hash-in-raw-strings
            allow-panic-in-tests
            allow-print-in-tests
            allow-private-module-inception
            allow-renamed-params-for
+           allow-unwrap-in-consts
            allow-unwrap-in-tests
+           allow-unwrap-types
            allow-useless-vec-in-tests
            allowed-dotfiles
            allowed-duplicate-crates
@@ -26,11 +32,13 @@ error: error reading Clippy's configuration file: unknown field `foobar`, expect
            array-size-threshold
            avoid-breaking-exported-api
            await-holding-invalid-types
-           blacklisted-names
            cargo-ignore-publish
+           check-incompatible-msrv-in-tests
+           check-inconsistent-struct-field-initializers
            check-private-items
            cognitive-complexity-threshold
-           cyclomatic-complexity-threshold
+           const-literal-digits-threshold
+           disallowed-fields
            disallowed-macros
            disallowed-methods
            disallowed-names
@@ -44,7 +52,10 @@ error: error reading Clippy's configuration file: unknown field `foobar`, expect
            excessive-nesting-threshold
            future-size-threshold
            ignore-interior-mutability
+           inherent-impl-lint-scope
+           large-error-ignored
            large-error-threshold
+           lint-commented-code
            literal-representation-threshold
            matches-for-let-else
            max-fn-params-bools
@@ -53,11 +64,14 @@ error: error reading Clippy's configuration file: unknown field `foobar`, expect
            max-suggested-slice-pattern-length
            max-trait-bounds
            min-ident-chars-threshold
+           missing-docs-allow-unused
            missing-docs-in-crate-items
            module-item-order-groupings
+           module-items-ordered-within-groupings
            msrv
            pass-by-value-size-limit
            pub-underscore-fields-behavior
+           recursive-self-in-type-definitions
            semicolon-inside-block-ignore-singleline
            semicolon-outside-block-ignore-multiline
            single-char-binding-names-threshold
@@ -92,14 +106,20 @@ error: error reading Clippy's configuration file: unknown field `barfoo`, expect
            accept-comment-above-statement
            allow-comparison-to-zero
            allow-dbg-in-tests
+           allow-exact-repetitions
+           allow-expect-in-consts
            allow-expect-in-tests
+           allow-indexing-slicing-in-tests
+           allow-large-stack-frames-in-tests
            allow-mixed-uninlined-format-args
            allow-one-hash-in-raw-strings
            allow-panic-in-tests
            allow-print-in-tests
            allow-private-module-inception
            allow-renamed-params-for
+           allow-unwrap-in-consts
            allow-unwrap-in-tests
+           allow-unwrap-types
            allow-useless-vec-in-tests
            allowed-dotfiles
            allowed-duplicate-crates
@@ -113,11 +133,13 @@ error: error reading Clippy's configuration file: unknown field `barfoo`, expect
            array-size-threshold
            avoid-breaking-exported-api
            await-holding-invalid-types
-           blacklisted-names
            cargo-ignore-publish
+           check-incompatible-msrv-in-tests
+           check-inconsistent-struct-field-initializers
            check-private-items
            cognitive-complexity-threshold
-           cyclomatic-complexity-threshold
+           const-literal-digits-threshold
+           disallowed-fields
            disallowed-macros
            disallowed-methods
            disallowed-names
@@ -131,7 +153,10 @@ error: error reading Clippy's configuration file: unknown field `barfoo`, expect
            excessive-nesting-threshold
            future-size-threshold
            ignore-interior-mutability
+           inherent-impl-lint-scope
+           large-error-ignored
            large-error-threshold
+           lint-commented-code
            literal-representation-threshold
            matches-for-let-else
            max-fn-params-bools
@@ -140,11 +165,14 @@ error: error reading Clippy's configuration file: unknown field `barfoo`, expect
            max-suggested-slice-pattern-length
            max-trait-bounds
            min-ident-chars-threshold
+           missing-docs-allow-unused
            missing-docs-in-crate-items
            module-item-order-groupings
+           module-items-ordered-within-groupings
            msrv
            pass-by-value-size-limit
            pub-underscore-fields-behavior
+           recursive-self-in-type-definitions
            semicolon-inside-block-ignore-singleline
            semicolon-outside-block-ignore-multiline
            single-char-binding-names-threshold
@@ -179,14 +207,20 @@ error: error reading Clippy's configuration file: unknown field `allow_mixed_uni
            accept-comment-above-statement
            allow-comparison-to-zero
            allow-dbg-in-tests
+           allow-exact-repetitions
+           allow-expect-in-consts
            allow-expect-in-tests
+           allow-indexing-slicing-in-tests
+           allow-large-stack-frames-in-tests
            allow-mixed-uninlined-format-args
            allow-one-hash-in-raw-strings
            allow-panic-in-tests
            allow-print-in-tests
            allow-private-module-inception
            allow-renamed-params-for
+           allow-unwrap-in-consts
            allow-unwrap-in-tests
+           allow-unwrap-types
            allow-useless-vec-in-tests
            allowed-dotfiles
            allowed-duplicate-crates
@@ -200,11 +234,13 @@ error: error reading Clippy's configuration file: unknown field `allow_mixed_uni
            array-size-threshold
            avoid-breaking-exported-api
            await-holding-invalid-types
-           blacklisted-names
            cargo-ignore-publish
+           check-incompatible-msrv-in-tests
+           check-inconsistent-struct-field-initializers
            check-private-items
            cognitive-complexity-threshold
-           cyclomatic-complexity-threshold
+           const-literal-digits-threshold
+           disallowed-fields
            disallowed-macros
            disallowed-methods
            disallowed-names
@@ -218,7 +254,10 @@ error: error reading Clippy's configuration file: unknown field `allow_mixed_uni
            excessive-nesting-threshold
            future-size-threshold
            ignore-interior-mutability
+           inherent-impl-lint-scope
+           large-error-ignored
            large-error-threshold
+           lint-commented-code
            literal-representation-threshold
            matches-for-let-else
            max-fn-params-bools
@@ -227,11 +266,14 @@ error: error reading Clippy's configuration file: unknown field `allow_mixed_uni
            max-suggested-slice-pattern-length
            max-trait-bounds
            min-ident-chars-threshold
+           missing-docs-allow-unused
            missing-docs-in-crate-items
            module-item-order-groupings
+           module-items-ordered-within-groupings
            msrv
            pass-by-value-size-limit
            pub-underscore-fields-behavior
+           recursive-self-in-type-definitions
            semicolon-inside-block-ignore-singleline
            semicolon-outside-block-ignore-multiline
            single-char-binding-names-threshold

@@ -3,15 +3,15 @@
 //! These methods should only do simple, shallow tasks related to the syntax of the node itself.
 
 use crate::{
-    ast::{
-        self,
-        operators::{ArithOp, BinaryOp, CmpOp, LogicOp, Ordering, RangeOp, UnaryOp},
-        support, ArgList, AstChildren, AstNode, BlockExpr, ClosureExpr, Const, Expr, Fn,
-        FormatArgsArg, FormatArgsExpr, MacroDef, Static, TokenTree,
-    },
     AstToken,
-    SyntaxKind::*,
+    SyntaxKind::{self, *},
     SyntaxNode, SyntaxToken, T,
+    ast::{
+        self, ArgList, AstChildren, AstNode, BlockExpr, ClosureExpr, Const, Expr, Fn,
+        FormatArgsArg, FormatArgsExpr, MacroDef, Static, TokenTree,
+        operators::{ArithOp, BinaryOp, CmpOp, LogicOp, Ordering, RangeOp, UnaryOp},
+        support,
+    },
 };
 
 use super::RangeItem;
@@ -47,6 +47,27 @@ impl From<ast::BlockExpr> for ElseBranch {
 impl From<ast::IfExpr> for ElseBranch {
     fn from(if_expr: ast::IfExpr) -> Self {
         Self::IfExpr(if_expr)
+    }
+}
+
+impl AstNode for ElseBranch {
+    fn can_cast(kind: SyntaxKind) -> bool {
+        ast::BlockExpr::can_cast(kind) || ast::IfExpr::can_cast(kind)
+    }
+
+    fn cast(syntax: SyntaxNode) -> Option<Self> {
+        if let Some(block_expr) = ast::BlockExpr::cast(syntax.clone()) {
+            Some(Self::Block(block_expr))
+        } else {
+            ast::IfExpr::cast(syntax).map(Self::IfExpr)
+        }
+    }
+
+    fn syntax(&self) -> &SyntaxNode {
+        match self {
+            ElseBranch::Block(block_expr) => block_expr.syntax(),
+            ElseBranch::IfExpr(if_expr) => if_expr.syntax(),
+        }
     }
 }
 
@@ -354,7 +375,11 @@ impl ast::Literal {
 pub enum BlockModifier {
     Async(SyntaxToken),
     Unsafe(SyntaxToken),
-    Try(SyntaxToken),
+    Try {
+        try_token: SyntaxToken,
+        bikeshed_token: Option<SyntaxToken>,
+        result_type: Option<ast::Type>,
+    },
     Const(SyntaxToken),
     AsyncGen(SyntaxToken),
     Gen(SyntaxToken),
@@ -373,7 +398,13 @@ impl ast::BlockExpr {
             })
             .or_else(|| self.async_token().map(BlockModifier::Async))
             .or_else(|| self.unsafe_token().map(BlockModifier::Unsafe))
-            .or_else(|| self.try_token().map(BlockModifier::Try))
+            .or_else(|| {
+                let modifier = self.try_block_modifier()?;
+                let try_token = modifier.try_token()?;
+                let bikeshed_token = modifier.bikeshed_token();
+                let result_type = modifier.ty();
+                Some(BlockModifier::Try { try_token, bikeshed_token, result_type })
+            })
             .or_else(|| self.const_token().map(BlockModifier::Const))
             .or_else(|| self.label().map(BlockModifier::Label))
     }
@@ -393,7 +424,7 @@ impl ast::BlockExpr {
             FOR_EXPR | IF_EXPR => parent
                 .children()
                 .find(|it| ast::Expr::can_cast(it.kind()))
-                .map_or(true, |it| it == *self.syntax()),
+                .is_none_or(|it| it == *self.syntax()),
             LET_ELSE | FN | WHILE_EXPR | LOOP_EXPR | CONST_BLOCK_PAT => false,
             _ => true,
         }

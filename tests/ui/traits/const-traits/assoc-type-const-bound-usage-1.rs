@@ -1,12 +1,10 @@
-//@ compile-flags: -Znext-solver
-//@ known-bug: unknown
+//@ check-pass
 
 #![feature(const_trait_impl, generic_const_exprs)]
 #![allow(incomplete_features)]
 
-#[const_trait]
-trait Trait {
-    type Assoc: ~const Trait;
+const trait Trait {
+    type Assoc: [const] Trait;
     fn func() -> i32;
 }
 

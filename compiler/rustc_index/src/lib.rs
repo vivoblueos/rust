@@ -1,10 +1,13 @@
 // tidy-alphabetical-start
 #![cfg_attr(all(feature = "nightly", test), feature(stmt_expr_attributes))]
-#![cfg_attr(feature = "nightly", allow(internal_features))]
-#![cfg_attr(feature = "nightly", feature(extend_one, step_trait, test))]
-#![cfg_attr(feature = "nightly", feature(new_zeroed_alloc))]
-#![warn(unreachable_pub)]
+#![cfg_attr(all(feature = "nightly", test), feature(test))]
+#![cfg_attr(feature = "nightly", feature(extend_one, step_trait))]
 // tidy-alphabetical-end
+
+// FIXME(#125687): new_range_api recently stabilized
+// Remove this when it hits stable. cfg(bootstrap)
+#![allow(stable_features)]
+#![cfg_attr(feature = "nightly", feature(new_range_api))]
 
 pub mod bit_set;
 #[cfg(feature = "nightly")]
@@ -14,7 +17,7 @@ mod idx;
 mod slice;
 mod vec;
 
-pub use idx::Idx;
+pub use idx::{Idx, IntoSliceIdx};
 pub use rustc_index_macros::newtype_index;
 pub use slice::IndexSlice;
 #[doc(no_inline)]
@@ -48,5 +51,15 @@ macro_rules! static_assert_size {
         // no effect other than using the statements.
         // struct sizes are not deterministic under randomized layouts
         const _: (usize, usize) = ($size, ::std::mem::size_of::<$ty>());
+    };
+}
+
+#[macro_export]
+macro_rules! indexvec {
+    ($expr:expr; $n:expr) => {
+        IndexVec::from_raw(vec![$expr; $n])
+    };
+    ($($expr:expr),* $(,)?) => {
+        IndexVec::from_raw(vec![$($expr),*])
     };
 }

@@ -1,10 +1,10 @@
 use std::borrow::Cow;
 
+use rustc_ast::YieldKind;
 use rustc_ast::ast::{
-    self, Attribute, MetaItem, MetaItemInner, MetaItemKind, NodeId, Path, Visibility,
-    VisibilityKind,
+    self, Attribute, ImplRestriction, MetaItem, MetaItemInner, MetaItemKind, NodeId, Path,
+    RestrictionKind, Visibility, VisibilityKind,
 };
-use rustc_ast::ptr;
 use rustc_ast_pretty::pprust;
 use rustc_span::{BytePos, LocalExpnId, Span, Symbol, SyntaxContext, sym, symbol};
 use unicode_width::UnicodeWidthStr;
@@ -74,6 +74,40 @@ pub(crate) fn format_visibility(
     }
 }
 
+pub(crate) fn format_impl_restriction(
+    context: &RewriteContext<'_>,
+    impl_restriction: &ImplRestriction,
+) -> String {
+    format_restriction("impl", context, &impl_restriction.kind)
+}
+
+fn format_restriction(
+    kw: &'static str,
+    context: &RewriteContext<'_>,
+    restriction: &RestrictionKind,
+) -> String {
+    match restriction {
+        RestrictionKind::Unrestricted => String::new(),
+        RestrictionKind::Restricted {
+            ref path,
+            id: _,
+            shorthand,
+        } => {
+            let Path { ref segments, .. } = **path;
+            let mut segments_iter = segments.iter().map(|seg| rewrite_ident(context, seg.ident));
+            if path.is_global() && segments_iter.next().is_none() {
+                panic!("non-global path in {kw}(restricted)?");
+            }
+            // FIXME use `segments_iter.intersperse("::").collect::<String>()` once
+            // `#![feature(iter_intersperse)]` is re-stabilized.
+            let path = itertools::join(segments_iter, "::");
+            let in_str = if *shorthand { "" } else { "in " };
+
+            format!("{kw}({in_str}{path}) ")
+        }
+    }
+}
+
 #[inline]
 pub(crate) fn format_coro(coroutine_kind: &ast::CoroutineKind) -> &'static str {
     match coroutine_kind {
@@ -102,8 +136,9 @@ pub(crate) fn format_constness_right(constness: ast::Const) -> &'static str {
 #[inline]
 pub(crate) fn format_defaultness(defaultness: ast::Defaultness) -> &'static str {
     match defaultness {
+        ast::Defaultness::Implicit => "",
         ast::Defaultness::Default(..) => "default ",
-        ast::Defaultness::Final => "",
+        ast::Defaultness::Final(..) => "final ",
     }
 }
 
@@ -133,6 +168,19 @@ pub(crate) fn format_mutability(mutability: ast::Mutability) -> &'static str {
 }
 
 #[inline]
+pub(crate) fn format_pinnedness_and_mutability(
+    pinnedness: ast::Pinnedness,
+    mutability: ast::Mutability,
+) -> (&'static str, &'static str) {
+    match (pinnedness, mutability) {
+        (ast::Pinnedness::Pinned, ast::Mutability::Mut) => ("pin ", "mut "),
+        (ast::Pinnedness::Pinned, ast::Mutability::Not) => ("pin ", "const "),
+        (ast::Pinnedness::Not, ast::Mutability::Mut) => ("", "mut "),
+        (ast::Pinnedness::Not, ast::Mutability::Not) => ("", ""),
+    }
+}
+
+#[inline]
 pub(crate) fn format_extern(ext: ast::Extern, explicit_abi: bool) -> Cow<'static, str> {
     match ext {
         ast::Extern::None => Cow::from(""),
@@ -149,8 +197,8 @@ pub(crate) fn format_extern(ext: ast::Extern, explicit_abi: bool) -> Cow<'static
 }
 
 #[inline]
-// Transform `Vec<rustc_ast::ptr::P<T>>` into `Vec<&T>`
-pub(crate) fn ptr_vec_to_ref_vec<T>(vec: &[ptr::P<T>]) -> Vec<&T> {
+// Transform `Vec<Box<T>>` into `Vec<&T>`
+pub(crate) fn ptr_vec_to_ref_vec<T>(vec: &[Box<T>]) -> Vec<&T> {
     vec.iter().map(|x| &**x).collect::<Vec<_>>()
 }
 
@@ -485,7 +533,9 @@ pub(crate) fn is_block_expr(context: &RewriteContext<'_>, expr: &ast::Expr, repr
         | ast::ExprKind::Index(_, ref expr, _)
         | ast::ExprKind::Unary(_, ref expr)
         | ast::ExprKind::Try(ref expr)
-        | ast::ExprKind::Yield(Some(ref expr)) => is_block_expr(context, expr, repr),
+        | ast::ExprKind::Yield(YieldKind::Prefix(Some(ref expr))) => {
+            is_block_expr(context, expr, repr)
+        }
         ast::ExprKind::Closure(ref closure) => is_block_expr(context, &closure.body, repr),
         // This can only be a string lit
         ast::ExprKind::Lit(_) => {
@@ -504,6 +554,7 @@ pub(crate) fn is_block_expr(context: &RewriteContext<'_>, expr: &ast::Expr, repr
         | ast::ExprKind::IncludedBytes(..)
         | ast::ExprKind::InlineAsm(..)
         | ast::ExprKind::OffsetOf(..)
+        | ast::ExprKind::UnsafeBinderCast(..)
         | ast::ExprKind::Let(..)
         | ast::ExprKind::Path(..)
         | ast::ExprKind::Range(..)
@@ -512,8 +563,9 @@ pub(crate) fn is_block_expr(context: &RewriteContext<'_>, expr: &ast::Expr, repr
         | ast::ExprKind::Become(..)
         | ast::ExprKind::Yeet(..)
         | ast::ExprKind::Tup(..)
+        | ast::ExprKind::Use(..)
         | ast::ExprKind::Type(..)
-        | ast::ExprKind::Yield(None)
+        | ast::ExprKind::Yield(..)
         | ast::ExprKind::Underscore => false,
     }
 }

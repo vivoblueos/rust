@@ -1,6 +1,13 @@
 #[cfg(test)]
 mod tests;
 
+// On 64-bit platforms, `io::Error` may use a bit-packed representation to
+// reduce size. However, this representation assumes that error codes are
+// always 32-bit wide.
+//
+// This assumption is invalid on 64-bit UEFI, where error codes are 64-bit.
+// Therefore, the packed representation is explicitly disabled for UEFI
+// targets, and the unpacked representation must be used instead.
 #[cfg(all(target_pointer_width = "64", not(target_os = "uefi")))]
 mod repr_bitpacked;
 #[cfg(all(target_pointer_width = "64", not(target_os = "uefi")))]
@@ -18,7 +25,7 @@ use crate::{error, fmt, result, sys};
 /// This type is broadly used across [`std::io`] for any operation which may
 /// produce an error.
 ///
-/// This typedef is generally used to avoid writing out [`io::Error`] directly and
+/// This type alias is generally used to avoid writing out [`io::Error`] directly and
 /// is otherwise a direct mapping to [`Result`].
 ///
 /// While usual Rust style is to import types directly, aliases of [`Result`]
@@ -48,6 +55,7 @@ use crate::{error, fmt, result, sys};
 /// }
 /// ```
 #[stable(feature = "rust1", since = "1.0.0")]
+#[doc(search_unbox)]
 pub type Result<T> = result::Result<T, Error>;
 
 /// The error type for I/O operations of the [`Read`], [`Write`], [`Seek`], and
@@ -76,31 +84,34 @@ impl fmt::Debug for Error {
 #[allow(dead_code)]
 impl Error {
     pub(crate) const INVALID_UTF8: Self =
-        const_io_error!(ErrorKind::InvalidData, "stream did not contain valid UTF-8");
+        const_error!(ErrorKind::InvalidData, "stream did not contain valid UTF-8");
 
     pub(crate) const READ_EXACT_EOF: Self =
-        const_io_error!(ErrorKind::UnexpectedEof, "failed to fill whole buffer");
+        const_error!(ErrorKind::UnexpectedEof, "failed to fill whole buffer");
 
-    pub(crate) const UNKNOWN_THREAD_COUNT: Self = const_io_error!(
+    pub(crate) const UNKNOWN_THREAD_COUNT: Self = const_error!(
         ErrorKind::NotFound,
-        "The number of hardware threads is not known for the target platform"
+        "the number of hardware threads is not known for the target platform",
     );
 
     pub(crate) const UNSUPPORTED_PLATFORM: Self =
-        const_io_error!(ErrorKind::Unsupported, "operation not supported on this platform");
+        const_error!(ErrorKind::Unsupported, "operation not supported on this platform");
 
     pub(crate) const WRITE_ALL_EOF: Self =
-        const_io_error!(ErrorKind::WriteZero, "failed to write whole buffer");
+        const_error!(ErrorKind::WriteZero, "failed to write whole buffer");
 
     pub(crate) const ZERO_TIMEOUT: Self =
-        const_io_error!(ErrorKind::InvalidInput, "cannot set a 0 duration timeout");
+        const_error!(ErrorKind::InvalidInput, "cannot set a 0 duration timeout");
+
+    pub(crate) const NO_ADDRESSES: Self =
+        const_error!(ErrorKind::InvalidInput, "could not resolve to any addresses");
 }
 
 #[stable(feature = "rust1", since = "1.0.0")]
 impl From<alloc::ffi::NulError> for Error {
     /// Converts a [`alloc::ffi::NulError`] into a [`Error`].
     fn from(_: alloc::ffi::NulError) -> Error {
-        const_io_error!(ErrorKind::InvalidInput, "data provided contains a nul byte")
+        const_error!(ErrorKind::InvalidInput, "data provided contains a nul byte")
     }
 }
 
@@ -135,7 +146,7 @@ enum ErrorData<C> {
 ///
 /// [`into`]: Into::into
 #[unstable(feature = "raw_os_error_ty", issue = "107792")]
-pub type RawOsError = sys::RawOsError;
+pub type RawOsError = sys::io::RawOsError;
 
 // `#[repr(align(4))]` is probably redundant, it should have that value or
 // higher already. We include it just because repr_bitpacked.rs's encoding
@@ -151,27 +162,38 @@ pub type RawOsError = sys::RawOsError;
 // (For the sake of being explicit: the alignment requirement here only matters
 // if `error/repr_bitpacked.rs` is in use — for the unpacked repr it doesn't
 // matter at all)
+#[doc(hidden)]
+#[unstable(feature = "io_const_error_internals", issue = "none")]
 #[repr(align(4))]
 #[derive(Debug)]
-pub(crate) struct SimpleMessage {
-    kind: ErrorKind,
-    message: &'static str,
+pub struct SimpleMessage {
+    pub kind: ErrorKind,
+    pub message: &'static str,
 }
 
-impl SimpleMessage {
-    pub(crate) const fn new(kind: ErrorKind, message: &'static str) -> Self {
-        Self { kind, message }
-    }
-}
-
-/// Creates and returns an `io::Error` for a given `ErrorKind` and constant
-/// message. This doesn't allocate.
-pub(crate) macro const_io_error($kind:expr, $message:expr $(,)?) {
-    $crate::io::error::Error::from_static_message({
-        const MESSAGE_DATA: $crate::io::error::SimpleMessage =
-            $crate::io::error::SimpleMessage::new($kind, $message);
-        &MESSAGE_DATA
-    })
+/// Creates a new I/O error from a known kind of error and a string literal.
+///
+/// Contrary to [`Error::new`], this macro does not allocate and can be used in
+/// `const` contexts.
+///
+/// # Example
+/// ```
+/// #![feature(io_const_error)]
+/// use std::io::{const_error, Error, ErrorKind};
+///
+/// const FAIL: Error = const_error!(ErrorKind::Unsupported, "tried something that never works");
+///
+/// fn not_here() -> Result<(), Error> {
+///     Err(FAIL)
+/// }
+/// ```
+#[rustc_macro_transparency = "semiopaque"]
+#[unstable(feature = "io_const_error", issue = "133448")]
+#[allow_internal_unstable(hint_must_use, io_const_error_internals)]
+pub macro const_error($kind:expr, $message:expr $(,)?) {
+    $crate::hint::must_use($crate::io::Error::from_static_message(
+        const { &$crate::io::SimpleMessage { kind: $kind, message: $message } },
+    ))
 }
 
 // As with `SimpleMessage`: `#[repr(align(4))]` here is just because
@@ -207,6 +229,7 @@ struct Custom {
 /// the recognized error kinds and fail in those cases.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 #[stable(feature = "rust1", since = "1.0.0")]
+#[cfg_attr(not(test), rustc_diagnostic_item = "io_errorkind")]
 #[allow(deprecated)]
 #[non_exhaustive]
 pub enum ErrorKind {
@@ -327,9 +350,9 @@ pub enum ErrorKind {
     /// example, on Unix, a named pipe opened with `File::open`.
     #[stable(feature = "io_error_a_bit_more", since = "1.83.0")]
     NotSeekable,
-    /// Filesystem quota was exceeded.
-    #[unstable(feature = "io_error_more", issue = "86442")]
-    FilesystemQuotaExceeded,
+    /// Filesystem quota or some other kind of quota was exceeded.
+    #[stable(feature = "io_error_quota_exceeded", since = "1.85.0")]
+    QuotaExceeded,
     /// File larger than allowed or supported.
     ///
     /// This might arise from a hard limit of the underlying filesystem or file access API, or from
@@ -353,7 +376,7 @@ pub enum ErrorKind {
     #[stable(feature = "io_error_a_bit_more", since = "1.83.0")]
     Deadlock,
     /// Cross-device or cross-filesystem (hard) link or rename.
-    #[unstable(feature = "io_error_more", issue = "86442")]
+    #[stable(feature = "io_error_crosses_devices", since = "1.85.0")]
     CrossesDevices,
     /// Too many (hard) links to the same filesystem object.
     ///
@@ -362,8 +385,8 @@ pub enum ErrorKind {
     TooManyLinks,
     /// A filename was invalid.
     ///
-    /// This error can also cause if it exceeded the filename length limit.
-    #[unstable(feature = "io_error_more", issue = "86442")]
+    /// This error can also occur if a length limit for a name was exceeded.
+    #[stable(feature = "io_error_invalid_filename", since = "1.87.0")]
     InvalidFilename,
     /// Program argument list too long.
     ///
@@ -435,8 +458,8 @@ pub enum ErrorKind {
 impl ErrorKind {
     pub(crate) fn as_str(&self) -> &'static str {
         use ErrorKind::*;
-        // tidy-alphabetical-start
         match *self {
+            // tidy-alphabetical-start
             AddrInUse => "address in use",
             AddrNotAvailable => "address not available",
             AlreadyExists => "entity already exists",
@@ -451,10 +474,9 @@ impl ErrorKind {
             ExecutableFileBusy => "executable file busy",
             FileTooLarge => "file too large",
             FilesystemLoop => "filesystem loop or indirection limit (e.g. symlink loop)",
-            FilesystemQuotaExceeded => "filesystem quota exceeded",
             HostUnreachable => "host unreachable",
-            Interrupted => "operation interrupted",
             InProgress => "in progress",
+            Interrupted => "operation interrupted",
             InvalidData => "invalid data",
             InvalidFilename => "invalid filename",
             InvalidInput => "invalid input parameter",
@@ -468,6 +490,7 @@ impl ErrorKind {
             Other => "other error",
             OutOfMemory => "out of memory",
             PermissionDenied => "permission denied",
+            QuotaExceeded => "quota exceeded",
             ReadOnlyFilesystem => "read-only filesystem or storage medium",
             ResourceBusy => "resource busy",
             StaleNetworkFileHandle => "stale network file handle",
@@ -479,8 +502,8 @@ impl ErrorKind {
             Unsupported => "unsupported",
             WouldBlock => "operation would block",
             WriteZero => "write zero",
+            // tidy-alphabetical-end
         }
-        // tidy-alphabetical-end
     }
 }
 
@@ -550,6 +573,7 @@ impl Error {
     /// let eof_error = Error::from(ErrorKind::UnexpectedEof);
     /// ```
     #[stable(feature = "rust1", since = "1.0.0")]
+    #[cfg_attr(not(test), rustc_diagnostic_item = "io_error_new")]
     #[inline(never)]
     pub fn new<E>(kind: ErrorKind, error: E) -> Error
     where
@@ -592,13 +616,15 @@ impl Error {
     ///
     /// This function does not allocate.
     ///
-    /// You should not use this directly, and instead use the `const_io_error!`
-    /// macro: `io::const_io_error!(ErrorKind::Something, "some_message")`.
+    /// You should not use this directly, and instead use the `const_error!`
+    /// macro: `io::const_error!(ErrorKind::Something, "some_message")`.
     ///
     /// This function should maybe change to `from_static_message<const MSG: &'static
     /// str>(kind: ErrorKind)` in the future, when const generics allow that.
     #[inline]
-    pub(crate) const fn from_static_message(msg: &'static SimpleMessage) -> Error {
+    #[doc(hidden)]
+    #[unstable(feature = "io_const_error_internals", issue = "none")]
+    pub const fn from_static_message(msg: &'static SimpleMessage) -> Error {
         Self { repr: Repr::new_simple_message(msg) }
     }
 
@@ -627,7 +653,7 @@ impl Error {
     #[must_use]
     #[inline]
     pub fn last_os_error() -> Error {
-        Error::from_raw_os_error(sys::os::errno())
+        Error::from_raw_os_error(sys::io::errno())
     }
 
     /// Creates a new instance of an [`Error`] from a particular OS error code.
@@ -931,19 +957,19 @@ impl Error {
     where
         E: error::Error + Send + Sync + 'static,
     {
-        match self.repr.into_data() {
-            ErrorData::Custom(b) if b.error.is::<E>() => {
-                let res = (*b).error.downcast::<E>();
-
-                // downcast is a really trivial and is marked as inline, so
-                // it's likely be inlined here.
-                //
-                // And the compiler should be able to eliminate the branch
-                // that produces `Err` here since b.error.is::<E>()
-                // returns true.
-                Ok(*res.unwrap())
+        if let ErrorData::Custom(c) = self.repr.data()
+            && c.error.is::<E>()
+        {
+            if let ErrorData::Custom(b) = self.repr.into_data()
+                && let Ok(err) = b.error.downcast::<E>()
+            {
+                Ok(*err)
+            } else {
+                // Safety: We have just checked that the condition is true
+                unsafe { crate::hint::unreachable_unchecked() }
             }
-            repr_data => Err(Self { repr: Repr::new(repr_data) }),
+        } else {
+            Err(self)
         }
     }
 
@@ -978,7 +1004,7 @@ impl Error {
     #[inline]
     pub fn kind(&self) -> ErrorKind {
         match self.repr.data() {
-            ErrorData::Os(code) => sys::decode_error_kind(code),
+            ErrorData::Os(code) => sys::io::decode_error_kind(code),
             ErrorData::Custom(c) => c.kind,
             ErrorData::Simple(kind) => kind,
             ErrorData::SimpleMessage(m) => m.kind,
@@ -988,7 +1014,7 @@ impl Error {
     #[inline]
     pub(crate) fn is_interrupted(&self) -> bool {
         match self.repr.data() {
-            ErrorData::Os(code) => sys::is_interrupted(code),
+            ErrorData::Os(code) => sys::io::is_interrupted(code),
             ErrorData::Custom(c) => c.kind == ErrorKind::Interrupted,
             ErrorData::Simple(kind) => kind == ErrorKind::Interrupted,
             ErrorData::SimpleMessage(m) => m.kind == ErrorKind::Interrupted,
@@ -1002,8 +1028,8 @@ impl fmt::Debug for Repr {
             ErrorData::Os(code) => fmt
                 .debug_struct("Os")
                 .field("code", &code)
-                .field("kind", &sys::decode_error_kind(code))
-                .field("message", &sys::os::error_string(code))
+                .field("kind", &sys::io::decode_error_kind(code))
+                .field("message", &sys::io::error_string(code))
                 .finish(),
             ErrorData::Custom(c) => fmt::Debug::fmt(&c, fmt),
             ErrorData::Simple(kind) => fmt.debug_tuple("Kind").field(&kind).finish(),
@@ -1021,7 +1047,7 @@ impl fmt::Display for Error {
     fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.repr.data() {
             ErrorData::Os(code) => {
-                let detail = sys::os::error_string(code);
+                let detail = sys::io::error_string(code);
                 write!(fmt, "{detail} (os error {code})")
             }
             ErrorData::Custom(ref c) => c.error.fmt(fmt),
@@ -1033,15 +1059,6 @@ impl fmt::Display for Error {
 
 #[stable(feature = "rust1", since = "1.0.0")]
 impl error::Error for Error {
-    #[allow(deprecated, deprecated_in_future)]
-    fn description(&self) -> &str {
-        match self.repr.data() {
-            ErrorData::Os(..) | ErrorData::Simple(..) => self.kind().as_str(),
-            ErrorData::SimpleMessage(msg) => msg.message,
-            ErrorData::Custom(c) => c.error.description(),
-        }
-    }
-
     #[allow(deprecated)]
     fn cause(&self) -> Option<&dyn error::Error> {
         match self.repr.data() {

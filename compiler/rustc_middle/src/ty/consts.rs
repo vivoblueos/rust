@@ -2,22 +2,21 @@ use std::borrow::Cow;
 
 use rustc_data_structures::intern::Interned;
 use rustc_error_messages::MultiSpan;
-use rustc_hir::def::{DefKind, Res};
-use rustc_hir::def_id::LocalDefId;
-use rustc_hir::{self as hir};
 use rustc_macros::HashStable;
+use rustc_type_ir::walk::TypeWalker;
 use rustc_type_ir::{self as ir, TypeFlags, WithCachedTypeInfo};
-use tracing::{debug, instrument};
 
-use crate::mir::interpret::{LitToConstInput, Scalar};
-use crate::ty::{self, GenericArgs, Ty, TyCtxt, TypeVisitableExt};
+use crate::mir::interpret::Scalar;
+use crate::ty::{self, Ty, TyCtxt};
 
 mod int;
 mod kind;
+mod lit;
 mod valtree;
 
 pub use int::*;
 pub use kind::*;
+pub use lit::*;
 use rustc_span::{DUMMY_SP, ErrorGuaranteed};
 pub use valtree::*;
 
@@ -25,7 +24,7 @@ pub type ConstKind<'tcx> = ir::ConstKind<TyCtxt<'tcx>>;
 pub type UnevaluatedConst<'tcx> = ir::UnevaluatedConst<TyCtxt<'tcx>>;
 
 #[cfg(target_pointer_width = "64")]
-rustc_data_structures::static_assert_size!(ConstKind<'_>, 32);
+rustc_data_structures::static_assert_size!(ConstKind<'_>, 24);
 
 #[derive(Copy, Clone, PartialEq, Eq, Hash, HashStable)]
 #[rustc_pass_by_value]
@@ -39,7 +38,7 @@ impl<'tcx> rustc_type_ir::inherent::IntoKind for Const<'tcx> {
     }
 }
 
-impl<'tcx> rustc_type_ir::visit::Flags for Const<'tcx> {
+impl<'tcx> rustc_type_ir::Flags for Const<'tcx> {
     fn flags(&self) -> TypeFlags {
         self.0.flags
     }
@@ -97,13 +96,24 @@ impl<'tcx> Const<'tcx> {
     pub fn new_bound(
         tcx: TyCtxt<'tcx>,
         debruijn: ty::DebruijnIndex,
-        var: ty::BoundVar,
+        bound_const: ty::BoundConst<'tcx>,
     ) -> Const<'tcx> {
-        Const::new(tcx, ty::ConstKind::Bound(debruijn, var))
+        Const::new(tcx, ty::ConstKind::Bound(ty::BoundVarIndexKind::Bound(debruijn), bound_const))
     }
 
     #[inline]
-    pub fn new_placeholder(tcx: TyCtxt<'tcx>, placeholder: ty::PlaceholderConst) -> Const<'tcx> {
+    pub fn new_canonical_bound(tcx: TyCtxt<'tcx>, var: ty::BoundVar) -> Const<'tcx> {
+        Const::new(
+            tcx,
+            ty::ConstKind::Bound(ty::BoundVarIndexKind::Canonical, ty::BoundConst::new(var)),
+        )
+    }
+
+    #[inline]
+    pub fn new_placeholder(
+        tcx: TyCtxt<'tcx>,
+        placeholder: ty::PlaceholderConst<'tcx>,
+    ) -> Const<'tcx> {
         Const::new(tcx, ty::ConstKind::Placeholder(placeholder))
     }
 
@@ -114,8 +124,8 @@ impl<'tcx> Const<'tcx> {
     }
 
     #[inline]
-    pub fn new_value(tcx: TyCtxt<'tcx>, val: ty::ValTree<'tcx>, ty: Ty<'tcx>) -> Const<'tcx> {
-        Const::new(tcx, ty::ConstKind::Value(ty, val))
+    pub fn new_value(tcx: TyCtxt<'tcx>, valtree: ty::ValTree<'tcx>, ty: Ty<'tcx>) -> Const<'tcx> {
+        Const::new(tcx, ty::ConstKind::Value(ty::Value { ty, valtree }))
     }
 
     #[inline]
@@ -148,13 +158,22 @@ impl<'tcx> Const<'tcx> {
         let reported = tcx.dcx().span_delayed_bug(span, msg);
         Const::new_error(tcx, reported)
     }
+
+    pub fn is_trivially_wf(self) -> bool {
+        match self.kind() {
+            ty::ConstKind::Param(_) | ty::ConstKind::Placeholder(_) | ty::ConstKind::Bound(..) => {
+                true
+            }
+            ty::ConstKind::Infer(_)
+            | ty::ConstKind::Unevaluated(..)
+            | ty::ConstKind::Value(_)
+            | ty::ConstKind::Error(_)
+            | ty::ConstKind::Expr(_) => false,
+        }
+    }
 }
 
 impl<'tcx> rustc_type_ir::inherent::Const<TyCtxt<'tcx>> for Const<'tcx> {
-    fn try_to_target_usize(self, interner: TyCtxt<'tcx>) -> Option<u64> {
-        self.try_to_target_usize(interner)
-    }
-
     fn new_infer(tcx: TyCtxt<'tcx>, infer: ty::InferConst) -> Self {
         Const::new_infer(tcx, infer)
     }
@@ -163,12 +182,24 @@ impl<'tcx> rustc_type_ir::inherent::Const<TyCtxt<'tcx>> for Const<'tcx> {
         Const::new_var(tcx, vid)
     }
 
-    fn new_bound(interner: TyCtxt<'tcx>, debruijn: ty::DebruijnIndex, var: ty::BoundVar) -> Self {
-        Const::new_bound(interner, debruijn, var)
+    fn new_bound(
+        interner: TyCtxt<'tcx>,
+        debruijn: ty::DebruijnIndex,
+        bound_const: ty::BoundConst<'tcx>,
+    ) -> Self {
+        Const::new_bound(interner, debruijn, bound_const)
     }
 
     fn new_anon_bound(tcx: TyCtxt<'tcx>, debruijn: ty::DebruijnIndex, var: ty::BoundVar) -> Self {
-        Const::new_bound(tcx, debruijn, var)
+        Const::new_bound(tcx, debruijn, ty::BoundConst::new(var))
+    }
+
+    fn new_canonical_bound(tcx: TyCtxt<'tcx>, var: rustc_type_ir::BoundVar) -> Self {
+        Const::new_canonical_bound(tcx, var)
+    }
+
+    fn new_placeholder(tcx: TyCtxt<'tcx>, placeholder: ty::PlaceholderConst<'tcx>) -> Self {
+        Const::new_placeholder(tcx, placeholder)
     }
 
     fn new_unevaluated(interner: TyCtxt<'tcx>, uv: ty::UnevaluatedConst<'tcx>) -> Self {
@@ -185,82 +216,6 @@ impl<'tcx> rustc_type_ir::inherent::Const<TyCtxt<'tcx>> for Const<'tcx> {
 }
 
 impl<'tcx> Const<'tcx> {
-    // FIXME: move this and try_from_lit to hir_ty_lowering like lower_const_arg/from_const_arg
-    /// Literals and const generic parameters are eagerly converted to a constant, everything else
-    /// becomes `Unevaluated`.
-    #[instrument(skip(tcx), level = "debug")]
-    pub fn from_anon_const(tcx: TyCtxt<'tcx>, def: LocalDefId) -> Self {
-        let body_id = match tcx.hir_node_by_def_id(def) {
-            hir::Node::AnonConst(ac) => ac.body,
-            node => span_bug!(
-                tcx.def_span(def.to_def_id()),
-                "from_anon_const can only process anonymous constants, not {node:?}"
-            ),
-        };
-
-        let expr = &tcx.hir().body(body_id).value;
-        debug!(?expr);
-
-        let ty = tcx.type_of(def).no_bound_vars().expect("const parameter types cannot be generic");
-
-        match Self::try_from_lit(tcx, ty, expr) {
-            Some(v) => v,
-            None => ty::Const::new_unevaluated(tcx, ty::UnevaluatedConst {
-                def: def.to_def_id(),
-                args: GenericArgs::identity_for_item(tcx, def.to_def_id()),
-            }),
-        }
-    }
-
-    #[instrument(skip(tcx), level = "debug")]
-    fn try_from_lit(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>, expr: &'tcx hir::Expr<'tcx>) -> Option<Self> {
-        // Unwrap a block, so that e.g. `{ P }` is recognised as a parameter. Const arguments
-        // currently have to be wrapped in curly brackets, so it's necessary to special-case.
-        let expr = match &expr.kind {
-            hir::ExprKind::Block(block, _) if block.stmts.is_empty() && block.expr.is_some() => {
-                block.expr.as_ref().unwrap()
-            }
-            _ => expr,
-        };
-
-        if let hir::ExprKind::Path(hir::QPath::Resolved(
-            _,
-            &hir::Path { res: Res::Def(DefKind::ConstParam, _), .. },
-        )) = expr.kind
-        {
-            span_bug!(expr.span, "try_from_lit: received const param which shouldn't be possible");
-        };
-
-        let lit_input = match expr.kind {
-            hir::ExprKind::Lit(lit) => Some(LitToConstInput { lit: &lit.node, ty, neg: false }),
-            hir::ExprKind::Unary(hir::UnOp::Neg, expr) => match expr.kind {
-                hir::ExprKind::Lit(lit) => Some(LitToConstInput { lit: &lit.node, ty, neg: true }),
-                _ => None,
-            },
-            _ => None,
-        };
-
-        if let Some(lit_input) = lit_input {
-            // If an error occurred, ignore that it's a literal and leave reporting the error up to
-            // mir.
-            match tcx.at(expr.span).lit_to_const(lit_input) {
-                Ok(c) => return Some(c),
-                Err(_) if lit_input.ty.has_aliases() => {
-                    // allow the `ty` to be an alias type, though we cannot handle it here
-                    return None;
-                }
-                Err(e) => {
-                    tcx.dcx().span_delayed_bug(
-                        expr.span,
-                        format!("Const::try_from_lit: couldn't lit_to_const {e:?}"),
-                    );
-                }
-            }
-        }
-
-        None
-    }
-
     /// Creates a constant with the given integer value and interns it.
     #[inline]
     pub fn from_bits(
@@ -275,7 +230,7 @@ impl<'tcx> Const<'tcx> {
             .size;
         ty::Const::new_value(
             tcx,
-            ty::ValTree::from_scalar_int(ScalarInt::try_from_uint(bits, size).unwrap()),
+            ty::ValTree::from_scalar_int(tcx, ScalarInt::try_from_uint(bits, size).unwrap()),
             ty,
         )
     }
@@ -283,7 +238,7 @@ impl<'tcx> Const<'tcx> {
     #[inline]
     /// Creates an interned zst constant.
     pub fn zero_sized(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> Self {
-        ty::Const::new_value(tcx, ty::ValTree::zst(), ty)
+        ty::Const::new_value(tcx, ty::ValTree::zst(tcx), ty)
     }
 
     #[inline]
@@ -298,50 +253,94 @@ impl<'tcx> Const<'tcx> {
         Self::from_bits(tcx, n as u128, ty::TypingEnv::fully_monomorphized(), tcx.types.usize)
     }
 
-    /// Panics if self.kind != ty::ConstKind::Value
-    pub fn to_valtree(self) -> (ty::ValTree<'tcx>, Ty<'tcx>) {
+    /// Panics if `self.kind != ty::ConstKind::Value`.
+    pub fn to_value(self) -> ty::Value<'tcx> {
         match self.kind() {
-            ty::ConstKind::Value(ty, valtree) => (valtree, ty),
+            ty::ConstKind::Value(cv) => cv,
             _ => bug!("expected ConstKind::Value, got {:?}", self.kind()),
         }
     }
 
-    /// Attempts to convert to a `ValTree`
-    pub fn try_to_valtree(self) -> Option<(ty::ValTree<'tcx>, Ty<'tcx>)> {
+    /// Attempts to convert to a value.
+    ///
+    /// Note that this does not normalize the constant.
+    pub fn try_to_value(self) -> Option<ty::Value<'tcx>> {
         match self.kind() {
-            ty::ConstKind::Value(ty, valtree) => Some((valtree, ty)),
+            ty::ConstKind::Value(cv) => Some(cv),
             _ => None,
         }
     }
 
+    /// Converts to a `ValTreeKind::Leaf` value, `panic`'ing
+    /// if this constant is some other kind.
+    ///
+    /// Note that this does not normalize the constant.
     #[inline]
-    pub fn try_to_scalar(self) -> Option<(Scalar, Ty<'tcx>)> {
-        let (valtree, ty) = self.try_to_valtree()?;
-        Some((valtree.try_to_scalar()?, ty))
+    pub fn to_leaf(self) -> ScalarInt {
+        self.to_value().to_leaf()
     }
 
-    pub fn try_to_bool(self) -> Option<bool> {
-        self.try_to_valtree()?.0.try_to_scalar_int()?.try_to_bool().ok()
+    /// Converts to a `ValTreeKind::Branch` value, `panic`'ing
+    /// if this constant is some other kind.
+    ///
+    /// Note that this does not normalize the constant.
+    #[inline]
+    pub fn to_branch(self) -> &'tcx [ty::Const<'tcx>] {
+        self.to_value().to_branch()
     }
 
+    /// Attempts to convert to a `ValTreeKind::Leaf` value.
+    ///
+    /// Note that this does not normalize the constant.
+    pub fn try_to_leaf(self) -> Option<ScalarInt> {
+        self.try_to_value()?.try_to_leaf()
+    }
+
+    /// Attempts to convert to a `ValTreeKind::Leaf` value.
+    ///
+    /// Note that this does not normalize the constant.
+    pub fn try_to_scalar(self) -> Option<Scalar> {
+        self.try_to_leaf().map(Scalar::Int)
+    }
+
+    /// Attempts to convert to a `ValTreeKind::Branch` value.
+    ///
+    /// Note that this does not normalize the constant.
+    pub fn try_to_branch(self) -> Option<&'tcx [ty::Const<'tcx>]> {
+        self.try_to_value()?.try_to_branch()
+    }
+
+    /// Convenience method to extract the value of a usize constant,
+    /// useful to get the length of an array type.
+    ///
+    /// Note that this does not evaluate the constant.
     #[inline]
     pub fn try_to_target_usize(self, tcx: TyCtxt<'tcx>) -> Option<u64> {
-        self.try_to_valtree()?.0.try_to_target_usize(tcx)
-    }
-
-    /// Attempts to evaluate the given constant to bits. Can fail to evaluate in the presence of
-    /// generics (or erroneous code) or if the value can't be represented as bits (e.g. because it
-    /// contains const generic parameters or pointers).
-    #[inline]
-    pub fn try_to_bits(self, tcx: TyCtxt<'tcx>, typing_env: ty::TypingEnv<'tcx>) -> Option<u128> {
-        let (scalar, ty) = self.try_to_scalar()?;
-        let scalar = scalar.try_to_scalar_int().ok()?;
-        let input = typing_env.with_reveal_all_normalized(tcx).as_query_input(ty);
-        let size = tcx.layout_of(input).ok()?.size;
-        Some(scalar.to_bits(size))
+        self.try_to_value()?.try_to_target_usize(tcx)
     }
 
     pub fn is_ct_infer(self) -> bool {
         matches!(self.kind(), ty::ConstKind::Infer(_))
+    }
+
+    pub fn ct_vid(self) -> Option<ty::ConstVid> {
+        match self.kind() {
+            ConstKind::Infer(ty::InferConst::Var(vid)) => Some(vid),
+            _ => None,
+        }
+    }
+
+    /// Iterator that walks `self` and any types reachable from
+    /// `self`, in depth-first order. Note that just walks the types
+    /// that appear in `self`, it does not descend into the fields of
+    /// structs or variants. For example:
+    ///
+    /// ```text
+    /// isize => { isize }
+    /// Foo<Bar<isize>> => { Foo<Bar<isize>>, Bar<isize>, isize }
+    /// [isize] => { [isize], isize }
+    /// ```
+    pub fn walk(self) -> TypeWalker<TyCtxt<'tcx>> {
+        TypeWalker::new(self.into())
     }
 }

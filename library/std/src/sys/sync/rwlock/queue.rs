@@ -117,11 +117,11 @@ use crate::hint::spin_loop;
 use crate::mem;
 use crate::ptr::{self, NonNull, null_mut, without_provenance_mut};
 use crate::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed, Release};
-use crate::sync::atomic::{AtomicBool, AtomicPtr};
-use crate::thread::{self, Thread, ThreadId};
+use crate::sync::atomic::{Atomic, AtomicBool, AtomicPtr};
+use crate::thread::{self, Thread};
 
 /// The atomic lock state.
-type AtomicState = AtomicPtr<()>;
+type AtomicState = Atomic<State>;
 /// The inner lock state.
 type State = *mut ();
 
@@ -181,11 +181,11 @@ struct Node {
     tail: AtomicLink,
     write: bool,
     thread: OnceCell<Thread>,
-    completed: AtomicBool,
+    completed: Atomic<bool>,
 }
 
 /// An atomic node pointer with relaxed operations.
-struct AtomicLink(AtomicPtr<Node>);
+struct AtomicLink(Atomic<*mut Node>);
 
 impl AtomicLink {
     fn new(v: Option<NonNull<Node>>) -> AtomicLink {
@@ -217,9 +217,7 @@ impl Node {
     /// Prepare this node for waiting.
     fn prepare(&mut self) {
         // Fall back to creating an unnamed `Thread` handle to allow locking in TLS destructors.
-        self.thread.get_or_init(|| {
-            thread::try_current().unwrap_or_else(|| Thread::new_unnamed(ThreadId::new()))
-        });
+        self.thread.get_or_init(thread::current_or_unnamed);
         self.completed = AtomicBool::new(false);
     }
 
@@ -331,7 +329,7 @@ impl RwLock {
 
     #[inline]
     pub fn try_read(&self) -> bool {
-        self.state.fetch_update(Acquire, Relaxed, read_lock).is_ok()
+        self.state.try_update(Acquire, Relaxed, read_lock).is_ok()
     }
 
     #[inline]
@@ -345,7 +343,7 @@ impl RwLock {
     pub fn try_write(&self) -> bool {
         // Atomically set the `LOCKED` bit. This is lowered to a single atomic instruction on most
         // modern processors (e.g. "lock bts" on x86 and "ldseta" on modern AArch64), and therefore
-        // is more efficient than `fetch_update(lock(true))`, which can spuriously fail if a new
+        // is more efficient than `try_update(lock(true))`, which can spuriously fail if a new
         // node is appended to the queue.
         self.state.fetch_or(LOCKED, Acquire).addr() & LOCKED == 0
     }
@@ -455,7 +453,7 @@ impl RwLock {
 
     #[inline]
     pub unsafe fn read_unlock(&self) {
-        match self.state.fetch_update(Release, Acquire, |state| {
+        match self.state.try_update(Release, Acquire, |state| {
             if state.addr() & QUEUED == 0 {
                 // If there are no threads queued, simply decrement the reader count.
                 let count = state.addr() - (SINGLE | LOCKED);

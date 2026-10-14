@@ -1,5 +1,5 @@
 use rustc_abi::FieldIdx;
-use rustc_index::bit_set::ChunkedBitSet;
+use rustc_index::bit_set::MixedBitSet;
 use rustc_middle::mir::{Body, TerminatorKind};
 use rustc_middle::ty::{self, GenericArgsRef, Ty, TyCtxt, VariantDef};
 use rustc_mir_dataflow::impls::MaybeInitializedPlaces;
@@ -22,6 +22,7 @@ impl<'tcx> crate::MirPass<'tcx> for RemoveUninitDrops {
         let move_data = MoveData::gather_moves(body, tcx, |ty| ty.needs_drop(tcx, typing_env));
 
         let mut maybe_inits = MaybeInitializedPlaces::new(tcx, body, &move_data)
+            .exclude_inactive_in_otherwise()
             .iterate_to_fixpoint(tcx, body, Some("remove_uninit_drops"))
             .into_results_cursor(body);
 
@@ -62,12 +63,16 @@ impl<'tcx> crate::MirPass<'tcx> for RemoveUninitDrops {
             block.terminator_mut().kind = TerminatorKind::Goto { target: *target };
         }
     }
+
+    fn is_required(&self) -> bool {
+        true
+    }
 }
 
 fn is_needs_drop_and_init<'tcx>(
     tcx: TyCtxt<'tcx>,
     typing_env: ty::TypingEnv<'tcx>,
-    maybe_inits: &ChunkedBitSet<MovePathIndex>,
+    maybe_inits: &MixedBitSet<MovePathIndex>,
     move_data: &MoveData<'tcx>,
     ty: Ty<'tcx>,
     mpi: MovePathIndex,

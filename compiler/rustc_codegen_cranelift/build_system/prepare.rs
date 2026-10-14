@@ -8,7 +8,7 @@ use crate::path::{Dirs, RelPath};
 use crate::utils::{copy_dir_recursively, ensure_empty_dir, spawn_and_wait};
 
 pub(crate) fn prepare(dirs: &Dirs) {
-    RelPath::DOWNLOAD.ensure_exists(dirs);
+    std::fs::create_dir_all(&dirs.download_dir).unwrap();
     crate::tests::RAND_REPO.fetch(dirs);
     crate::tests::REGEX_REPO.fetch(dirs);
 }
@@ -79,18 +79,25 @@ impl GitRepo {
 
     fn download_dir(&self, dirs: &Dirs) -> PathBuf {
         match self.url {
-            GitRepoUrl::Github { user: _, repo } => RelPath::DOWNLOAD.join(repo).to_path(dirs),
+            GitRepoUrl::Github { user: _, repo } => dirs.download_dir.join(repo),
         }
     }
 
     pub(crate) const fn source_dir(&self) -> RelPath {
         match self.url {
-            GitRepoUrl::Github { user: _, repo } => RelPath::BUILD.join(repo),
+            GitRepoUrl::Github { user: _, repo } => RelPath::build(repo),
         }
     }
 
     fn verify_checksum(&self, dirs: &Dirs) {
         let download_dir = self.download_dir(dirs);
+        if !download_dir.exists() {
+            eprintln!(
+                "Missing directory {download_dir}: Please run ./y.sh prepare to download.",
+                download_dir = download_dir.display(),
+            );
+            std::process::exit(1);
+        }
         let actual_hash = format!("{:016x}", hash_dir(&download_dir));
         if actual_hash != self.content_hash {
             eprintln!(
@@ -130,7 +137,7 @@ impl GitRepo {
         }
 
         let source_lockfile =
-            RelPath::PATCHES.to_path(dirs).join(format!("{}-lock.toml", self.patch_name));
+            dirs.source_dir.join("patches").join(format!("{}-lock.toml", self.patch_name));
         let target_lockfile = download_dir.join("Cargo.lock");
         if source_lockfile.exists() {
             assert!(!target_lockfile.exists());
@@ -186,12 +193,12 @@ fn init_git_repo(repo_dir: &Path) {
     spawn_and_wait(git_add_cmd);
 
     let mut git_commit_cmd = git_command(repo_dir, "commit");
-    git_commit_cmd.arg("-m").arg("Initial commit").arg("-q");
+    git_commit_cmd.arg("-m").arg("Initial commit").arg("-q").arg("--no-verify");
     spawn_and_wait(git_commit_cmd);
 }
 
 fn get_patches(dirs: &Dirs, crate_name: &str) -> Vec<PathBuf> {
-    let mut patches: Vec<_> = fs::read_dir(RelPath::PATCHES.to_path(dirs))
+    let mut patches: Vec<_> = fs::read_dir(dirs.source_dir.join("patches"))
         .unwrap()
         .map(|entry| entry.unwrap().path())
         .filter(|path| path.extension() == Some(OsStr::new("patch")))

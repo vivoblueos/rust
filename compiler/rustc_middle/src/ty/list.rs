@@ -7,9 +7,9 @@ use std::{fmt, iter, mem, ptr, slice};
 use rustc_data_structures::aligned::{Aligned, align_of};
 use rustc_data_structures::sync::DynSync;
 use rustc_serialize::{Encodable, Encoder};
+use rustc_type_ir::FlagComputation;
 
-use super::flags::FlagComputation;
-use super::{DebruijnIndex, TypeFlags};
+use super::{DebruijnIndex, TyCtxt, TypeFlags};
 use crate::arena::Arena;
 
 /// `List<T>` is a bit like `&[T]`, but with some critical differences.
@@ -21,7 +21,7 @@ use crate::arena::Arena;
 ///   pointer.
 /// - Because of this, you cannot get a `List<T>` that is a sub-list of another
 ///   `List<T>`. You can get a sub-slice `&[T]`, however.
-/// - `List<T>` can be used with `CopyTaggedPtr`, which is useful within
+/// - `List<T>` can be used with `TaggedRef`, which is useful within
 ///   structs whose size must be minimized.
 /// - Because of the uniqueness assumption, we can use the address of a
 ///   `List<T>` for faster equality comparisons and hashing.
@@ -37,7 +37,18 @@ pub type List<T> = RawList<(), T>;
 #[repr(C)]
 pub struct RawList<H, T> {
     skel: ListSkeleton<H, T>,
-    opaque: OpaqueListContents,
+
+    // `List`/`RawList` is variable-sized. So we want it to be an unsized
+    // type because calling `size_of::<List<Foo>>` would be dangerous.
+    //
+    // We also want `&List`/`&RawList` to be thin pointers.
+    //
+    // A field with an extern type is a hacky way to achieve this. (See
+    // https://github.com/rust-lang/rust/pull/154399#issuecomment-4157036415
+    // for some discussion.) This field is never directly manipulated because
+    // `RawList` instances are created with manual memory layout in
+    // `from_arena`.
+    _extern_ty: ExternTy,
 }
 
 /// A [`RawList`] without the unsized tail. This type is used for layout computation
@@ -47,7 +58,8 @@ struct ListSkeleton<H, T> {
     header: H,
     len: usize,
     /// Although this claims to be a zero-length array, in practice `len`
-    /// elements are actually present.
+    /// elements are actually present. This is achieved with manual memory
+    /// layout in `from_arena`. See also the comment on `RawList::_extern_ty`.
     data: [T; 0],
 }
 
@@ -58,9 +70,7 @@ impl<T> Default for &List<T> {
 }
 
 unsafe extern "C" {
-    /// A dummy type used to force `List` to be unsized while not requiring
-    /// references to it be wide pointers.
-    type OpaqueListContents;
+    type ExternTy;
 }
 
 impl<H, T> RawList<H, T> {
@@ -93,7 +103,7 @@ impl<H, T> RawList<H, T> {
         T: Copy,
     {
         assert!(!mem::needs_drop::<T>());
-        assert!(mem::size_of::<T>() != 0);
+        assert!(size_of::<T>() != 0);
         assert!(!slice.is_empty());
 
         let (layout, _offset) =
@@ -155,7 +165,7 @@ macro_rules! impl_list_empty {
                 static EMPTY: ListSkeleton<$header_ty, MaxAlign> =
                     ListSkeleton { header: $header_init, len: 0, data: [] };
 
-                assert!(mem::align_of::<T>() <= mem::align_of::<MaxAlign>());
+                assert!(align_of::<T>() <= align_of::<MaxAlign>());
 
                 // SAFETY: `EMPTY` is sufficiently aligned to be an empty list for all
                 // types with `align_of(T) <= align_of(MaxAlign)`, which we checked above.
@@ -257,14 +267,18 @@ impl<'a, H, T: Copy> IntoIterator for &'a RawList<H, T> {
 
 unsafe impl<H: Sync, T: Sync> Sync for RawList<H, T> {}
 
-// We need this since `List` uses extern type `OpaqueListContents`.
+// We need this because `List` uses the extern type `ExternTy`.
 unsafe impl<H: DynSync, T: DynSync> DynSync for RawList<H, T> {}
 
 // Safety:
-// Layouts of `ListSkeleton<H, T>` and `RawList<H, T>` are the same, modulo opaque tail,
-// thus aligns of `ListSkeleton<H, T>` and `RawList<H, T>` must be the same.
+// Layouts of `ListSkeleton<H, T>` and `RawList<H, T>` are the same, modulo the
+// `_extern_ty` field (which is never instantiated in practice). Therefore,
+// aligns of `ListSkeleton<H, T>` and `RawList<H, T>` must be the same.
 unsafe impl<H, T> Aligned for RawList<H, T> {
+    #[cfg(bootstrap)]
     const ALIGN: ptr::Alignment = align_of::<ListSkeleton<H, T>>();
+    #[cfg(not(bootstrap))]
+    const ALIGN: mem::Alignment = align_of::<ListSkeleton<H, T>>();
 }
 
 /// A [`List`] that additionally stores type information inline to speed up
@@ -299,11 +313,22 @@ impl TypeInfo {
     }
 }
 
-impl From<FlagComputation> for TypeInfo {
-    fn from(computation: FlagComputation) -> TypeInfo {
+impl<'tcx> From<FlagComputation<TyCtxt<'tcx>>> for TypeInfo {
+    fn from(computation: FlagComputation<TyCtxt<'tcx>>) -> TypeInfo {
         TypeInfo {
             flags: computation.flags,
             outer_exclusive_binder: computation.outer_exclusive_binder,
         }
     }
+}
+
+#[cfg(target_pointer_width = "64")]
+mod size_asserts {
+    use rustc_data_structures::static_assert_size;
+
+    use super::*;
+    // tidy-alphabetical-start
+    static_assert_size!(&List<u32>, 8); // thin pointer
+    static_assert_size!(&RawList<u8, u32>, 8); // thin pointer
+    // tidy-alphabetical-end
 }

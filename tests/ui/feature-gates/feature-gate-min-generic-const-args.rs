@@ -1,8 +1,10 @@
 trait Trait {
-    const ASSOC: usize;
+    type const ASSOC: usize;
+    //~^ ERROR: associated `type const` are unstable [E0658]
+    //~| ERROR: `type const` syntax is experimental [E0658]
 }
 
-// FIXME(min_generic_const_args): implement support for this, behind the feature gate
+// FIXME(mgca): add suggestion for mgca to this error
 fn foo<T: Trait>() -> [u8; <T as Trait>::ASSOC] {
     //~^ ERROR generic parameters may not be used in const operations
     loop {}

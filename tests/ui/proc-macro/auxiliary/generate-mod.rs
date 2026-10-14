@@ -1,9 +1,6 @@
+//@ edition:2015
 //@ run-pass
-//@ force-host
-//@ no-prefer-dynamic
 //@ ignore-pass
-
-#![crate_type = "proc-macro"]
 
 extern crate proc_macro;
 use proc_macro::*;

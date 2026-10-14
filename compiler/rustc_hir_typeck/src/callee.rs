@@ -1,21 +1,22 @@
 use std::iter;
 
-use rustc_ast::util::parser::PREC_UNAMBIGUOUS;
-use rustc_errors::{Applicability, Diag, ErrorGuaranteed, StashKey};
+use rustc_abi::{CanonAbi, ExternAbi};
+use rustc_ast::util::parser::ExprPrecedence;
+use rustc_errors::{Applicability, Diag, ErrorGuaranteed, StashKey, msg};
 use rustc_hir::def::{self, CtorKind, Namespace, Res};
 use rustc_hir::def_id::DefId;
-use rustc_hir::{self as hir, LangItem};
+use rustc_hir::{self as hir, HirId, LangItem, find_attr};
 use rustc_hir_analysis::autoderef::Autoderef;
-use rustc_infer::infer;
-use rustc_infer::traits::{self, Obligation, ObligationCause, ObligationCauseCode};
+use rustc_infer::infer::BoundRegionConversionTime;
+use rustc_infer::traits::{Obligation, ObligationCause, ObligationCauseCode};
 use rustc_middle::ty::adjustment::{
     Adjust, Adjustment, AllowTwoPhase, AutoBorrow, AutoBorrowMutability,
 };
 use rustc_middle::ty::{self, GenericArgsRef, Ty, TyCtxt, TypeVisitableExt};
 use rustc_middle::{bug, span_bug};
-use rustc_span::Span;
 use rustc_span::def_id::LocalDefId;
-use rustc_span::symbol::{Ident, sym};
+use rustc_span::{Span, sym};
+use rustc_target::spec::{AbiMap, AbiMapping};
 use rustc_trait_selection::error_reporting::traits::DefIdOrName;
 use rustc_trait_selection::infer::InferCtxtExt as _;
 use rustc_trait_selection::traits::query::evaluate_obligation::InferCtxtExt as _;
@@ -25,6 +26,7 @@ use super::method::MethodCallee;
 use super::method::probe::ProbeScope;
 use super::{Expectation, FnCtxt, TupleArgumentsFlag};
 use crate::errors;
+use crate::method::TreatNotYetDefinedOpaques;
 
 /// Checks that it is legal to call methods of the trait corresponding
 /// to `trait_id` (this only cares about the trait, not the specific
@@ -35,11 +37,9 @@ pub(crate) fn check_legal_trait_for_method_call(
     receiver: Option<Span>,
     expr_span: Span,
     trait_id: DefId,
-    body_id: DefId,
+    _body_id: DefId,
 ) -> Result<(), ErrorGuaranteed> {
-    if tcx.is_lang_item(trait_id, LangItem::Drop)
-        && tcx.lang_items().fallback_surface_drop_fn() != Some(body_id)
-    {
+    if tcx.is_lang_item(trait_id, LangItem::Drop) {
         let sugg = if let Some(receiver) = receiver.filter(|s| !s.is_empty()) {
             errors::ExplicitDestructorCallSugg::Snippet {
                 lo: expr_span.shrink_to_lo(),
@@ -50,7 +50,7 @@ pub(crate) fn check_legal_trait_for_method_call(
         };
         return Err(tcx.dcx().emit_err(errors::ExplicitDestructorCall { span, sugg }));
     }
-    tcx.ensure().coherent_trait(trait_id)
+    tcx.ensure_result().coherent_trait(trait_id)
 }
 
 #[derive(Debug)]
@@ -79,25 +79,61 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             _ => self.check_expr(callee_expr),
         };
 
-        let expr_ty = self.structurally_resolve_type(call_expr.span, original_callee_ty);
+        let expr_ty = self.try_structurally_resolve_type(call_expr.span, original_callee_ty);
 
         let mut autoderef = self.autoderef(callee_expr.span, expr_ty);
         let mut result = None;
         while result.is_none() && autoderef.next().is_some() {
             result = self.try_overloaded_call_step(call_expr, callee_expr, arg_exprs, &autoderef);
         }
+
+        match *autoderef.final_ty().kind() {
+            ty::FnDef(def_id, _) => {
+                let abi = self.tcx.fn_sig(def_id).skip_binder().skip_binder().abi;
+                self.check_call_abi(abi, call_expr.span);
+            }
+            ty::FnPtr(_, header) => {
+                self.check_call_abi(header.abi, call_expr.span);
+            }
+            _ => { /* cannot have a non-rust abi */ }
+        }
+
+        if self.is_scalable_vector_ctor(autoderef.final_ty()) {
+            let mut err = self.dcx().create_err(errors::ScalableVectorCtor {
+                span: callee_expr.span,
+                ty: autoderef.final_ty(),
+            });
+            err.span_label(callee_expr.span, "you can create scalable vectors using intrinsics");
+            Ty::new_error(self.tcx, err.emit());
+        }
+
         self.register_predicates(autoderef.into_obligations());
 
         let output = match result {
             None => {
-                // this will report an error since original_callee_ty is not a fn
-                self.confirm_builtin_call(
-                    call_expr,
-                    callee_expr,
-                    original_callee_ty,
-                    arg_exprs,
-                    expected,
-                )
+                // Check all of the arg expressions, but with no expectations
+                // since we don't have a signature to compare them to.
+                for arg in arg_exprs {
+                    self.check_expr(arg);
+                }
+
+                if let hir::ExprKind::Path(hir::QPath::Resolved(_, path)) = &callee_expr.kind
+                    && let [segment] = path.segments
+                {
+                    self.dcx().try_steal_modify_and_emit_err(
+                        segment.ident.span,
+                        StashKey::CallIntoMethod,
+                        |err| {
+                            // Try suggesting `foo(a)` -> `a.foo()` if possible.
+                            self.suggest_call_as_method(
+                                err, segment, arg_exprs, call_expr, expected,
+                            );
+                        },
+                    );
+                }
+
+                let guar = self.report_invalid_callee(call_expr, callee_expr, expr_ty, arg_exprs);
+                Ty::new_error(self.tcx, guar)
             }
 
             Some(CallStep::Builtin(callee_ty)) => {
@@ -123,6 +159,50 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         output
     }
 
+    /// Can a function with this ABI be called with a rust call expression?
+    ///
+    /// Some ABIs cannot be called from rust, either because rust does not know how to generate
+    /// code for the call, or because a call does not semantically make sense.
+    pub(crate) fn check_call_abi(&self, abi: ExternAbi, span: Span) {
+        let canon_abi = match AbiMap::from_target(&self.sess().target).canonize_abi(abi, false) {
+            AbiMapping::Direct(canon_abi) | AbiMapping::Deprecated(canon_abi) => canon_abi,
+            AbiMapping::Invalid => {
+                // This should be reported elsewhere, but we want to taint this body
+                // so that we don't try to evaluate calls to ABIs that are invalid.
+                let guar = self.dcx().span_delayed_bug(
+                    span,
+                    format!("invalid abi for platform should have reported an error: {abi}"),
+                );
+                self.set_tainted_by_errors(guar);
+                return;
+            }
+        };
+
+        match canon_abi {
+            // Rust doesn't know how to call functions with this ABI.
+            CanonAbi::Custom
+            // The interrupt ABIs should only be called by the CPU. They have complex
+            // pre- and postconditions, and can use non-standard instructions like `iret` on x86.
+            | CanonAbi::Interrupt(_) => {
+                let err = crate::errors::AbiCannotBeCalled { span, abi };
+                self.tcx.dcx().emit_err(err);
+            }
+
+            // This is an entry point for the host, and cannot be called directly.
+            CanonAbi::GpuKernel => {
+                let err = crate::errors::GpuKernelAbiCannotBeCalled { span };
+                self.tcx.dcx().emit_err(err);
+            }
+
+            CanonAbi::C
+            | CanonAbi::Rust
+            | CanonAbi::RustCold
+            | CanonAbi::RustPreserveNone
+            | CanonAbi::Arm(_)
+            | CanonAbi::X86(_) => {}
+        }
+    }
+
     #[instrument(level = "debug", skip(self, call_expr, callee_expr, arg_exprs, autoderef), ret)]
     fn try_overloaded_call_step(
         &self,
@@ -132,9 +212,9 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         autoderef: &Autoderef<'a, 'tcx>,
     ) -> Option<CallStep<'tcx>> {
         let adjusted_ty =
-            self.structurally_resolve_type(autoderef.span(), autoderef.final_ty(false));
+            self.try_structurally_resolve_type(autoderef.span(), autoderef.final_ty());
 
-        // If the callee is a bare function or a closure, then we're all set.
+        // If the callee is a function pointer or a closure, then we're all set.
         match *adjusted_ty.kind() {
             ty::FnDef(..) | ty::FnPtr(..) => {
                 let adjustments = self.adjust_steps(autoderef);
@@ -150,17 +230,20 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 let closure_sig = args.as_closure().sig();
                 let closure_sig = self.instantiate_binder_with_fresh_vars(
                     call_expr.span,
-                    infer::FnCall,
+                    BoundRegionConversionTime::FnCall,
                     closure_sig,
                 );
                 let adjustments = self.adjust_steps(autoderef);
-                self.record_deferred_call_resolution(def_id, DeferredCallResolution {
-                    call_expr,
-                    callee_expr,
-                    closure_ty: adjusted_ty,
-                    adjustments,
-                    fn_sig: closure_sig,
-                });
+                self.record_deferred_call_resolution(
+                    def_id,
+                    DeferredCallResolution {
+                        call_expr,
+                        callee_expr,
+                        closure_ty: adjusted_ty,
+                        adjustments,
+                        fn_sig: closure_sig,
+                    },
+                );
                 return Some(CallStep::DeferredClosure(def_id, closure_sig));
             }
 
@@ -174,7 +257,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 let closure_args = args.as_coroutine_closure();
                 let coroutine_closure_sig = self.instantiate_binder_with_fresh_vars(
                     call_expr.span,
-                    infer::FnCall,
+                    BoundRegionConversionTime::FnCall,
                     closure_args.coroutine_closure_sig(),
                 );
                 let tupled_upvars_ty = self.next_ty_var(callee_expr.span);
@@ -197,13 +280,16 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                     coroutine_closure_sig.abi,
                 );
                 let adjustments = self.adjust_steps(autoderef);
-                self.record_deferred_call_resolution(def_id, DeferredCallResolution {
-                    call_expr,
-                    callee_expr,
-                    closure_ty: adjusted_ty,
-                    adjustments,
-                    fn_sig: call_sig,
-                });
+                self.record_deferred_call_resolution(
+                    def_id,
+                    DeferredCallResolution {
+                        call_expr,
+                        callee_expr,
+                        closure_ty: adjusted_ty,
+                        adjustments,
+                        fn_sig: call_sig,
+                    },
+                );
                 return Some(CallStep::DeferredClosure(def_id, call_sig));
             }
 
@@ -221,6 +307,15 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             // so we wind up with `FnMut::call_mut(&mut *f, ())`.
             ty::Ref(..) if autoderef.step_count() == 0 => {
                 return None;
+            }
+
+            ty::Infer(ty::TyVar(vid)) => {
+                // If we end up with an inference variable which is not the hidden type of
+                // an opaque, emit an error.
+                if !self.has_opaques_with_sub_unified_hidden_type(vid) {
+                    self.type_must_be_known_at_this_point(autoderef.span(), adjusted_ty);
+                    return None;
+                }
             }
 
             ty::Error(_) => {
@@ -293,26 +388,33 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 Ty::new_tup_from_iter(self.tcx, arg_exprs.iter().map(|e| self.next_ty_var(e.span)))
             });
 
-            if let Some(ok) = self.lookup_method_in_trait(
+            // We use `TreatNotYetDefinedOpaques::AsRigid` here so that if the `adjusted_ty`
+            // is `Box<impl FnOnce()>` we choose  `FnOnce` instead of `Fn`.
+            //
+            // We try all the different call traits in order and choose the first
+            // one which may apply. So if we treat opaques as inference variables
+            // `Box<impl FnOnce()>: Fn` is considered ambiguous and chosen.
+            if let Some(ok) = self.lookup_method_for_operator(
                 self.misc(call_expr.span),
-                Ident::with_dummy_span(method_name),
+                method_name,
                 trait_def_id,
                 adjusted_ty,
                 opt_input_type,
+                TreatNotYetDefinedOpaques::AsRigid,
             ) {
                 let method = self.register_infer_ok_obligations(ok);
                 let mut autoref = None;
                 if borrow {
                     // Check for &self vs &mut self in the method signature. Since this is either
                     // the Fn or FnMut trait, it should be one of those.
-                    let ty::Ref(_, _, mutbl) = method.sig.inputs()[0].kind() else {
+                    let ty::Ref(_, _, mutbl) = *method.sig.inputs()[0].kind() else {
                         bug!("Expected `FnMut`/`Fn` to take receiver by-ref/by-mut")
                     };
 
                     // For initial two-phase borrow
                     // deployment, conservatively omit
                     // overloaded function call ops.
-                    let mutbl = AutoBorrowMutability::new(*mutbl, AllowTwoPhase::No);
+                    let mutbl = AutoBorrowMutability::new(mutbl, AllowTwoPhase::No);
 
                     autoref = Some(Adjustment {
                         kind: Adjust::Borrow(AutoBorrow::Ref(mutbl)),
@@ -325,6 +427,19 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         }
 
         None
+    }
+
+    fn is_scalable_vector_ctor(&self, callee_ty: Ty<'_>) -> bool {
+        if let ty::FnDef(def_id, _) = *callee_ty.kind()
+            && let def::DefKind::Ctor(def::CtorOf::Struct, _) = self.tcx.def_kind(def_id)
+        {
+            self.tcx
+                .opt_parent(def_id)
+                .and_then(|id| self.tcx.adt_def(id).repr().scalable)
+                .is_some()
+        } else {
+            false
+        }
     }
 
     /// Give appropriate suggestion when encountering `||{/* not callable */}()`, where the
@@ -341,8 +456,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             return;
         };
 
-        let hir = self.tcx.hir();
-        let fn_decl_span = if let hir::Node::Expr(hir::Expr {
+        let fn_decl_span = if let hir::Node::Expr(&hir::Expr {
             kind: hir::ExprKind::Closure(&hir::Closure { fn_decl_span, .. }),
             ..
         }) = self.tcx.parent_hir_node(hir_id)
@@ -363,19 +477,18 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                     }),
                 ..
             }),
-        )) = hir.parent_iter(hir_id).nth(3)
+        )) = self.tcx.hir_parent_iter(hir_id).nth(3)
         {
             // Actually need to unwrap one more layer of HIR to get to
             // the _real_ closure...
-            if let hir::Node::Expr(hir::Expr {
+            let hir::Node::Expr(&hir::Expr {
                 kind: hir::ExprKind::Closure(&hir::Closure { fn_decl_span, .. }),
                 ..
             }) = self.tcx.parent_hir_node(parent_hir_id)
-            {
-                fn_decl_span
-            } else {
+            else {
                 return;
-            }
+            };
+            fn_decl_span
         } else {
             return;
         };
@@ -428,16 +541,13 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
     ) -> Ty<'tcx> {
         let (fn_sig, def_id) = match *callee_ty.kind() {
             ty::FnDef(def_id, args) => {
-                self.enforce_context_effects(call_expr.span, def_id, args);
+                self.enforce_context_effects(Some(call_expr.hir_id), call_expr.span, def_id, args);
                 let fn_sig = self.tcx.fn_sig(def_id).instantiate(self.tcx, args);
 
                 // Unit testing: function items annotated with
                 // `#[rustc_evaluate_where_clauses]` trigger special output
                 // to let us test the trait evaluation system.
-                // Untranslatable diagnostics are okay for rustc internals
-                #[allow(rustc::untranslatable_diagnostic)]
-                #[allow(rustc::diagnostic_outside_of_impl)]
-                if self.tcx.has_attr(def_id, sym::rustc_evaluate_where_clauses) {
+                if self.has_rustc_attrs && find_attr!(self.tcx, def_id, RustcEvaluateWhereClauses) {
                     let predicates = self.tcx.predicates_of(def_id);
                     let predicates = predicates.instantiate(self.tcx, args);
                     for (predicate, predicate_span) in predicates {
@@ -459,32 +569,11 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 }
                 (fn_sig, Some(def_id))
             }
+
             // FIXME(const_trait_impl): these arms should error because we can't enforce them
             ty::FnPtr(sig_tys, hdr) => (sig_tys.with(hdr), None),
-            _ => {
-                for arg in arg_exprs {
-                    self.check_expr(arg);
-                }
 
-                if let hir::ExprKind::Path(hir::QPath::Resolved(_, path)) = &callee_expr.kind
-                    && let [segment] = path.segments
-                {
-                    self.dcx().try_steal_modify_and_emit_err(
-                        segment.ident.span,
-                        StashKey::CallIntoMethod,
-                        |err| {
-                            // Try suggesting `foo(a)` -> `a.foo()` if possible.
-                            self.suggest_call_as_method(
-                                err, segment, arg_exprs, call_expr, expected,
-                            );
-                        },
-                    );
-                }
-
-                let err = self.report_invalid_callee(call_expr, callee_expr, callee_ty, arg_exprs);
-
-                return Ty::new_error(self.tcx, err);
-            }
+            _ => unreachable!(),
         };
 
         // Replace any late-bound regions that appear in the function
@@ -492,7 +581,11 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         // renormalize the associated types at this point, since they
         // previously appeared within a `Binder<>` and hence would not
         // have been normalized before.
-        let fn_sig = self.instantiate_binder_with_fresh_vars(call_expr.span, infer::FnCall, fn_sig);
+        let fn_sig = self.instantiate_binder_with_fresh_vars(
+            call_expr.span,
+            BoundRegionConversionTime::FnCall,
+            fn_sig,
+        );
         let fn_sig = self.normalize(call_expr.span, fn_sig);
 
         self.check_argument_types(
@@ -512,35 +605,12 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             if let Some(ty) = fn_sig.inputs().last().copied() {
                 self.register_bound(
                     ty,
-                    self.tcx.require_lang_item(hir::LangItem::Tuple, Some(sp)),
-                    traits::ObligationCause::new(sp, self.body_id, ObligationCauseCode::RustCall),
+                    self.tcx.require_lang_item(hir::LangItem::Tuple, sp),
+                    self.cause(sp, ObligationCauseCode::RustCall),
                 );
                 self.require_type_is_sized(ty, sp, ObligationCauseCode::RustCall);
             } else {
                 self.dcx().emit_err(errors::RustCallIncorrectArgs { span: sp });
-            }
-        }
-
-        if let Some(def_id) = def_id
-            && self.tcx.def_kind(def_id) == hir::def::DefKind::Fn
-            && self.tcx.is_intrinsic(def_id, sym::const_eval_select)
-        {
-            let fn_sig = self.resolve_vars_if_possible(fn_sig);
-            for idx in 0..=1 {
-                let arg_ty = fn_sig.inputs()[idx + 1];
-                let span = arg_exprs.get(idx + 1).map_or(call_expr.span, |arg| arg.span);
-                // Check that second and third argument of `const_eval_select` must be `FnDef`, and additionally that
-                // the second argument must be `const fn`. The first argument must be a tuple, but this is already expressed
-                // in the function signature (`F: FnOnce<ARG>`), so I did not bother to add another check here.
-                //
-                // This check is here because there is currently no way to express a trait bound for `FnDef` types only.
-                if let ty::FnDef(def_id, _args) = *arg_ty.kind() {
-                    if idx == 0 && !self.tcx.is_const_fn(def_id) {
-                        self.dcx().emit_err(errors::ConstSelectMustBeConst { span });
-                    }
-                } else {
-                    self.dcx().emit_err(errors::ConstSelectMustBeFn { span, ty: arg_ty });
-                }
             }
         }
 
@@ -606,7 +676,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             };
 
             if let Ok(rest_snippet) = rest_snippet {
-                let sugg = if callee_expr.precedence().order() >= PREC_UNAMBIGUOUS {
+                let sugg = if self.precedence(callee_expr) >= ExprPrecedence::Unambiguous {
                     vec![
                         (up_to_rcvr_span, "".to_string()),
                         (rest_span, format!(".{}({rest_snippet}", segment.ident)),
@@ -670,13 +740,16 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         }
 
         let callee_ty = self.resolve_vars_if_possible(callee_ty);
+        let mut path = None;
         let mut err = self.dcx().create_err(errors::InvalidCallee {
             span: callee_expr.span,
-            ty: match &unit_variant {
+            ty: callee_ty,
+            found: match &unit_variant {
                 Some((_, kind, path)) => format!("{kind} `{path}`"),
-                None => format!("`{callee_ty}`"),
+                None => format!("`{}`", self.tcx.short_string(callee_ty, &mut path)),
             },
         });
+        *err.long_ty_path() = path;
         if callee_ty.references_error() {
             err.downgrade_to_delayed_bug();
         }
@@ -703,11 +776,11 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             && let Res::Local(_) = path.res
             && let [segment] = &path.segments
         {
-            for id in self.tcx.hir().items() {
-                if let Some(node) = self.tcx.hir().get_if_local(id.owner_id.into())
+            for id in self.tcx.hir_free_items() {
+                if let Some(node) = self.tcx.hir_get_if_local(id.owner_id.into())
                     && let hir::Node::Item(item) = node
-                    && let hir::ItemKind::Fn(..) = item.kind
-                    && item.ident.name == segment.ident.name
+                    && let hir::ItemKind::Fn { ident, .. } = item.kind
+                    && ident.name == segment.ident.name
                 {
                     err.span_label(
                         self.tcx.def_span(id.owner_id),
@@ -764,7 +837,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                     format!("this {descr} returns an unsized value `{output_ty}`, so it cannot be called")
                 );
                 if let DefIdOrName::DefId(def_id) = maybe_def
-                    && let Some(def_span) = self.tcx.hir().span_if_local(def_id)
+                    && let Some(def_span) = self.tcx.hir_span_if_local(def_id)
                 {
                     err.span_label(def_span, "the callable type is defined here");
                 }
@@ -773,30 +846,36 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             }
         }
 
-        if let Some(span) = self.tcx.hir().res_span(def) {
+        if let Some(span) = self.tcx.hir_res_span(def) {
             let callee_ty = callee_ty.to_string();
             let label = match (unit_variant, inner_callee_path) {
-                (Some((_, kind, path)), _) => Some(format!("{kind} `{path}` defined here")),
-                (_, Some(hir::QPath::Resolved(_, path))) => self
-                    .tcx
-                    .sess
-                    .source_map()
-                    .span_to_snippet(path.span)
-                    .ok()
-                    .map(|p| format!("`{p}` defined here returns `{callee_ty}`")),
+                (Some((_, kind, path)), _) => {
+                    err.arg("kind", kind);
+                    err.arg("path", path);
+                    Some(msg!("{$kind} `{$path}` defined here"))
+                }
+                (_, Some(hir::QPath::Resolved(_, path))) => {
+                    self.tcx.sess.source_map().span_to_snippet(path.span).ok().map(|p| {
+                        err.arg("func", p);
+                        msg!("`{$func}` defined here returns `{$ty}`")
+                    })
+                }
                 _ => {
                     match def {
                         // Emit a different diagnostic for local variables, as they are not
                         // type definitions themselves, but rather variables *of* that type.
-                        Res::Local(hir_id) => Some(format!(
-                            "`{}` has type `{}`",
-                            self.tcx.hir().name(hir_id),
-                            callee_ty
-                        )),
-                        Res::Def(kind, def_id) if kind.ns() == Some(Namespace::ValueNS) => {
-                            Some(format!("`{}` defined here", self.tcx.def_path_str(def_id),))
+                        Res::Local(hir_id) => {
+                            err.arg("local_name", self.tcx.hir_name(hir_id));
+                            Some(msg!("`{$local_name}` has type `{$ty}`"))
                         }
-                        _ => Some(format!("`{callee_ty}` defined here")),
+                        Res::Def(kind, def_id) if kind.ns() == Some(Namespace::ValueNS) => {
+                            err.arg("path", self.tcx.def_path_str(def_id));
+                            Some(msg!("`{$path}` defined here"))
+                        }
+                        _ => {
+                            err.arg("path", callee_ty);
+                            Some(msg!("`{$path}` defined here"))
+                        }
                     }
                 }
             };
@@ -837,6 +916,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
     #[tracing::instrument(level = "debug", skip(self, span))]
     pub(super) fn enforce_context_effects(
         &self,
+        call_hir_id: Option<HirId>,
         span: Span,
         callee_did: DefId,
         callee_args: GenericArgsRef<'tcx>,
@@ -849,12 +929,12 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             return;
         }
 
-        // If we have `rustc_do_not_const_check`, do not check `~const` bounds.
-        if self.tcx.has_attr(self.body_id, sym::rustc_do_not_const_check) {
+        // If we have `rustc_do_not_const_check`, do not check `[const]` bounds.
+        if self.has_rustc_attrs && find_attr!(self.tcx, self.body_id, RustcDoNotConstCheck) {
             return;
         }
 
-        let host = match self.tcx.hir().body_const_context(self.body_id) {
+        let host = match self.tcx.hir_body_const_context(self.body_id) {
             Some(hir::ConstContext::Const { .. } | hir::ConstContext::Static(_)) => {
                 ty::BoundConstness::Const
             }
@@ -866,11 +946,20 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         // const stability checking here too, I guess.
         if self.tcx.is_conditionally_const(callee_did) {
             let q = self.tcx.const_conditions(callee_did);
-            // FIXME(const_trait_impl): Use this span with a better cause code.
-            for (cond, _) in q.instantiate(self.tcx, callee_args) {
+            for (idx, (cond, pred_span)) in
+                q.instantiate(self.tcx, callee_args).into_iter().enumerate()
+            {
+                let cause = self.cause(
+                    span,
+                    if let Some(hir_id) = call_hir_id {
+                        ObligationCauseCode::HostEffectInExpr(callee_did, pred_span, hir_id, idx)
+                    } else {
+                        ObligationCauseCode::WhereClause(callee_did, pred_span)
+                    },
+                );
                 self.register_predicate(Obligation::new(
                     self.tcx,
-                    self.misc(span),
+                    cause,
                     self.param_env,
                     cond.to_host_effect_clause(self.tcx, host),
                 ));
@@ -886,19 +975,23 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         call_expr: &'tcx hir::Expr<'tcx>,
         arg_exprs: &'tcx [hir::Expr<'tcx>],
         expected: Expectation<'tcx>,
-        method_callee: MethodCallee<'tcx>,
+        method: MethodCallee<'tcx>,
     ) -> Ty<'tcx> {
-        let output_type = self.check_method_argument_types(
+        self.check_argument_types(
             call_expr.span,
             call_expr,
-            Ok(method_callee),
-            arg_exprs,
-            TupleArgumentsFlag::TupleArguments,
+            &method.sig.inputs()[1..],
+            method.sig.output(),
             expected,
+            arg_exprs,
+            method.sig.c_variadic,
+            TupleArgumentsFlag::TupleArguments,
+            Some(method.def_id),
         );
 
-        self.write_method_call_and_enforce_effects(call_expr.hir_id, call_expr.span, method_callee);
-        output_type
+        self.write_method_call_and_enforce_effects(call_expr.hir_id, call_expr.span, method);
+
+        method.sig.output()
     }
 }
 

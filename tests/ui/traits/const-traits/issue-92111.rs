@@ -1,9 +1,6 @@
-// Regression test for #92111.
-//
-//@ known-bug: #110395
-// FIXME check-pass
+//@ check-pass
 
-#![feature(const_trait_impl)]
+#![feature(const_trait_impl, const_destruct)]
 
 use std::marker::Destruct;
 
@@ -17,7 +14,7 @@ pub struct S(i32);
 
 impl Tr for S {}
 
-const fn a<T: ~const Destruct>(t: T) {}
+const fn a<T: [const] Destruct>(t: T) {}
 
 fn main() {
     a(S(0));

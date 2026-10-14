@@ -5,7 +5,6 @@ use rustc_ast::ast::{
 };
 use rustc_ast::visit::{Visitor, walk_block, walk_expr, walk_pat};
 use rustc_lint::{EarlyContext, EarlyLintPass, LintContext};
-use rustc_middle::lint::in_external_macro;
 use rustc_session::impl_lint_pass;
 use rustc_span::symbol::{Ident, Symbol};
 use rustc_span::{Span, sym};
@@ -13,25 +12,23 @@ use std::cmp::Ordering;
 
 declare_clippy_lint! {
     /// ### What it does
-    /// Checks for names that are very similar and thus confusing.
-    ///
-    /// Note: this lint looks for similar names throughout each
-    /// scope. To allow it, you need to allow it on the scope
-    /// level, not on the name that is reported.
+    /// Checks if you have variables whose name consists of just
+    /// underscores and digits.
     ///
     /// ### Why is this bad?
-    /// It's hard to distinguish between names that differ only
-    /// by a single character.
+    /// It's hard to memorize what a variable means without a
+    /// descriptive name.
     ///
     /// ### Example
-    /// ```ignore
-    /// let checked_exp = something;
-    /// let checked_expr = something_else;
+    /// ```no_run
+    /// let _1 = 1;
+    /// let ___1 = 1;
+    /// let __1___2 = 11;
     /// ```
     #[clippy::version = "pre 1.29.0"]
-    pub SIMILAR_NAMES,
-    pedantic,
-    "similarly named items and bindings"
+    pub JUST_UNDERSCORES_AND_DIGITS,
+    style,
+    "unclear name"
 }
 
 declare_clippy_lint! {
@@ -55,30 +52,46 @@ declare_clippy_lint! {
 
 declare_clippy_lint! {
     /// ### What it does
-    /// Checks if you have variables whose name consists of just
-    /// underscores and digits.
+    /// Checks for names that are very similar and thus confusing. In particular,
+    /// the lint checks for names with a single character change.
+    ///
+    /// It does not warn about names that have a single additional character at
+    /// the beginning nor the end; only insertions in the middle are considered.
+    ///
+    /// Note: this lint looks for similar names throughout each
+    /// scope. To allow it, you need to allow it on the scope
+    /// level, not on the name that is reported.
     ///
     /// ### Why is this bad?
-    /// It's hard to memorize what a variable means without a
-    /// descriptive name.
+    /// It's hard to distinguish between names that differ only
+    /// by a single character.
     ///
     /// ### Example
-    /// ```no_run
-    /// let _1 = 1;
-    /// let ___1 = 1;
-    /// let __1___2 = 11;
+    /// ```ignore
+    /// let checked_exp = something;
+    /// let checked_eap = something_else;
+    /// ```
+    ///
+    /// ### Example 2
+    /// ```ignore
+    /// let orange = val;
+    /// let ornange = val2;
     /// ```
     #[clippy::version = "pre 1.29.0"]
-    pub JUST_UNDERSCORES_AND_DIGITS,
-    style,
-    "unclear name"
+    pub SIMILAR_NAMES,
+    pedantic,
+    "similarly named items and bindings"
 }
+
+impl_lint_pass!(NonExpressiveNames => [
+    JUST_UNDERSCORES_AND_DIGITS,
+    MANY_SINGLE_CHAR_NAMES,
+    SIMILAR_NAMES,
+]);
 
 pub struct NonExpressiveNames {
     pub single_char_binding_names_threshold: u64,
 }
-
-impl_lint_pass!(NonExpressiveNames => [SIMILAR_NAMES, MANY_SINGLE_CHAR_NAMES, JUST_UNDERSCORES_AND_DIGITS]);
 
 impl NonExpressiveNames {
     pub fn new(conf: &'static Conf) -> Self {
@@ -209,7 +222,8 @@ impl SimilarNamesNameVisitor<'_, '_, '_> {
 
     fn check_ident(&mut self, ident: Ident) {
         let interned_name = ident.name.as_str();
-        if interned_name.chars().any(char::is_uppercase) {
+        // name can be empty if it comes from recovery
+        if interned_name.chars().any(char::is_uppercase) || interned_name.is_empty() {
             return;
         }
         if interned_name.chars().all(|c| c.is_ascii_digit() || c == '_') {
@@ -248,6 +262,11 @@ impl SimilarNamesNameVisitor<'_, '_, '_> {
                 continue;
             }
 
+            // Skip similarity check if both names are exactly 3 characters
+            if count == 3 && existing_name.len == 3 {
+                continue;
+            }
+
             let dissimilar = match existing_name.len.cmp(&count) {
                 Ordering::Greater => existing_name.len - count != 1 || levenstein_not_1(interned_name, existing_str),
                 Ordering::Less => count - existing_name.len != 1 || levenstein_not_1(existing_str, interned_name),
@@ -270,10 +289,10 @@ impl SimilarNamesNameVisitor<'_, '_, '_> {
             return;
         }
         self.0.names.push(ExistingName {
-            exemptions: get_exemptions(interned_name).unwrap_or(&[]),
             interned: ident.name,
             span: ident.span,
             len: count,
+            exemptions: get_exemptions(interned_name).unwrap_or(&[]),
         });
     }
 
@@ -381,7 +400,7 @@ impl<'tcx> Visitor<'tcx> for SimilarNamesLocalVisitor<'_, 'tcx> {
 
 impl EarlyLintPass for NonExpressiveNames {
     fn check_item(&mut self, cx: &EarlyContext<'_>, item: &Item) {
-        if in_external_macro(cx.sess(), item.span) {
+        if item.span.in_external_macro(cx.sess().source_map()) {
             return;
         }
 
@@ -396,7 +415,7 @@ impl EarlyLintPass for NonExpressiveNames {
     }
 
     fn check_impl_item(&mut self, cx: &EarlyContext<'_>, item: &AssocItem) {
-        if in_external_macro(cx.sess(), item.span) {
+        if item.span.in_external_macro(cx.sess().source_map()) {
             return;
         }
 

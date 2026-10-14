@@ -23,21 +23,21 @@
 //  - `check_unused` finally emits the diagnostics based on the data generated
 //    in the last step
 
+use std::borrow::Cow;
+
 use rustc_ast as ast;
 use rustc_ast::visit::{self, Visitor};
 use rustc_data_structures::fx::{FxHashMap, FxIndexMap, FxIndexSet};
 use rustc_data_structures::unord::UnordSet;
-use rustc_errors::MultiSpan;
+use rustc_errors::{DiagArgValue, Diagnostic, MultiSpan};
 use rustc_hir::def::{DefKind, Res};
-use rustc_session::lint::BuiltinLintDiag;
 use rustc_session::lint::builtin::{
     MACRO_USE_EXTERN_CRATE, UNUSED_EXTERN_CRATES, UNUSED_IMPORTS, UNUSED_QUALIFICATIONS,
 };
-use rustc_span::symbol::{Ident, kw};
-use rustc_span::{DUMMY_SP, Span};
+use rustc_span::{DUMMY_SP, Ident, Span, kw};
 
 use crate::imports::{Import, ImportKind};
-use crate::{LexicalScopeBinding, NameBindingKind, Resolver, module_to_string};
+use crate::{DeclKind, IdentKey, LateDecl, Resolver, errors, module_to_string};
 
 struct UnusedImport {
     use_tree: ast::UseTree,
@@ -101,6 +101,21 @@ impl<'a, 'ra, 'tcx> UnusedImportCheckVisitor<'a, 'ra, 'tcx> {
         }
     }
 
+    fn check_use_tree(&mut self, use_tree: &'a ast::UseTree, id: ast::NodeId) {
+        if self.r.effective_visibilities.is_exported(self.r.local_def_id(id)) {
+            self.check_import_as_underscore(use_tree, id);
+            return;
+        }
+
+        if let ast::UseTreeKind::Nested { ref items, .. } = use_tree.kind {
+            if items.is_empty() {
+                self.unused_import(self.base_id).add(id);
+            }
+        } else {
+            self.check_import(id);
+        }
+    }
+
     fn unused_import(&mut self, id: ast::NodeId) -> &mut UnusedImport {
         let use_tree_id = self.base_id;
         let use_tree = self.base_use_tree.unwrap().clone();
@@ -119,9 +134,10 @@ impl<'a, 'ra, 'tcx> UnusedImportCheckVisitor<'a, 'ra, 'tcx> {
             ast::UseTreeKind::Simple(Some(ident)) => {
                 if ident.name == kw::Underscore
                     && !self.r.import_res_map.get(&id).is_some_and(|per_ns| {
-                        per_ns.iter().filter_map(|res| res.as_ref()).any(|res| {
-                            matches!(res, Res::Def(DefKind::Trait | DefKind::TraitAlias, _))
-                        })
+                        matches!(
+                            per_ns.type_ns,
+                            Some(Res::Def(DefKind::Trait | DefKind::TraitAlias, _))
+                        )
                     })
                 {
                     self.unused_import(self.base_id).add(id);
@@ -154,7 +170,8 @@ impl<'a, 'ra, 'tcx> UnusedImportCheckVisitor<'a, 'ra, 'tcx> {
                         UNUSED_EXTERN_CRATES,
                         extern_crate.id,
                         span,
-                        BuiltinLintDiag::UnusedExternCrate {
+                        crate::errors::UnusedExternCrate {
+                            span: extern_crate.span,
                             removal_span: extern_crate.span_with_attributes,
                         },
                     );
@@ -187,9 +204,19 @@ impl<'a, 'ra, 'tcx> UnusedImportCheckVisitor<'a, 'ra, 'tcx> {
             if self
                 .r
                 .extern_prelude
-                .get(&extern_crate.ident)
-                .is_none_or(|entry| entry.introduced_by_item)
+                .get(&IdentKey::new(extern_crate.ident))
+                .is_none_or(|entry| entry.introduced_by_item())
             {
+                continue;
+            }
+
+            let module = self
+                .r
+                .get_nearest_non_block_module(self.r.local_def_id(extern_crate.id).to_def_id());
+            if module.no_implicit_prelude {
+                // If the module has `no_implicit_prelude`, then we don't suggest
+                // replacing the extern crate with a use, as it would not be
+                // inserted into the prelude. User writes `extern` style deliberately.
                 continue;
             }
 
@@ -202,11 +229,15 @@ impl<'a, 'ra, 'tcx> UnusedImportCheckVisitor<'a, 'ra, 'tcx> {
                 .span
                 .find_ancestor_inside(extern_crate.span)
                 .unwrap_or(extern_crate.ident.span);
+
             self.r.lint_buffer.buffer_lint(
                 UNUSED_EXTERN_CRATES,
                 extern_crate.id,
                 extern_crate.span,
-                BuiltinLintDiag::ExternCrateNotIdiomatic { vis_span, ident_span },
+                crate::errors::ExternCrateNotIdiomatic {
+                    span: vis_span.between(ident_span),
+                    code: if vis_span.is_empty() { "use " } else { " use " },
+                },
             );
         }
     }
@@ -214,52 +245,40 @@ impl<'a, 'ra, 'tcx> UnusedImportCheckVisitor<'a, 'ra, 'tcx> {
 
 impl<'a, 'ra, 'tcx> Visitor<'a> for UnusedImportCheckVisitor<'a, 'ra, 'tcx> {
     fn visit_item(&mut self, item: &'a ast::Item) {
-        match item.kind {
+        self.item_span = item.span_with_attributes();
+        match &item.kind {
             // Ignore is_public import statements because there's no way to be sure
             // whether they're used or not. Also ignore imports with a dummy span
             // because this means that they were generated in some fashion by the
             // compiler and we don't need to consider them.
             ast::ItemKind::Use(..) if item.span.is_dummy() => return,
-            ast::ItemKind::ExternCrate(orig_name) => {
+            // Use the base UseTree's NodeId as the item id
+            // This allows the grouping of all the lints in the same item
+            ast::ItemKind::Use(use_tree) => {
+                self.base_id = item.id;
+                self.base_use_tree = Some(use_tree);
+                self.check_use_tree(use_tree, item.id);
+            }
+            &ast::ItemKind::ExternCrate(orig_name, ident) => {
                 self.extern_crate_items.push(ExternCrateToLint {
                     id: item.id,
                     span: item.span,
                     vis_span: item.vis.span,
                     span_with_attributes: item.span_with_attributes(),
                     has_attrs: !item.attrs.is_empty(),
-                    ident: item.ident,
+                    ident,
                     renames: orig_name.is_some(),
                 });
             }
             _ => {}
         }
 
-        self.item_span = item.span_with_attributes();
         visit::walk_item(self, item);
     }
 
-    fn visit_use_tree(&mut self, use_tree: &'a ast::UseTree, id: ast::NodeId, nested: bool) {
-        // Use the base UseTree's NodeId as the item id
-        // This allows the grouping of all the lints in the same item
-        if !nested {
-            self.base_id = id;
-            self.base_use_tree = Some(use_tree);
-        }
-
-        if self.r.effective_visibilities.is_exported(self.r.local_def_id(id)) {
-            self.check_import_as_underscore(use_tree, id);
-            return;
-        }
-
-        if let ast::UseTreeKind::Nested { ref items, .. } = use_tree.kind {
-            if items.is_empty() {
-                self.unused_import(self.base_id).add(id);
-            }
-        } else {
-            self.check_import(id);
-        }
-
-        visit::walk_use_tree(self, use_tree, id);
+    fn visit_nested_use_tree(&mut self, use_tree: &'a ast::UseTree, id: ast::NodeId) {
+        self.check_use_tree(use_tree, id);
+        visit::walk_use_tree(self, use_tree);
     }
 }
 
@@ -276,22 +295,25 @@ fn calc_unused_spans(
 ) -> UnusedSpanResult {
     // The full span is the whole item's span if this current tree is not nested inside another
     // This tells rustfix to remove the whole item if all the imports are unused
-    let full_span = if unused_import.use_tree.span == use_tree.span {
+    let full_span = if unused_import.use_tree.span() == use_tree.span() {
         unused_import.item_span
     } else {
-        use_tree.span
+        use_tree.span()
     };
     match use_tree.kind {
-        ast::UseTreeKind::Simple(..) | ast::UseTreeKind::Glob => {
+        ast::UseTreeKind::Simple(..) | ast::UseTreeKind::Glob(_) => {
             if unused_import.unused.contains(&use_tree_id) {
-                UnusedSpanResult::Unused { spans: vec![use_tree.span], remove: full_span }
+                UnusedSpanResult::Unused { spans: vec![use_tree.span()], remove: full_span }
             } else {
                 UnusedSpanResult::Used
             }
         }
         ast::UseTreeKind::Nested { items: ref nested, span: tree_span } => {
             if nested.is_empty() {
-                return UnusedSpanResult::Unused { spans: vec![use_tree.span], remove: full_span };
+                return UnusedSpanResult::Unused {
+                    spans: vec![use_tree.span()],
+                    remove: full_span,
+                };
             }
 
             let mut unused_spans = Vec::new();
@@ -322,10 +344,10 @@ fn calc_unused_spans(
                     } else if pos == nested.len() - 1 || used_children > 0 {
                         // Delete everything from the end of the last import, to delete the
                         // previous comma
-                        nested[pos - 1].0.span.shrink_to_hi().to(use_tree.span)
+                        nested[pos - 1].0.hi_span().shrink_to_hi().to(use_tree.hi_span())
                     } else {
                         // Delete everything until the next import, to delete the trailing commas
-                        use_tree.span.to(nested[pos + 1].0.span.shrink_to_lo())
+                        use_tree.prefix.span.to(nested[pos + 1].0.prefix.span.shrink_to_lo())
                     };
 
                     // Try to collapse adjacent spans into a single one. This prevents all cases of
@@ -338,7 +360,8 @@ fn calc_unused_spans(
                     }
                 }
                 contains_self |= use_tree.prefix == kw::SelfLower
-                    && matches!(use_tree.kind, ast::UseTreeKind::Simple(None));
+                    && matches!(use_tree.kind, ast::UseTreeKind::Simple(_))
+                    && !unused_import.unused.contains(&use_tree_id);
                 previous_unused = remove.is_some();
             }
             if unused_spans.is_empty() {
@@ -360,11 +383,23 @@ fn calc_unused_spans(
                 if used_children == 1 && !contains_self {
                     // Left brace, from the start of the nested group to the first item.
                     to_remove.push(
-                        tree_span.shrink_to_lo().to(nested.first().unwrap().0.span.shrink_to_lo()),
+                        tree_span.shrink_to_lo().to(nested
+                            .first()
+                            .unwrap()
+                            .0
+                            .prefix
+                            .span
+                            .shrink_to_lo()),
                     );
                     // Right brace, from the end of the last item to the end of the nested group.
                     to_remove.push(
-                        nested.last().unwrap().0.span.shrink_to_hi().to(tree_span.shrink_to_hi()),
+                        nested
+                            .last()
+                            .unwrap()
+                            .0
+                            .hi_span()
+                            .shrink_to_hi()
+                            .to(tree_span.shrink_to_hi()),
                     );
                 }
 
@@ -391,18 +426,19 @@ impl Resolver<'_, '_> {
                                 MACRO_USE_EXTERN_CRATE,
                                 import.root_id,
                                 import.span,
-                                BuiltinLintDiag::MacroUseDeprecated,
+                                crate::errors::MacroUseDeprecated,
                             );
                         }
                     }
                 }
                 ImportKind::ExternCrate { id, .. } => {
                     let def_id = self.local_def_id(id);
-                    if self.extern_crate_map.get(&def_id).map_or(true, |&cnum| {
+                    if self.extern_crate_map.get(&def_id).is_none_or(|&cnum| {
                         !tcx.is_compiler_builtins(cnum)
                             && !tcx.is_panic_runtime(cnum)
                             && !tcx.has_global_allocator(cnum)
                             && !tcx.has_panic_handler(cnum)
+                            && tcx.externally_implementable_items(cnum).is_empty()
                     }) {
                         maybe_unused_extern_crates.insert(id, import.span);
                     }
@@ -412,7 +448,7 @@ impl Resolver<'_, '_> {
                         UNUSED_IMPORTS,
                         import.root_id,
                         import.span,
-                        BuiltinLintDiag::UnusedMacroUse,
+                        crate::errors::UnusedMacroUse,
                     );
                 }
                 _ => {}
@@ -476,28 +512,42 @@ impl Resolver<'_, '_> {
                 }
             };
 
-            visitor.r.lint_buffer.buffer_lint(
+            visitor.r.lint_buffer.dyn_buffer_lint_any(
                 UNUSED_IMPORTS,
                 unused.use_tree_id,
                 ms,
-                BuiltinLintDiag::UnusedImports {
-                    remove_whole_use,
-                    num_to_remove,
-                    remove_spans,
-                    test_module_span,
-                    span_snippets,
+                move |dcx, level, sess| {
+                    let sugg = if remove_whole_use {
+                        errors::UnusedImportsSugg::RemoveWholeUse { span: remove_spans[0] }
+                    } else {
+                        errors::UnusedImportsSugg::RemoveImports { remove_spans, num_to_remove }
+                    };
+                    let test_module_span = test_module_span.map(|span| {
+                        sess.downcast_ref::<rustc_session::Session>()
+                            .expect("expected a `Session`")
+                            .source_map()
+                            .guess_head_span(span)
+                    });
+
+                    errors::UnusedImports {
+                        sugg,
+                        test_module_span,
+                        num_snippets: span_snippets.len(),
+                        span_snippets: DiagArgValue::StrListSepByAnd(
+                            span_snippets.into_iter().map(Cow::Owned).collect(),
+                        ),
+                    }
+                    .into_diag(dcx, level)
                 },
             );
         }
 
         let unused_imports = visitor.unused_imports;
         let mut check_redundant_imports = FxIndexSet::default();
-        for module in self.arenas.local_modules().iter() {
+        for module in &self.local_modules {
             for (_key, resolution) in self.resolutions(*module).borrow().iter() {
-                let resolution = resolution.borrow();
-
-                if let Some(binding) = resolution.binding
-                    && let NameBindingKind::Import { import, .. } = binding.kind
+                if let Some(decl) = resolution.borrow().best_decl()
+                    && let DeclKind::Import { import, .. } = decl.kind
                     && let ImportKind::Single { id, .. } = import.kind
                 {
                     if let Some(unused_import) = unused_imports.get(&import.root_id)
@@ -524,8 +574,8 @@ impl Resolver<'_, '_> {
         // Deleting both unused imports and unnecessary segments of an item may result
         // in the item not being found.
         for unn_qua in &self.potentially_unnecessary_qualifications {
-            if let LexicalScopeBinding::Item(name_binding) = unn_qua.binding
-                && let NameBindingKind::Import { import, .. } = name_binding.kind
+            if let LateDecl::Decl(decl) = unn_qua.decl
+                && let DeclKind::Import { import, .. } = decl.kind
                 && (is_unused_import(import, &unused_imports)
                     || is_redundant_import(import, &redundant_imports))
             {
@@ -536,7 +586,7 @@ impl Resolver<'_, '_> {
                 UNUSED_QUALIFICATIONS,
                 unn_qua.node_id,
                 unn_qua.path_span,
-                BuiltinLintDiag::UnusedQualifications { removal_span: unn_qua.removal_span },
+                errors::UnusedQualifications { removal_span: unn_qua.removal_span },
             );
         }
 

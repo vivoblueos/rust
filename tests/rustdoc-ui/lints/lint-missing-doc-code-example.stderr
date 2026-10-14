@@ -1,20 +1,26 @@
-error: missing code example in this documentation
-  --> $DIR/lint-missing-doc-code-example.rs:20:1
+error: missing documentation for an associated function
+  --> $DIR/lint-missing-doc-code-example.rs:82:5
    |
-LL | pub mod module1 {
-   | ^^^^^^^^^^^^^^^
+LL |     pub fn bar() {}
+   |     ^^^^^^^^^^^^
    |
 note: the lint level is defined here
-  --> $DIR/lint-missing-doc-code-example.rs:3:9
+  --> $DIR/lint-missing-doc-code-example.rs:2:9
    |
-LL | #![deny(rustdoc::missing_doc_code_examples)]
-   |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+LL | #![deny(missing_docs)]
+   |         ^^^^^^^^^^^^
 
 error: missing code example in this documentation
   --> $DIR/lint-missing-doc-code-example.rs:38:3
    |
 LL |   /// doc
    |   ^^^^^^^
+   |
+note: the lint level is defined here
+  --> $DIR/lint-missing-doc-code-example.rs:3:9
+   |
+LL | #![deny(rustdoc::missing_doc_code_examples)]
+   |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
 error: missing code example in this documentation
   --> $DIR/lint-missing-doc-code-example.rs:50:1
@@ -34,5 +40,11 @@ error: missing code example in this documentation
 LL | /// Doc
    | ^^^^^^^
 
-error: aborting due to 5 previous errors
+error: missing code example in this documentation
+  --> $DIR/lint-missing-doc-code-example.rs:82:5
+   |
+LL |     pub fn bar() {}
+   |     ^^^^^^^^^^^^^^^
+
+error: aborting due to 6 previous errors
 

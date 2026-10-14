@@ -1,4 +1,5 @@
-//@ aux-build:param-attrs.rs
+//@ edition:2015
+//@ proc-macro: param-attrs.rs
 
 //@ check-pass
 

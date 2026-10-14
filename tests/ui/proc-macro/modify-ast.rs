@@ -1,5 +1,6 @@
 //@ run-pass
-//@ aux-build:modify-ast.rs
+//@ proc-macro: modify-ast.rs
+//@ ignore-backends: gcc
 
 extern crate modify_ast;
 

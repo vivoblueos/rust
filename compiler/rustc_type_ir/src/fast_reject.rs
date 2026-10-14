@@ -9,7 +9,7 @@ use rustc_data_structures::fingerprint::Fingerprint;
 #[cfg(feature = "nightly")]
 use rustc_data_structures::stable_hasher::{HashStable, StableHasher, ToStableHashKey};
 #[cfg(feature = "nightly")]
-use rustc_macros::{HashStable_NoContext, TyDecodable, TyEncodable};
+use rustc_macros::{Decodable_NoContext, Encodable_NoContext, HashStable_NoContext};
 
 use crate::inherent::*;
 use crate::visit::TypeVisitableExt as _;
@@ -17,7 +17,10 @@ use crate::{self as ty, Interner};
 
 /// See `simplify_type`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "nightly", derive(TyEncodable, TyDecodable, HashStable_NoContext))]
+#[cfg_attr(
+    feature = "nightly",
+    derive(Encodable_NoContext, Decodable_NoContext, HashStable_NoContext)
+)]
 pub enum SimplifiedType<DefId> {
     Bool,
     Char,
@@ -41,19 +44,19 @@ pub enum SimplifiedType<DefId> {
     Coroutine(DefId),
     CoroutineWitness(DefId),
     Function(usize),
+    UnsafeBinder,
     Placeholder,
     Error,
 }
 
 #[cfg(feature = "nightly")]
-impl<HCX: Clone, DefId: HashStable<HCX>> ToStableHashKey<HCX> for SimplifiedType<DefId> {
+impl<Hcx, DefId: HashStable<Hcx>> ToStableHashKey<Hcx> for SimplifiedType<DefId> {
     type KeyType = Fingerprint;
 
     #[inline]
-    fn to_stable_hash_key(&self, hcx: &HCX) -> Fingerprint {
+    fn to_stable_hash_key(&self, hcx: &mut Hcx) -> Fingerprint {
         let mut hasher = StableHasher::new();
-        let mut hcx: HCX = hcx.clone();
-        self.hash_stable(&mut hcx, &mut hasher);
+        self.hash_stable(hcx, &mut hasher);
         hasher.finish()
     }
 }
@@ -80,6 +83,9 @@ pub enum TreatParams {
     ///
     /// This also treats projections with inference variables as infer vars
     /// since they could be further normalized.
+    // FIXME(@lcnr): This treats aliases as rigid. This is only correct if the
+    // type has been structurally normalized. We should reflect this requirement
+    // in the variant name. It is currently incorrectly used in diagnostics.
     AsRigid,
 }
 
@@ -115,7 +121,7 @@ pub fn simplify_type<I: Interner>(
         ty::Int(int_type) => Some(SimplifiedType::Int(int_type)),
         ty::Uint(uint_type) => Some(SimplifiedType::Uint(uint_type)),
         ty::Float(float_type) => Some(SimplifiedType::Float(float_type)),
-        ty::Adt(def, _) => Some(SimplifiedType::Adt(def.def_id())),
+        ty::Adt(def, _) => Some(SimplifiedType::Adt(def.def_id().into())),
         ty::Str => Some(SimplifiedType::Str),
         ty::Array(..) => Some(SimplifiedType::Array),
         ty::Slice(..) => Some(SimplifiedType::Slice),
@@ -123,21 +129,22 @@ pub fn simplify_type<I: Interner>(
         ty::RawPtr(_, mutbl) => Some(SimplifiedType::Ptr(mutbl)),
         ty::Dynamic(trait_info, ..) => match trait_info.principal_def_id() {
             Some(principal_def_id) if !cx.trait_is_auto(principal_def_id) => {
-                Some(SimplifiedType::Trait(principal_def_id))
+                Some(SimplifiedType::Trait(principal_def_id.into()))
             }
             _ => Some(SimplifiedType::MarkerTraitObject),
         },
         ty::Ref(_, _, mutbl) => Some(SimplifiedType::Ref(mutbl)),
-        ty::FnDef(def_id, _) | ty::Closure(def_id, _) | ty::CoroutineClosure(def_id, _) => {
-            Some(SimplifiedType::Closure(def_id))
-        }
-        ty::Coroutine(def_id, _) => Some(SimplifiedType::Coroutine(def_id)),
-        ty::CoroutineWitness(def_id, _) => Some(SimplifiedType::CoroutineWitness(def_id)),
+        ty::FnDef(def_id, _) => Some(SimplifiedType::Closure(def_id.into())),
+        ty::Closure(def_id, _) => Some(SimplifiedType::Closure(def_id.into())),
+        ty::CoroutineClosure(def_id, _) => Some(SimplifiedType::Closure(def_id.into())),
+        ty::Coroutine(def_id, _) => Some(SimplifiedType::Coroutine(def_id.into())),
+        ty::CoroutineWitness(def_id, _) => Some(SimplifiedType::CoroutineWitness(def_id.into())),
         ty::Never => Some(SimplifiedType::Never),
         ty::Tuple(tys) => Some(SimplifiedType::Tuple(tys.len())),
         ty::FnPtr(sig_tys, _hdr) => {
             Some(SimplifiedType::Function(sig_tys.skip_binder().inputs().len()))
         }
+        ty::UnsafeBinder(_) => Some(SimplifiedType::UnsafeBinder),
         ty::Placeholder(..) => Some(SimplifiedType::Placeholder),
         ty::Param(_) => match treat_params {
             TreatParams::AsRigid => Some(SimplifiedType::Placeholder),
@@ -146,12 +153,14 @@ pub fn simplify_type<I: Interner>(
         ty::Alias(..) => match treat_params {
             // When treating `ty::Param` as a placeholder, projections also
             // don't unify with anything else as long as they are fully normalized.
-            // FIXME(-Znext-solver): Can remove this `if` and always simplify to `Placeholder`
-            // when the new solver is enabled by default.
-            TreatParams::AsRigid if !ty.has_non_region_infer() => Some(SimplifiedType::Placeholder),
+            TreatParams::AsRigid
+                if !ty.has_non_region_infer() || cx.next_trait_solver_globally() =>
+            {
+                Some(SimplifiedType::Placeholder)
+            }
             TreatParams::AsRigid | TreatParams::InstantiateWithInfer => None,
         },
-        ty::Foreign(def_id) => Some(SimplifiedType::Foreign(def_id)),
+        ty::Foreign(def_id) => Some(SimplifiedType::Foreign(def_id.into())),
         ty::Error(_) => Some(SimplifiedType::Error),
         ty::Bound(..) | ty::Infer(_) => None,
     }
@@ -214,27 +223,55 @@ impl<I: Interner> DeepRejectCtxt<I, false, true> {
 impl<I: Interner, const INSTANTIATE_LHS_WITH_INFER: bool, const INSTANTIATE_RHS_WITH_INFER: bool>
     DeepRejectCtxt<I, INSTANTIATE_LHS_WITH_INFER, INSTANTIATE_RHS_WITH_INFER>
 {
+    // Quite arbitrary. Large enough to only affect a very tiny amount of impls/crates
+    // and small enough to prevent hangs.
+    const STARTING_DEPTH: usize = 8;
+
     pub fn args_may_unify(
         self,
         obligation_args: I::GenericArgs,
         impl_args: I::GenericArgs,
     ) -> bool {
+        self.args_may_unify_inner(obligation_args, impl_args, Self::STARTING_DEPTH)
+    }
+
+    pub fn types_may_unify(self, lhs: I::Ty, rhs: I::Ty) -> bool {
+        self.types_may_unify_inner(lhs, rhs, Self::STARTING_DEPTH)
+    }
+
+    pub fn types_may_unify_with_depth(self, lhs: I::Ty, rhs: I::Ty, depth_limit: usize) -> bool {
+        self.types_may_unify_inner(lhs, rhs, depth_limit)
+    }
+
+    fn args_may_unify_inner(
+        self,
+        obligation_args: I::GenericArgs,
+        impl_args: I::GenericArgs,
+        depth: usize,
+    ) -> bool {
+        // No need to decrement the depth here as this function is only
+        // recursively reachable via `types_may_unify_inner` which already
+        // increments the depth for us.
         iter::zip(obligation_args.iter(), impl_args.iter()).all(|(obl, imp)| {
             match (obl.kind(), imp.kind()) {
                 // We don't fast reject based on regions.
                 (ty::GenericArgKind::Lifetime(_), ty::GenericArgKind::Lifetime(_)) => true,
                 (ty::GenericArgKind::Type(obl), ty::GenericArgKind::Type(imp)) => {
-                    self.types_may_unify(obl, imp)
+                    self.types_may_unify_inner(obl, imp, depth)
                 }
                 (ty::GenericArgKind::Const(obl), ty::GenericArgKind::Const(imp)) => {
-                    self.consts_may_unify(obl, imp)
+                    self.consts_may_unify_inner(obl, imp)
                 }
                 _ => panic!("kind mismatch: {obl:?} {imp:?}"),
             }
         })
     }
 
-    pub fn types_may_unify(self, lhs: I::Ty, rhs: I::Ty) -> bool {
+    fn types_may_unify_inner(self, lhs: I::Ty, rhs: I::Ty, depth: usize) -> bool {
+        if lhs == rhs {
+            return true;
+        }
+
         match rhs.kind() {
             // Start by checking whether the `rhs` type may unify with
             // pretty much everything. Just return `true` in that case.
@@ -270,21 +307,35 @@ impl<I: Interner, const INSTANTIATE_LHS_WITH_INFER: bool, const INSTANTIATE_RHS_
             | ty::Coroutine(..)
             | ty::CoroutineWitness(..)
             | ty::Foreign(_)
-            | ty::Placeholder(_) => {}
+            | ty::Placeholder(_)
+            | ty::UnsafeBinder(_) => {}
+        };
+
+        // The type system needs to support exponentially large types
+        // as long as they are self-similar. While most other folders
+        // use caching to handle them, this folder exists purely as a
+        // perf optimization and is incredibly hot. In pretty much all
+        // uses checking the cache is slower than simply recursing, so
+        // we instead just add an arbitrary depth cutoff.
+        //
+        // We only decrement the depth here as the match on `rhs`
+        // does not recurse.
+        let Some(depth) = depth.checked_sub(1) else {
+            return true;
         };
 
         // For purely rigid types, use structural equivalence.
         match lhs.kind() {
             ty::Ref(_, lhs_ty, lhs_mutbl) => match rhs.kind() {
                 ty::Ref(_, rhs_ty, rhs_mutbl) => {
-                    lhs_mutbl == rhs_mutbl && self.types_may_unify(lhs_ty, rhs_ty)
+                    lhs_mutbl == rhs_mutbl && self.types_may_unify_inner(lhs_ty, rhs_ty, depth)
                 }
                 _ => false,
             },
 
             ty::Adt(lhs_def, lhs_args) => match rhs.kind() {
                 ty::Adt(rhs_def, rhs_args) => {
-                    lhs_def == rhs_def && self.args_may_unify(lhs_args, rhs_args)
+                    lhs_def == rhs_def && self.args_may_unify_inner(lhs_args, rhs_args, depth)
                 }
                 _ => false,
             },
@@ -326,27 +377,28 @@ impl<I: Interner, const INSTANTIATE_LHS_WITH_INFER: bool, const INSTANTIATE_RHS_
                 ty::Tuple(rhs) => {
                     lhs.len() == rhs.len()
                         && iter::zip(lhs.iter(), rhs.iter())
-                            .all(|(lhs, rhs)| self.types_may_unify(lhs, rhs))
+                            .all(|(lhs, rhs)| self.types_may_unify_inner(lhs, rhs, depth))
                 }
                 _ => false,
             },
 
             ty::Array(lhs_ty, lhs_len) => match rhs.kind() {
                 ty::Array(rhs_ty, rhs_len) => {
-                    self.types_may_unify(lhs_ty, rhs_ty) && self.consts_may_unify(lhs_len, rhs_len)
+                    self.types_may_unify_inner(lhs_ty, rhs_ty, depth)
+                        && self.consts_may_unify_inner(lhs_len, rhs_len)
                 }
                 _ => false,
             },
 
             ty::RawPtr(lhs_ty, lhs_mutbl) => match rhs.kind() {
                 ty::RawPtr(rhs_ty, rhs_mutbl) => {
-                    lhs_mutbl == rhs_mutbl && self.types_may_unify(lhs_ty, rhs_ty)
+                    lhs_mutbl == rhs_mutbl && self.types_may_unify_inner(lhs_ty, rhs_ty, depth)
                 }
                 _ => false,
             },
 
             ty::Slice(lhs_ty) => {
-                matches!(rhs.kind(), ty::Slice(rhs_ty) if self.types_may_unify(lhs_ty, rhs_ty))
+                matches!(rhs.kind(), ty::Slice(rhs_ty) if self.types_may_unify_inner(lhs_ty, rhs_ty, depth))
             }
 
             ty::Dynamic(lhs_preds, ..) => {
@@ -366,7 +418,7 @@ impl<I: Interner, const INSTANTIATE_LHS_WITH_INFER: bool, const INSTANTIATE_RHS_
                     lhs_hdr == rhs_hdr
                         && lhs_sig_tys.len() == rhs_sig_tys.len()
                         && iter::zip(lhs_sig_tys.iter(), rhs_sig_tys.iter())
-                            .all(|(lhs, rhs)| self.types_may_unify(lhs, rhs))
+                            .all(|(lhs, rhs)| self.types_may_unify_inner(lhs, rhs, depth))
                 }
                 _ => false,
             },
@@ -375,49 +427,58 @@ impl<I: Interner, const INSTANTIATE_LHS_WITH_INFER: bool, const INSTANTIATE_RHS_
 
             ty::FnDef(lhs_def_id, lhs_args) => match rhs.kind() {
                 ty::FnDef(rhs_def_id, rhs_args) => {
-                    lhs_def_id == rhs_def_id && self.args_may_unify(lhs_args, rhs_args)
+                    lhs_def_id == rhs_def_id && self.args_may_unify_inner(lhs_args, rhs_args, depth)
                 }
                 _ => false,
             },
 
             ty::Closure(lhs_def_id, lhs_args) => match rhs.kind() {
                 ty::Closure(rhs_def_id, rhs_args) => {
-                    lhs_def_id == rhs_def_id && self.args_may_unify(lhs_args, rhs_args)
+                    lhs_def_id == rhs_def_id && self.args_may_unify_inner(lhs_args, rhs_args, depth)
                 }
                 _ => false,
             },
 
             ty::CoroutineClosure(lhs_def_id, lhs_args) => match rhs.kind() {
                 ty::CoroutineClosure(rhs_def_id, rhs_args) => {
-                    lhs_def_id == rhs_def_id && self.args_may_unify(lhs_args, rhs_args)
+                    lhs_def_id == rhs_def_id && self.args_may_unify_inner(lhs_args, rhs_args, depth)
                 }
                 _ => false,
             },
 
             ty::Coroutine(lhs_def_id, lhs_args) => match rhs.kind() {
                 ty::Coroutine(rhs_def_id, rhs_args) => {
-                    lhs_def_id == rhs_def_id && self.args_may_unify(lhs_args, rhs_args)
+                    lhs_def_id == rhs_def_id && self.args_may_unify_inner(lhs_args, rhs_args, depth)
                 }
                 _ => false,
             },
 
             ty::CoroutineWitness(lhs_def_id, lhs_args) => match rhs.kind() {
                 ty::CoroutineWitness(rhs_def_id, rhs_args) => {
-                    lhs_def_id == rhs_def_id && self.args_may_unify(lhs_args, rhs_args)
+                    lhs_def_id == rhs_def_id && self.args_may_unify_inner(lhs_args, rhs_args, depth)
                 }
                 _ => false,
             },
 
             ty::Pat(lhs_ty, _) => {
                 // FIXME(pattern_types): take pattern into account
-                matches!(rhs.kind(), ty::Pat(rhs_ty, _) if self.types_may_unify(lhs_ty, rhs_ty))
+                matches!(rhs.kind(), ty::Pat(rhs_ty, _) if self.types_may_unify_inner(lhs_ty, rhs_ty, depth))
             }
+
+            ty::UnsafeBinder(lhs_ty) => match rhs.kind() {
+                ty::UnsafeBinder(rhs_ty) => {
+                    self.types_may_unify(lhs_ty.skip_binder(), rhs_ty.skip_binder())
+                }
+                _ => false,
+            },
 
             ty::Error(..) => true,
         }
     }
 
-    pub fn consts_may_unify(self, lhs: I::Const, rhs: I::Const) -> bool {
+    // Unlike `types_may_unify_inner`, this does not take a depth as
+    // we never recurse from this function.
+    fn consts_may_unify_inner(self, lhs: I::Const, rhs: I::Const) -> bool {
         match rhs.kind() {
             ty::ConstKind::Param(_) => {
                 if INSTANTIATE_RHS_WITH_INFER {
@@ -437,8 +498,8 @@ impl<I: Interner, const INSTANTIATE_LHS_WITH_INFER: bool, const INSTANTIATE_RHS_
         };
 
         match lhs.kind() {
-            ty::ConstKind::Value(_, lhs_val) => match rhs.kind() {
-                ty::ConstKind::Value(_, rhs_val) => lhs_val == rhs_val,
+            ty::ConstKind::Value(lhs_val) => match rhs.kind() {
+                ty::ConstKind::Value(rhs_val) => lhs_val.valtree() == rhs_val.valtree(),
                 _ => false,
             },
 

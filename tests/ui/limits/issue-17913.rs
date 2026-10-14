@@ -1,6 +1,7 @@
 //@ build-fail
-//@ normalize-stderr-test: "\[&usize; \d+\]" -> "[&usize; usize::MAX]"
-//@ error-pattern: too big for the target architecture
+//@ stderr-per-bitwidth
+//@ normalize-stderr: "\[&usize; \d+\]" -> "[&usize; usize::MAX]"
+//@ normalize-stderr: "\[&n; 0x[0-9A-F]+_usize\]" -> "[&n; SIZE]"
 
 #[cfg(target_pointer_width = "64")]
 fn main() {
@@ -15,3 +16,5 @@ fn main() {
     let a: Box<_> = Box::new([&n; 0xFFFFFFFF_usize]);
     println!("{}", a[0xFFFFFF_usize]);
 }
+
+//~? ERROR are too big for the target architecture

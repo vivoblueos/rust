@@ -1,7 +1,7 @@
 // Regression test for #42602. It used to be that we had
 // a dep-graph like
 //
-//     typeck(foo) -> FnOnce -> typeck(bar)
+//     typeck_root(foo) -> FnOnce -> typeck_root(bar)
 //
 // This was fixed by improving the resolution of the `FnOnce` trait
 // selection node.
@@ -9,6 +9,7 @@
 //@ revisions:cfail1 cfail2 cfail3
 //@ compile-flags:-Zquery-dep-graph
 //@ build-pass (FIXME(62277): could be check-pass?)
+//@ ignore-backends: gcc
 
 #![feature(rustc_attrs)]
 

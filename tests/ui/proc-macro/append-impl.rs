@@ -1,5 +1,6 @@
 //@ run-pass
-//@ aux-build:append-impl.rs
+//@ proc-macro: append-impl.rs
+//@ ignore-backends: gcc
 
 #![allow(warnings)]
 

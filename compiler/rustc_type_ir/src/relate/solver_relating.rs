@@ -1,10 +1,11 @@
-pub use rustc_type_ir::relate::*;
-use rustc_type_ir::solve::Goal;
-use rustc_type_ir::{self as ty, InferCtxtLike, Interner};
 use tracing::{debug, instrument};
 
 use self::combine::{PredicateEmittingRelation, super_combine_consts, super_combine_tys};
 use crate::data_structures::DelayedSet;
+use crate::relate::combine::combine_ty_args;
+pub use crate::relate::*;
+use crate::solve::Goal;
+use crate::{self as ty, InferCtxtLike, Interner};
 
 pub trait RelateExt: InferCtxtLike {
     fn relate<T: Relate<Self::Interner>>(
@@ -13,6 +14,7 @@ pub trait RelateExt: InferCtxtLike {
         lhs: T,
         variance: ty::Variance,
         rhs: T,
+        span: <Self::Interner as Interner>::Span,
     ) -> Result<
         Vec<Goal<Self::Interner, <Self::Interner as Interner>::Predicate>>,
         TypeError<Self::Interner>,
@@ -23,6 +25,7 @@ pub trait RelateExt: InferCtxtLike {
         param_env: <Self::Interner as Interner>::ParamEnv,
         lhs: T,
         rhs: T,
+        span: <Self::Interner as Interner>::Span,
     ) -> Result<
         Vec<Goal<Self::Interner, <Self::Interner as Interner>::Predicate>>,
         TypeError<Self::Interner>,
@@ -36,12 +39,13 @@ impl<Infcx: InferCtxtLike> RelateExt for Infcx {
         lhs: T,
         variance: ty::Variance,
         rhs: T,
+        span: <Self::Interner as Interner>::Span,
     ) -> Result<
         Vec<Goal<Self::Interner, <Self::Interner as Interner>::Predicate>>,
         TypeError<Self::Interner>,
     > {
         let mut relate =
-            SolverRelating::new(self, StructurallyRelateAliases::No, variance, param_env);
+            SolverRelating::new(self, StructurallyRelateAliases::No, variance, param_env, span);
         relate.relate(lhs, rhs)?;
         Ok(relate.goals)
     }
@@ -51,12 +55,18 @@ impl<Infcx: InferCtxtLike> RelateExt for Infcx {
         param_env: <Self::Interner as Interner>::ParamEnv,
         lhs: T,
         rhs: T,
+        span: <Self::Interner as Interner>::Span,
     ) -> Result<
         Vec<Goal<Self::Interner, <Self::Interner as Interner>::Predicate>>,
         TypeError<Self::Interner>,
     > {
-        let mut relate =
-            SolverRelating::new(self, StructurallyRelateAliases::Yes, ty::Invariant, param_env);
+        let mut relate = SolverRelating::new(
+            self,
+            StructurallyRelateAliases::Yes,
+            ty::Invariant,
+            param_env,
+            span,
+        );
         relate.relate(lhs, rhs)?;
         Ok(relate.goals)
     }
@@ -68,6 +78,7 @@ pub struct SolverRelating<'infcx, Infcx, I: Interner> {
     // Immutable fields.
     structurally_relate_aliases: StructurallyRelateAliases,
     param_env: I::ParamEnv,
+    span: I::Span,
     // Mutable fields.
     ambient_variance: ty::Variance,
     goals: Vec<Goal<I, I::Predicate>>,
@@ -106,10 +117,12 @@ where
         structurally_relate_aliases: StructurallyRelateAliases,
         ambient_variance: ty::Variance,
         param_env: I::ParamEnv,
+        span: I::Span,
     ) -> Self {
         SolverRelating {
             infcx,
             structurally_relate_aliases,
+            span,
             ambient_variance,
             param_env,
             goals: vec![],
@@ -127,24 +140,26 @@ where
         self.infcx.cx()
     }
 
-    fn relate_item_args(
+    fn relate_ty_args(
         &mut self,
-        item_def_id: I::DefId,
-        a_arg: I::GenericArgs,
-        b_arg: I::GenericArgs,
-    ) -> RelateResult<I, I::GenericArgs> {
+        a_ty: I::Ty,
+        b_ty: I::Ty,
+        def_id: I::DefId,
+        a_args: I::GenericArgs,
+        b_args: I::GenericArgs,
+        _: impl FnOnce(I::GenericArgs) -> I::Ty,
+    ) -> RelateResult<I, I::Ty> {
         if self.ambient_variance == ty::Invariant {
             // Avoid fetching the variance if we are in an invariant
             // context; no need, and it can induce dependency cycles
             // (e.g., #41849).
-            relate_args_invariantly(self, a_arg, b_arg)
+            relate_args_invariantly(self, a_args, b_args)?;
+            Ok(a_ty)
         } else {
-            let tcx = self.cx();
-            let opt_variances = tcx.variances_of(item_def_id);
-            relate_args_with_variances(self, item_def_id, opt_variances, a_arg, b_arg, false)
+            let variances = self.cx().variances_of(def_id);
+            combine_ty_args(self.infcx, self, a_ty, b_ty, variances, a_args, b_args, |_| a_ty)
         }
     }
-
     fn relate_with_variance<T: Relate<I>>(
         &mut self,
         variance: ty::Variance,
@@ -241,10 +256,10 @@ where
     fn regions(&mut self, a: I::Region, b: I::Region) -> RelateResult<I, I::Region> {
         match self.ambient_variance {
             // Subtype(&'a u8, &'b u8) => Outlives('a: 'b) => SubRegion('b, 'a)
-            ty::Covariant => self.infcx.sub_regions(b, a),
+            ty::Covariant => self.infcx.sub_regions(b, a, self.span),
             // Suptype(&'a u8, &'b u8) => Outlives('b: 'a) => SubRegion('a, 'b)
-            ty::Contravariant => self.infcx.sub_regions(a, b),
-            ty::Invariant => self.infcx.equate_regions(a, b),
+            ty::Contravariant => self.infcx.sub_regions(a, b, self.span),
+            ty::Invariant => self.infcx.equate_regions(a, b, self.span),
             ty::Bivariant => {
                 unreachable!("Expected bivariance to be handled in relate_with_variance")
             }
@@ -272,12 +287,12 @@ where
         }
 
         // If they have no bound vars, relate normally.
-        if let Some(a_inner) = a.no_bound_vars() {
-            if let Some(b_inner) = b.no_bound_vars() {
-                self.relate(a_inner, b_inner)?;
-                return Ok(a);
-            }
-        };
+        if let Some(a_inner) = a.no_bound_vars()
+            && let Some(b_inner) = b.no_bound_vars()
+        {
+            self.relate(a_inner, b_inner)?;
+            return Ok(a);
+        }
 
         match self.ambient_variance {
             // Checks whether `for<..> sub <: for<..> sup` holds.

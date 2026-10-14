@@ -2,6 +2,7 @@
 //@ revisions: feat nofeat
 //@ compile-flags: -Cinstrument-coverage
 //@ needs-profiler-runtime
+//@ reference: attributes.coverage.syntax
 
 // Malformed `#[coverage(..)]` attributes should not cause an ICE when built
 // with `-Cinstrument-coverage`.
@@ -9,7 +10,7 @@
 
 #[coverage]
 //~^ ERROR malformed `coverage` attribute input
-//[nofeat]~| the `#[coverage]` attribute is an experimental feature
+//[nofeat]~| ERROR the `#[coverage]` attribute is an experimental feature
 fn main() {}
 
 // FIXME(#130766): When the `#[coverage(..)]` attribute is stabilized,

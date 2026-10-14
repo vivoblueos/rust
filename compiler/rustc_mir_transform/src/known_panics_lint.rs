@@ -13,7 +13,7 @@ use rustc_data_structures::fx::FxHashSet;
 use rustc_hir::HirId;
 use rustc_hir::def::DefKind;
 use rustc_index::IndexVec;
-use rustc_index::bit_set::BitSet;
+use rustc_index::bit_set::DenseBitSet;
 use rustc_middle::bug;
 use rustc_middle::mir::visit::{MutatingUseContext, NonMutatingUseContext, PlaceContext, Visitor};
 use rustc_middle::mir::*;
@@ -35,7 +35,7 @@ impl<'tcx> crate::MirLint<'tcx> for KnownPanicsLint {
         let def_id = body.source.def_id().expect_local();
         let def_kind = tcx.def_kind(def_id);
         let is_fn_like = def_kind.is_fn_like();
-        let is_assoc_const = def_kind == DefKind::AssocConst;
+        let is_assoc_const = matches!(def_kind, DefKind::AssocConst { .. });
 
         // Only run const prop on functions, methods, closures and associated constants
         if !is_fn_like && !is_assoc_const {
@@ -67,7 +67,7 @@ struct ConstPropagator<'mir, 'tcx> {
     tcx: TyCtxt<'tcx>,
     typing_env: ty::TypingEnv<'tcx>,
     worklist: Vec<BasicBlock>,
-    visited_blocks: BitSet<BasicBlock>,
+    visited_blocks: DenseBitSet<BasicBlock>,
     locals: IndexVec<Local, Value<'tcx>>,
     body: &'mir Body<'tcx>,
     written_only_inside_own_block_locals: FxHashSet<Local>,
@@ -190,7 +190,7 @@ impl<'mir, 'tcx> ConstPropagator<'mir, 'tcx> {
             tcx,
             typing_env,
             worklist: vec![START_BLOCK],
-            visited_blocks: BitSet::new_empty(body.basic_blocks.len()),
+            visited_blocks: DenseBitSet::new_empty(body.basic_blocks.len()),
             locals: IndexVec::from_elem_n(Value::Uninit, body.local_decls.len()),
             body,
             can_const_prop,
@@ -241,7 +241,7 @@ impl<'mir, 'tcx> ConstPropagator<'mir, 'tcx> {
                 assert!(
                     !err.kind().formatted_string(),
                     "known panics lint encountered formatting error: {}",
-                    format_interp_error(self.ecx.tcx.dcx(), err),
+                    format_interp_error(err),
                 );
                 err
             })
@@ -258,7 +258,7 @@ impl<'mir, 'tcx> ConstPropagator<'mir, 'tcx> {
         // Normalization needed b/c known panics lint runs in
         // `mir_drops_elaborated_and_const_checked`, which happens before
         // optimized MIR. Only after optimizing the MIR can we guarantee
-        // that the `RevealAll` pass has happened and that the body's consts
+        // that the `PostAnalysisNormalize` pass has happened and that the body's consts
         // are normalized, so any call to resolve before that needs to be
         // manually normalized.
         let val = self.tcx.try_normalize_erasing_regions(self.typing_env, c.const_).ok()?;
@@ -282,6 +282,7 @@ impl<'mir, 'tcx> ConstPropagator<'mir, 'tcx> {
     /// or `eval_place`, depending on the variant of `Operand` used.
     fn eval_operand(&mut self, op: &Operand<'tcx>) -> Option<ImmTy<'tcx>> {
         match *op {
+            Operand::RuntimeChecks(_) => None,
             Operand::Constant(ref c) => self.eval_constant(c),
             Operand::Move(place) | Operand::Copy(place) => self.eval_place(place),
         }
@@ -296,11 +297,12 @@ impl<'mir, 'tcx> ConstPropagator<'mir, 'tcx> {
         let source_info = self.body.source_info(location);
         if let Some(lint_root) = self.lint_root(*source_info) {
             let span = source_info.span;
-            self.tcx.emit_node_span_lint(lint_kind.lint(), lint_root, span, AssertLint {
+            self.tcx.emit_node_span_lint(
+                lint_kind.lint(),
+                lint_root,
                 span,
-                assert_kind,
-                lint_kind,
-            });
+                AssertLint { span, assert_kind, lint_kind },
+            );
         }
     }
 
@@ -440,11 +442,9 @@ impl<'mir, 'tcx> ConstPropagator<'mir, 'tcx> {
             | Rvalue::Use(..)
             | Rvalue::CopyForDeref(..)
             | Rvalue::Repeat(..)
-            | Rvalue::Len(..)
             | Rvalue::Cast(..)
-            | Rvalue::ShallowInitBox(..)
             | Rvalue::Discriminant(..)
-            | Rvalue::NullaryOp(..) => {}
+            | Rvalue::WrapUnsafeBinder(..) => {}
         }
 
         // FIXME we need to revisit this for #67176
@@ -507,7 +507,7 @@ impl<'mir, 'tcx> ConstPropagator<'mir, 'tcx> {
                     // other overflow checks.
                     AssertKind::Overflow(*bin_op, eval_to_int(op1), eval_to_int(op2))
                 }
-                AssertKind::BoundsCheck { ref len, ref index } => {
+                AssertKind::BoundsCheck { len, index } => {
                     let len = eval_to_int(len);
                     let index = eval_to_int(index);
                     AssertKind::BoundsCheck { len, index }
@@ -546,7 +546,9 @@ impl<'mir, 'tcx> ConstPropagator<'mir, 'tcx> {
         let val: Value<'_> = match *rvalue {
             ThreadLocalRef(_) => return None,
 
-            Use(ref operand) => self.eval_operand(operand)?.into(),
+            Use(ref operand) | WrapUnsafeBinder(ref operand, _) => {
+                self.eval_operand(operand)?.into()
+            }
 
             CopyForDeref(place) => self.eval_place(place)?.into(),
 
@@ -600,37 +602,7 @@ impl<'mir, 'tcx> ConstPropagator<'mir, 'tcx> {
                 return None;
             }
 
-            Len(place) => {
-                let len = if let ty::Array(_, n) = place.ty(self.local_decls(), self.tcx).ty.kind()
-                {
-                    n.try_to_target_usize(self.tcx)?
-                } else {
-                    match self.get_const(place)? {
-                        Value::Immediate(src) => src.len(&self.ecx).discard_err()?,
-                        Value::Aggregate { fields, .. } => fields.len() as u64,
-                        Value::Uninit => return None,
-                    }
-                };
-                ImmTy::from_scalar(Scalar::from_target_usize(len, self), layout).into()
-            }
-
             Ref(..) | RawPtr(..) => return None,
-
-            NullaryOp(ref null_op, ty) => {
-                let op_layout = self.ecx.layout_of(ty).ok()?;
-                let val = match null_op {
-                    NullOp::SizeOf => op_layout.size.bytes(),
-                    NullOp::AlignOf => op_layout.align.abi.bytes(),
-                    NullOp::OffsetOf(fields) => self
-                        .tcx
-                        .offset_of_subfield(self.typing_env, op_layout, fields.iter())
-                        .bytes(),
-                    NullOp::UbChecks => return None,
-                };
-                ImmTy::from_scalar(Scalar::from_target_usize(val, self), layout).into()
-            }
-
-            ShallowInitBox(..) => return None,
 
             Cast(ref kind, ref value, to) => match kind {
                 CastKind::IntToInt | CastKind::IntToFloat => {
@@ -647,7 +619,7 @@ impl<'mir, 'tcx> ConstPropagator<'mir, 'tcx> {
                     let res = self.ecx.float_to_float_or_int(&value, to).discard_err()?;
                     res.into()
                 }
-                CastKind::Transmute => {
+                CastKind::Transmute | CastKind::Subtype => {
                     let value = self.eval_operand(value)?;
                     let to = self.ecx.layout_of(to).ok()?;
                     // `offset` for immediates only supports scalar/scalar-pair ABIs,
@@ -777,10 +749,10 @@ impl<'tcx> Visitor<'tcx> for ConstPropagator<'_, 'tcx> {
     fn visit_terminator(&mut self, terminator: &Terminator<'tcx>, location: Location) {
         self.super_terminator(terminator, location);
         match &terminator.kind {
-            TerminatorKind::Assert { expected, ref msg, ref cond, .. } => {
+            TerminatorKind::Assert { expected, msg, cond, .. } => {
                 self.check_assertion(*expected, msg, cond, location);
             }
-            TerminatorKind::SwitchInt { ref discr, ref targets } => {
+            TerminatorKind::SwitchInt { discr, targets } => {
                 if let Some(ref value) = self.eval_operand(discr)
                     && let Some(value_const) = self.use_ecx(|this| this.ecx.read_scalar(value))
                     && let Some(constant) = value_const.to_bits(value_const.size()).discard_err()
@@ -867,7 +839,7 @@ enum ConstPropMode {
 struct CanConstProp {
     can_const_prop: IndexVec<Local, ConstPropMode>,
     // False at the beginning. Once set, no more assignments are allowed to that local.
-    found_assignment: BitSet<Local>,
+    found_assignment: DenseBitSet<Local>,
 }
 
 impl CanConstProp {
@@ -879,11 +851,18 @@ impl CanConstProp {
     ) -> IndexVec<Local, ConstPropMode> {
         let mut cpv = CanConstProp {
             can_const_prop: IndexVec::from_elem(ConstPropMode::FullConstProp, &body.local_decls),
-            found_assignment: BitSet::new_empty(body.local_decls.len()),
+            found_assignment: DenseBitSet::new_empty(body.local_decls.len()),
         };
         for (local, val) in cpv.can_const_prop.iter_enumerated_mut() {
             let ty = body.local_decls[local].ty;
-            if ty.is_union() {
+            if ty.is_async_drop_in_place_coroutine(tcx) {
+                // No const propagation for async drop coroutine (AsyncDropGlue).
+                // Otherwise, tcx.layout_of(typing_env.as_query_input(ty)) will be called
+                // (early layout request for async drop coroutine) to calculate layout size.
+                // Layout for `async_drop_in_place<T>::{closure}` may only be known with known T.
+                *val = ConstPropMode::NoPropagation;
+                continue;
+            } else if ty.is_union() {
                 // Unions are incompatible with the current implementation of
                 // const prop because Rust has no concept of an active
                 // variant of a union
@@ -929,7 +908,6 @@ impl<'tcx> Visitor<'tcx> for CanConstProp {
             // mutations of the same local via `Store`
             | MutatingUse(MutatingUseContext::Call)
             | MutatingUse(MutatingUseContext::AsmOutput)
-            | MutatingUse(MutatingUseContext::Deinit)
             // Actual store that can possibly even propagate a value
             | MutatingUse(MutatingUseContext::Store)
             | MutatingUse(MutatingUseContext::SetDiscriminant) => {

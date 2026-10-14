@@ -2,8 +2,7 @@ use rustc_ast as ast;
 use rustc_data_structures::fx::FxHashMap;
 use rustc_hir::def_id::DefId;
 use rustc_macros::{HashStable, TyDecodable, TyEncodable};
-use rustc_span::Span;
-use rustc_span::symbol::{Symbol, kw};
+use rustc_span::{Span, Symbol, kw};
 use tracing::instrument;
 
 use super::{Clause, InstantiatedPredicates, ParamConst, ParamTy, Ty, TyCtxt};
@@ -14,7 +13,7 @@ use crate::ty::{EarlyBinder, GenericArgsRef};
 pub enum GenericParamDefKind {
     Lifetime,
     Type { has_default: bool, synthetic: bool },
-    Const { has_default: bool, synthetic: bool },
+    Const { has_default: bool },
 }
 
 impl GenericParamDefKind {
@@ -74,9 +73,7 @@ impl GenericParamDef {
 
     pub fn is_anonymous_lifetime(&self) -> bool {
         match self.kind {
-            GenericParamDefKind::Lifetime => {
-                self.name == kw::UnderscoreLifetime || self.name == kw::Empty
-            }
+            GenericParamDefKind::Lifetime => self.name == kw::UnderscoreLifetime,
             _ => false,
         }
     }
@@ -287,7 +284,7 @@ impl<'tcx> Generics {
         args: &'a [ty::GenericArg<'tcx>],
     ) -> &'a [ty::GenericArg<'tcx>] {
         let mut own_params = self.parent_count..self.count();
-        if self.has_self && self.parent.is_none() {
+        if self.has_own_self() {
             own_params.start = 1;
         }
 
@@ -319,7 +316,7 @@ impl<'tcx> Generics {
         args: &'tcx [ty::GenericArg<'tcx>],
     ) -> &'tcx [ty::GenericArg<'tcx>] {
         let own = &args[self.parent_count..][..self.own_params.len()];
-        if self.has_self && self.parent.is_none() { &own[1..] } else { own }
+        if self.has_own_self() { &own[1..] } else { own }
     }
 
     /// Returns true if a concrete type is specified after a default type.
@@ -352,6 +349,10 @@ impl<'tcx> Generics {
 
     pub fn is_own_empty(&'tcx self) -> bool {
         self.own_params.is_empty()
+    }
+
+    pub fn has_own_self(&'tcx self) -> bool {
+        self.has_self && self.parent.is_none()
     }
 }
 
@@ -422,7 +423,7 @@ impl<'tcx> GenericPredicates<'tcx> {
     }
 }
 
-/// `~const` bounds for a given item. This is represented using a struct much like
+/// `[const]` bounds for a given item. This is represented using a struct much like
 /// `GenericPredicates`, where you can either choose to only instantiate the "own"
 /// bounds or all of the bounds including those from the parent. This distinction
 /// is necessary for code like `compare_method_predicate_entailment`.

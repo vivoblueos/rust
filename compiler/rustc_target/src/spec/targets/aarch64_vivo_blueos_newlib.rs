@@ -7,8 +7,8 @@
 // For example, `-C target-cpu=cortex-a53`.
 
 use crate::spec::{
-    Cc, LinkerFlavor, Lld, PanicStrategy, RelocModel, SanitizerSet, StackProbeType, Target,
-    TargetOptions, TlsModel, cvs,
+    Arch, Cc, Env, LinkerFlavor, Lld, Os, PanicStrategy, RelocModel, SanitizerSet, StackProbeType,
+    Target, TargetMetadata, TargetOptions, TlsModel, cvs,
 };
 
 pub(crate) fn target() -> Target {
@@ -30,14 +30,14 @@ pub(crate) fn target() -> Target {
         panic_strategy: PanicStrategy::Abort,
         families: cvs!["unix"],
         vendor: "vivo".into(),
-        os: "blueos".into(),
-        env: "newlib".into(),
+        os: Os::Other("blueos".into()),
+        env: Env::Newlib,
         tls_model: TlsModel::Emulated,
         ..Default::default()
     };
     Target {
         llvm_target: "aarch64-unknown-none".into(),
-        metadata: crate::spec::TargetMetadata {
+        metadata: TargetMetadata {
             description: Some("vivo BlueOS on Bare ARM64, hardfloat".into()),
             tier: Some(3),
             host_tools: Some(false),
@@ -45,7 +45,7 @@ pub(crate) fn target() -> Target {
         },
         pointer_width: 64,
         data_layout: "e-m:e-p270:32:32-p271:32:32-p272:64:64-i8:8:32-i16:16:32-i64:64-i128:128-n32:64-S128-Fn32".into(),
-        arch: "aarch64".into(),
+        arch: Arch::AArch64,
         options: opts,
     }
 }

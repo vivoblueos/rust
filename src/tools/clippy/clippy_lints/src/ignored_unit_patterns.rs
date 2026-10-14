@@ -17,15 +17,15 @@ declare_clippy_lint! {
     /// ### Example
     /// ```no_run
     /// match std::fs::create_dir("tmp-work-dir") {
-    ///    Ok(_) => println!("Working directory created"),
-    ///    Err(s) => eprintln!("Could not create directory: {s}"),
+    ///     Ok(_) => println!("Working directory created"),
+    ///     Err(s) => eprintln!("Could not create directory: {s}"),
     /// }
     /// ```
     /// Use instead:
     /// ```no_run
     /// match std::fs::create_dir("tmp-work-dir") {
-    ///    Ok(()) => println!("Working directory created"),
-    ///    Err(s) => eprintln!("Could not create directory: {s}"),
+    ///     Ok(()) => println!("Working directory created"),
+    ///     Err(s) => eprintln!("Could not create directory: {s}"),
     /// }
     /// ```
     #[clippy::version = "1.73.0"]
@@ -33,6 +33,7 @@ declare_clippy_lint! {
     pedantic,
     "suggest replacing `_` by `()` in patterns where appropriate"
 }
+
 declare_lint_pass!(IgnoredUnitPatterns => [IGNORED_UNIT_PATTERNS]);
 
 impl<'tcx> LateLintPass<'tcx> for IgnoredUnitPatterns {

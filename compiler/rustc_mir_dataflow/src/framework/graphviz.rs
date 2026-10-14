@@ -1,20 +1,144 @@
 //! A helpful diagram for debugging dataflow problems.
 
 use std::borrow::Cow;
-use std::cell::RefCell;
+use std::ffi::OsString;
+use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::{io, ops, str};
 
 use regex::Regex;
 use rustc_graphviz as dot;
-use rustc_index::bit_set::BitSet;
-use rustc_middle::mir::{self, BasicBlock, Body, Location, graphviz_safe_def_name};
+use rustc_hir::attrs::{BorrowckGraphvizFormatKind, RustcMirKind};
+use rustc_hir::find_attr;
+use rustc_index::bit_set::DenseBitSet;
+use rustc_middle::mir::{
+    self, BasicBlock, Body, Location, MirDumper, graphviz_safe_def_name, traversal,
+};
+use rustc_middle::ty::TyCtxt;
+use rustc_middle::ty::print::with_no_trimmed_paths;
+use rustc_span::def_id::DefId;
+use tracing::debug;
 
 use super::fmt::{DebugDiffWithAdapter, DebugWithAdapter, DebugWithContext};
-use super::{Analysis, CallReturnPlaces, Direction, Results, ResultsCursor, ResultsVisitor};
+use super::{
+    Analysis, CallReturnPlaces, Direction, Results, ResultsCursor, ResultsVisitor, visit_results,
+};
+
+/// Writes a DOT file containing the results of a dataflow analysis if the user requested it via
+/// `rustc_mir` attributes and `-Z dump-mir-dataflow`. The `Result` in and the `Results` out are
+/// the same.
+pub(super) fn write_graphviz_results<'tcx, A>(
+    tcx: TyCtxt<'tcx>,
+    body: &Body<'tcx>,
+    results: &Results<'tcx, A>,
+    pass_name: Option<&'static str>,
+) -> std::io::Result<()>
+where
+    A: Analysis<'tcx>,
+    A::Domain: DebugWithContext<A>,
+{
+    use std::fs;
+    use std::io::Write;
+
+    let def_id = body.source.def_id();
+    let attrs = RustcMirAttrs::parse(tcx, def_id);
+
+    let file = try {
+        match attrs.output_path(A::NAME) {
+            Some(path) => {
+                debug!("printing dataflow results for {:?} to {}", def_id, path.display());
+                if let Some(parent) = path.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                fs::File::create_buffered(&path)?
+            }
+
+            None => {
+                let Some(dumper) = MirDumper::new(tcx, A::NAME, body) else {
+                    return Ok(());
+                };
+                let disambiguator = &pass_name.unwrap_or("-----");
+                dumper.set_disambiguator(disambiguator).create_dump_file("dot", body)?
+            }
+        }
+    };
+    let mut file = match file {
+        Ok(f) => f,
+        Err(e) => return Err(e),
+    };
+
+    let style = attrs.formatter.unwrap_or(OutputStyle::AfterOnly);
+
+    let mut buf = Vec::new();
+
+    let graphviz = Formatter::new(body, results, style);
+    let mut render_opts =
+        vec![dot::RenderOption::Fontname(tcx.sess.opts.unstable_opts.graphviz_font.clone())];
+    if tcx.sess.opts.unstable_opts.graphviz_dark_mode {
+        render_opts.push(dot::RenderOption::DarkTheme);
+    }
+    let r = with_no_trimmed_paths!(dot::render_opts(&graphviz, &mut buf, &render_opts));
+
+    let lhs = try {
+        r?;
+        file.write_all(&buf)?;
+    };
+
+    lhs
+}
+
+#[derive(Default)]
+struct RustcMirAttrs {
+    basename_and_suffix: Option<PathBuf>,
+    formatter: Option<OutputStyle>,
+}
+
+impl RustcMirAttrs {
+    fn parse(tcx: TyCtxt<'_>, def_id: DefId) -> Self {
+        let mut ret = RustcMirAttrs::default();
+
+        if let Some(rustc_mir_attrs) = find_attr!(tcx, def_id, RustcMir(kind) => kind) {
+            for attr in rustc_mir_attrs {
+                match attr {
+                    RustcMirKind::BorrowckGraphvizPostflow { path } => {
+                        ret.basename_and_suffix = Some(path.clone());
+                    }
+                    RustcMirKind::BorrowckGraphvizFormat { format } => {
+                        ret.formatter = match format {
+                            BorrowckGraphvizFormatKind::TwoPhase => {
+                                Some(OutputStyle::BeforeAndAfter)
+                            }
+                        };
+                    }
+                    _ => (),
+                };
+            }
+        }
+
+        ret
+    }
+
+    /// Returns the path where dataflow results should be written, or `None`
+    /// `borrowck_graphviz_postflow` was not specified.
+    ///
+    /// This performs the following transformation to the argument of `borrowck_graphviz_postflow`:
+    ///
+    /// "path/suffix.dot" -> "path/analysis_name_suffix.dot"
+    fn output_path(&self, analysis_name: &str) -> Option<PathBuf> {
+        let mut ret = self.basename_and_suffix.as_ref().cloned()?;
+        let suffix = ret.file_name().unwrap(); // Checked when parsing attrs
+
+        let mut file_name: OsString = analysis_name.into();
+        file_name.push("_");
+        file_name.push(suffix);
+        ret.set_file_name(file_name);
+
+        Some(ret)
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum OutputStyle {
+enum OutputStyle {
     AfterOnly,
     BeforeAndAfter,
 }
@@ -28,44 +152,29 @@ impl OutputStyle {
     }
 }
 
-pub(crate) struct Formatter<'mir, 'tcx, A>
+struct Formatter<'mir, 'tcx, A>
 where
     A: Analysis<'tcx>,
 {
-    // The `RefCell` is used because `<Formatter as Labeller>::node_label`
-    // takes `&self`, but it needs to modify the cursor. This is also the
-    // reason for the `Formatter`/`BlockFormatter` split; `BlockFormatter` has
-    // the operations that involve the mutation, i.e. within the `borrow_mut`.
-    cursor: RefCell<ResultsCursor<'mir, 'tcx, A>>,
+    body: &'mir Body<'tcx>,
+    results: &'mir Results<'tcx, A>,
     style: OutputStyle,
-    reachable: BitSet<BasicBlock>,
+    reachable: DenseBitSet<BasicBlock>,
 }
 
 impl<'mir, 'tcx, A> Formatter<'mir, 'tcx, A>
 where
     A: Analysis<'tcx>,
 {
-    pub(crate) fn new(
-        body: &'mir Body<'tcx>,
-        results: Results<'tcx, A>,
-        style: OutputStyle,
-    ) -> Self {
-        let reachable = mir::traversal::reachable_as_bitset(body);
-        Formatter { cursor: results.into_results_cursor(body).into(), style, reachable }
-    }
-
-    fn body(&self) -> &'mir Body<'tcx> {
-        self.cursor.borrow().body()
-    }
-
-    pub(crate) fn into_results(self) -> Results<'tcx, A> {
-        self.cursor.into_inner().into_results()
+    fn new(body: &'mir Body<'tcx>, results: &'mir Results<'tcx, A>, style: OutputStyle) -> Self {
+        let reachable = traversal::reachable_as_bitset(body);
+        Formatter { body, results, style, reachable }
     }
 }
 
 /// A pair of a basic block and an index into that basic blocks `successors`.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
-pub(crate) struct CfgEdge {
+struct CfgEdge {
     source: BasicBlock,
     index: usize,
 }
@@ -88,7 +197,7 @@ where
     type Edge = CfgEdge;
 
     fn graph_id(&self) -> dot::Id<'_> {
-        let name = graphviz_safe_def_name(self.body().source.def_id());
+        let name = graphviz_safe_def_name(self.body.source.def_id());
         dot::Id::new(format!("graph_for_def_id_{name}")).unwrap()
     }
 
@@ -97,10 +206,14 @@ where
     }
 
     fn node_label(&self, block: &Self::Node) -> dot::LabelText<'_> {
-        let mut cursor = self.cursor.borrow_mut();
-        let mut fmt =
-            BlockFormatter { cursor: &mut cursor, style: self.style, bg: Background::Light };
-        let label = fmt.write_node_label(*block).unwrap();
+        let diffs = StateDiffCollector::run(self.body, *block, self.results, self.style);
+
+        let mut fmt = BlockFormatter {
+            cursor: ResultsCursor::new_borrowing(self.body, self.results),
+            style: self.style,
+            bg: Background::Light,
+        };
+        let label = fmt.write_node_label(*block, diffs).unwrap();
 
         dot::LabelText::html(String::from_utf8(label).unwrap())
     }
@@ -110,7 +223,7 @@ where
     }
 
     fn edge_label(&self, e: &Self::Edge) -> dot::LabelText<'_> {
-        let label = &self.body()[e.source].terminator().kind.fmt_successor_labels()[e.index];
+        let label = &self.body[e.source].terminator().kind.fmt_successor_labels()[e.index];
         dot::LabelText::label(label.clone())
     }
 }
@@ -123,7 +236,7 @@ where
     type Edge = CfgEdge;
 
     fn nodes(&self) -> dot::Nodes<'_, Self::Node> {
-        self.body()
+        self.body
             .basic_blocks
             .indices()
             .filter(|&idx| self.reachable.contains(idx))
@@ -132,10 +245,10 @@ where
     }
 
     fn edges(&self) -> dot::Edges<'_, Self::Edge> {
-        let body = self.body();
-        body.basic_blocks
+        self.body
+            .basic_blocks
             .indices()
-            .flat_map(|bb| dataflow_successors(body, bb))
+            .flat_map(|bb| dataflow_successors(self.body, bb))
             .collect::<Vec<_>>()
             .into()
     }
@@ -145,20 +258,20 @@ where
     }
 
     fn target(&self, edge: &Self::Edge) -> Self::Node {
-        self.body()[edge.source].terminator().successors().nth(edge.index).unwrap()
+        self.body[edge.source].terminator().successors().nth(edge.index).unwrap()
     }
 }
 
-struct BlockFormatter<'a, 'mir, 'tcx, A>
+struct BlockFormatter<'mir, 'tcx, A>
 where
     A: Analysis<'tcx>,
 {
-    cursor: &'a mut ResultsCursor<'mir, 'tcx, A>,
+    cursor: ResultsCursor<'mir, 'tcx, A>,
     bg: Background,
     style: OutputStyle,
 }
 
-impl<'tcx, A> BlockFormatter<'_, '_, 'tcx, A>
+impl<'tcx, A> BlockFormatter<'_, 'tcx, A>
 where
     A: Analysis<'tcx>,
     A::Domain: DebugWithContext<A>,
@@ -171,7 +284,11 @@ where
         bg
     }
 
-    fn write_node_label(&mut self, block: BasicBlock) -> io::Result<Vec<u8>> {
+    fn write_node_label(
+        &mut self,
+        block: BasicBlock,
+        diffs: StateDiffCollector<A::Domain>,
+    ) -> io::Result<Vec<u8>> {
         use std::io::Write;
 
         //   Sample output:
@@ -227,7 +344,7 @@ where
         self.write_row_with_full_state(w, "", "(on start)")?;
 
         // D + E: Statement and terminator transfer functions
-        self.write_statements_and_terminator(w, block)?;
+        self.write_statements_and_terminator(w, block, diffs)?;
 
         // F: State at end of block
 
@@ -410,14 +527,8 @@ where
         &mut self,
         w: &mut impl io::Write,
         block: BasicBlock,
+        diffs: StateDiffCollector<A::Domain>,
     ) -> io::Result<()> {
-        let diffs = StateDiffCollector::run(
-            self.cursor.body(),
-            block,
-            self.cursor.mut_results(),
-            self.style,
-        );
-
         let mut diffs_before = diffs.before.map(|v| v.into_iter());
         let mut diffs_after = diffs.after.into_iter();
 
@@ -445,7 +556,7 @@ where
         let before = diffs_before.as_mut().map(next_in_dataflow_order);
 
         assert!(diffs_after.is_empty());
-        assert!(diffs_before.as_ref().map_or(true, ExactSizeIterator::is_empty));
+        assert!(diffs_before.as_ref().is_none_or(ExactSizeIterator::is_empty));
 
         let terminator = self.cursor.body()[block].terminator();
         let mut terminator_str = String::new();
@@ -507,10 +618,10 @@ where
                 r#"<td colspan="{colspan}" {fmt} align="left">{state}</td>"#,
                 colspan = this.style.num_state_columns(),
                 fmt = fmt,
-                state = dot::escape_html(&format!("{:?}", DebugWithAdapter {
-                    this: state,
-                    ctxt: analysis
-                })),
+                state = dot::escape_html(&format!(
+                    "{:?}",
+                    DebugWithAdapter { this: state, ctxt: analysis }
+                )),
             )
         })
     }
@@ -524,9 +635,9 @@ struct StateDiffCollector<D> {
 
 impl<D> StateDiffCollector<D> {
     fn run<'tcx, A>(
-        body: &mir::Body<'tcx>,
+        body: &Body<'tcx>,
         block: BasicBlock,
-        results: &mut Results<'tcx, A>,
+        results: &Results<'tcx, A>,
         style: OutputStyle,
     ) -> Self
     where
@@ -539,12 +650,12 @@ impl<D> StateDiffCollector<D> {
             before: (style == OutputStyle::BeforeAndAfter).then_some(vec![]),
         };
 
-        results.visit_with(body, std::iter::once(block), &mut collector);
+        visit_results(body, std::iter::once(block), results, &mut collector);
         collector
     }
 }
 
-impl<'tcx, A> ResultsVisitor<'_, 'tcx, A> for StateDiffCollector<A::Domain>
+impl<'tcx, A> ResultsVisitor<'tcx, A> for StateDiffCollector<A::Domain>
 where
     A: Analysis<'tcx>,
     A::Domain: DebugWithContext<A>,
@@ -561,51 +672,51 @@ where
         }
     }
 
-    fn visit_statement_before_primary_effect(
+    fn visit_after_early_statement_effect(
         &mut self,
-        results: &mut Results<'tcx, A>,
+        analysis: &A,
         state: &A::Domain,
         _statement: &mir::Statement<'tcx>,
         _location: Location,
     ) {
         if let Some(before) = self.before.as_mut() {
-            before.push(diff_pretty(state, &self.prev_state, &results.analysis));
+            before.push(diff_pretty(state, &self.prev_state, analysis));
             self.prev_state.clone_from(state)
         }
     }
 
-    fn visit_statement_after_primary_effect(
+    fn visit_after_primary_statement_effect(
         &mut self,
-        results: &mut Results<'tcx, A>,
+        analysis: &A,
         state: &A::Domain,
         _statement: &mir::Statement<'tcx>,
         _location: Location,
     ) {
-        self.after.push(diff_pretty(state, &self.prev_state, &results.analysis));
+        self.after.push(diff_pretty(state, &self.prev_state, analysis));
         self.prev_state.clone_from(state)
     }
 
-    fn visit_terminator_before_primary_effect(
+    fn visit_after_early_terminator_effect(
         &mut self,
-        results: &mut Results<'tcx, A>,
+        analysis: &A,
         state: &A::Domain,
         _terminator: &mir::Terminator<'tcx>,
         _location: Location,
     ) {
         if let Some(before) = self.before.as_mut() {
-            before.push(diff_pretty(state, &self.prev_state, &results.analysis));
+            before.push(diff_pretty(state, &self.prev_state, analysis));
             self.prev_state.clone_from(state)
         }
     }
 
-    fn visit_terminator_after_primary_effect(
+    fn visit_after_primary_terminator_effect(
         &mut self,
-        results: &mut Results<'tcx, A>,
+        analysis: &A,
         state: &A::Domain,
         _terminator: &mir::Terminator<'tcx>,
         _location: Location,
     ) {
-        self.after.push(diff_pretty(state, &self.prev_state, &results.analysis));
+        self.after.push(diff_pretty(state, &self.prev_state, analysis));
         self.prev_state.clone_from(state)
     }
 }
@@ -628,6 +739,7 @@ where
     let re = regex!("\t?\u{001f}([+-])");
 
     let raw_diff = format!("{:#?}", DebugDiffWithAdapter { new, old, ctxt });
+    let raw_diff = dot::escape_html(&raw_diff);
 
     // Replace newlines in the `Debug` output with `<br/>`
     let raw_diff = raw_diff.replace('\n', r#"<br align="left"/>"#);

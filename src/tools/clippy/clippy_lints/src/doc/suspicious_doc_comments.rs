@@ -1,7 +1,9 @@
 use clippy_utils::diagnostics::span_lint_and_then;
-use rustc_ast::token::CommentKind;
-use rustc_ast::{AttrKind, AttrStyle, Attribute};
+use rustc_ast::AttrStyle;
+use rustc_ast::token::{CommentKind, DocFragmentKind};
 use rustc_errors::Applicability;
+use rustc_hir::Attribute;
+use rustc_hir::attrs::AttributeKind;
 use rustc_lint::LateContext;
 use rustc_span::Span;
 
@@ -35,15 +37,19 @@ fn collect_doc_replacements(attrs: &[Attribute]) -> Vec<(Span, String)> {
     attrs
         .iter()
         .filter_map(|attr| {
-            if let AttrKind::DocComment(com_kind, sym) = attr.kind
-                && let AttrStyle::Outer = attr.style
-                && let Some(com) = sym.as_str().strip_prefix('!')
+            if let Attribute::Parsed(AttributeKind::DocComment {
+                style: AttrStyle::Outer,
+                kind: DocFragmentKind::Sugared(comment_kind),
+                comment,
+                ..
+            }) = attr
+                && let Some(com) = comment.as_str().strip_prefix('!')
             {
-                let sugg = match com_kind {
-                    CommentKind::Line => format!("//!{com}"),
+                let sugg = match comment_kind {
                     CommentKind::Block => format!("/*!{com}*/"),
+                    CommentKind::Line => format!("//!{com}"),
                 };
-                Some((attr.span, sugg))
+                Some((attr.span(), sugg))
             } else {
                 None
             }

@@ -1,4 +1,5 @@
 //@compile-flags: --crate-name mut_key
+//@check-pass
 
 #![warn(clippy::mutable_key_type)]
 
@@ -55,7 +56,4 @@ fn should_not_take_this_arg(_v: HashSet<Counted<String>>) {}
 
 fn indirect(_: HashMap<ContainsCounted, usize>) {}
 
-fn main() {
-    should_not_take_this_arg(HashSet::new());
-    indirect(HashMap::new());
-}
+fn main() {}

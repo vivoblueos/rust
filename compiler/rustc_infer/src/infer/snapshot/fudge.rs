@@ -1,15 +1,17 @@
+use std::fmt::Debug;
 use std::ops::Range;
 
 use rustc_data_structures::{snapshot_vec as sv, unify as ut};
-use rustc_middle::infer::unify_key::{ConstVariableValue, ConstVidKey};
-use rustc_middle::ty::fold::{TypeFoldable, TypeFolder, TypeSuperFoldable};
-use rustc_middle::ty::{self, ConstVid, FloatVid, IntVid, RegionVid, Ty, TyCtxt, TyVid};
-use rustc_type_ir::visit::TypeVisitableExt;
+use rustc_middle::ty::{
+    self, ConstVid, FloatVid, IntVid, RegionVid, Ty, TyCtxt, TyVid, TypeFoldable, TypeFolder,
+    TypeSuperFoldable, TypeVisitableExt,
+};
 use tracing::instrument;
 use ut::UnifyKey;
 
 use super::VariableLengths;
 use crate::infer::type_variable::TypeVariableOrigin;
+use crate::infer::unify_key::{ConstVariableValue, ConstVidKey};
 use crate::infer::{ConstVariableOrigin, InferCtxt, RegionVariableOrigin, UnificationTable};
 
 fn vars_since_snapshot<'tcx, T>(
@@ -28,11 +30,12 @@ fn const_vars_since_snapshot<'tcx>(
     snapshot_var_len: usize,
 ) -> (Range<ConstVid>, Vec<ConstVariableOrigin>) {
     let range = vars_since_snapshot(table, snapshot_var_len);
+    let range = range.start.vid..range.end.vid;
 
     (
-        range.start.vid..range.end.vid,
-        (range.start.index()..range.end.index())
-            .map(|index| match table.probe_value(ConstVid::from_u32(index)) {
+        range.clone(),
+        range
+            .map(|index| match table.probe_value(index) {
                 ConstVariableValue::Known { value: _ } => {
                     ConstVariableOrigin { param_def_id: None, span: rustc_span::DUMMY_SP }
                 }
@@ -82,11 +85,12 @@ impl<'tcx> InferCtxt<'tcx> {
     /// the actual types (`?T`, `Option<?T>`) -- and remember that
     /// after the snapshot is popped, the variable `?T` is no longer
     /// unified.
-    #[instrument(skip(self, f), level = "debug")]
+    #[instrument(skip(self, f), level = "debug", ret)]
     pub fn fudge_inference_if_ok<T, E, F>(&self, f: F) -> Result<T, E>
     where
         F: FnOnce() -> Result<T, E>,
         T: TypeFoldable<TyCtxt<'tcx>>,
+        E: Debug,
     {
         let variable_lengths = self.variable_lengths();
         let (snapshot_vars, value) = self.probe(|_| {
@@ -109,7 +113,7 @@ impl<'tcx> InferCtxt<'tcx> {
 
     fn fudge_inference<T: TypeFoldable<TyCtxt<'tcx>>>(
         &self,
-        snapshot_vars: SnapshotVarData,
+        snapshot_vars: SnapshotVarData<'tcx>,
         value: T,
     ) -> T {
         // Micro-optimization: if no variables have been created, then
@@ -122,16 +126,16 @@ impl<'tcx> InferCtxt<'tcx> {
     }
 }
 
-struct SnapshotVarData {
-    region_vars: (Range<RegionVid>, Vec<RegionVariableOrigin>),
+struct SnapshotVarData<'tcx> {
+    region_vars: (Range<RegionVid>, Vec<RegionVariableOrigin<'tcx>>),
     type_vars: (Range<TyVid>, Vec<TypeVariableOrigin>),
     int_vars: Range<IntVid>,
     float_vars: Range<FloatVid>,
     const_vars: (Range<ConstVid>, Vec<ConstVariableOrigin>),
 }
 
-impl SnapshotVarData {
-    fn new(infcx: &InferCtxt<'_>, vars_pre_snapshot: VariableLengths) -> SnapshotVarData {
+impl<'tcx> SnapshotVarData<'tcx> {
+    fn new(infcx: &InferCtxt<'tcx>, vars_pre_snapshot: VariableLengths) -> SnapshotVarData<'tcx> {
         let mut inner = infcx.inner.borrow_mut();
         let region_vars = inner
             .unwrap_region_constraints()
@@ -161,7 +165,7 @@ impl SnapshotVarData {
 
 struct InferenceFudger<'a, 'tcx> {
     infcx: &'a InferCtxt<'tcx>,
-    snapshot_vars: SnapshotVarData,
+    snapshot_vars: SnapshotVarData<'tcx>,
 }
 
 impl<'a, 'tcx> TypeFolder<TyCtxt<'tcx>> for InferenceFudger<'a, 'tcx> {

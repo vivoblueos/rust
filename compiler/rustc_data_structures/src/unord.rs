@@ -8,10 +8,10 @@ use std::hash::Hash;
 use std::iter::{Product, Sum};
 use std::ops::Index;
 
-use rustc_hash::{FxHashMap, FxHashSet};
-use rustc_macros::{Decodable_Generic, Encodable_Generic};
+use rustc_macros::{Decodable_NoContext, Encodable_NoContext};
 
 use crate::fingerprint::Fingerprint;
+use crate::fx::{FxBuildHasher, FxHashMap, FxHashSet};
 use crate::stable_hasher::{HashStable, StableCompare, StableHasher, ToStableHashKey};
 
 /// `UnordItems` is the order-less version of `Iterator`. It only contains methods
@@ -109,6 +109,16 @@ impl<T, I: Iterator<Item = T>> UnordItems<T, I> {
     pub fn collect<C: From<UnordItems<T, I>>>(self) -> C {
         self.into()
     }
+
+    /// If the iterator has only one element, returns it, otherwise returns `None`.
+    #[track_caller]
+    pub fn get_only(mut self) -> Option<T> {
+        let item = self.0.next();
+        if self.0.next().is_some() {
+            return None;
+        }
+        item
+    }
 }
 
 impl<T> UnordItems<T, std::iter::Empty<T>> {
@@ -133,9 +143,9 @@ impl<'a, T: Copy + 'a, I: Iterator<Item = &'a T>> UnordItems<&'a T, I> {
 
 impl<T, I: Iterator<Item = T>> UnordItems<T, I> {
     #[inline]
-    pub fn into_sorted<HCX>(self, hcx: &HCX) -> Vec<T>
+    pub fn into_sorted<Hcx>(self, hcx: &mut Hcx) -> Vec<T>
     where
-        T: ToStableHashKey<HCX>,
+        T: ToStableHashKey<Hcx>,
     {
         self.collect_sorted(hcx, true)
     }
@@ -158,9 +168,9 @@ impl<T, I: Iterator<Item = T>> UnordItems<T, I> {
     }
 
     #[inline]
-    pub fn collect_sorted<HCX, C>(self, hcx: &HCX, cache_sort_key: bool) -> C
+    pub fn collect_sorted<Hcx, C>(self, hcx: &mut Hcx, cache_sort_key: bool) -> C
     where
-        T: ToStableHashKey<HCX>,
+        T: ToStableHashKey<Hcx>,
         C: FromIterator<T> + BorrowMut<[T]>,
     {
         let mut items: C = self.0.collect();
@@ -224,17 +234,17 @@ trait UnordCollection {}
 ///
 /// See [MCP 533](https://github.com/rust-lang/compiler-team/issues/533)
 /// for more information.
-#[derive(Debug, Eq, PartialEq, Clone, Encodable_Generic, Decodable_Generic)]
+#[derive(Debug, Eq, PartialEq, Clone, Encodable_NoContext, Decodable_NoContext)]
 pub struct UnordSet<V: Eq + Hash> {
     inner: FxHashSet<V>,
 }
 
 impl<V: Eq + Hash> UnordCollection for UnordSet<V> {}
 
-impl<V: Eq + Hash> Default for UnordSet<V> {
+impl<V: Eq + Hash> const Default for UnordSet<V> {
     #[inline]
     fn default() -> Self {
-        Self { inner: FxHashSet::default() }
+        Self { inner: FxHashSet::with_hasher(FxBuildHasher) }
     }
 }
 
@@ -257,6 +267,12 @@ impl<V: Eq + Hash> UnordSet<V> {
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.inner.is_empty()
+    }
+
+    /// If the set has only one element, returns it, otherwise returns `None`.
+    #[inline]
+    pub fn get_only(&self) -> Option<&V> {
+        if self.inner.len() == 1 { self.inner.iter().next() } else { None }
     }
 
     #[inline]
@@ -299,9 +315,9 @@ impl<V: Eq + Hash> UnordSet<V> {
     /// `cache_sort_key` when the [ToStableHashKey::to_stable_hash_key] implementation
     /// for `V` is expensive (e.g. a `DefId -> DefPathHash` lookup).
     #[inline]
-    pub fn to_sorted<HCX>(&self, hcx: &HCX, cache_sort_key: bool) -> Vec<&V>
+    pub fn to_sorted<Hcx>(&self, hcx: &mut Hcx, cache_sort_key: bool) -> Vec<&V>
     where
-        V: ToStableHashKey<HCX>,
+        V: ToStableHashKey<Hcx>,
     {
         to_sorted_vec(hcx, self.inner.iter(), cache_sort_key, |&x| x)
     }
@@ -341,9 +357,9 @@ impl<V: Eq + Hash> UnordSet<V> {
     /// `cache_sort_key` when the [ToStableHashKey::to_stable_hash_key] implementation
     /// for `V` is expensive (e.g. a `DefId -> DefPathHash` lookup).
     #[inline]
-    pub fn into_sorted<HCX>(self, hcx: &HCX, cache_sort_key: bool) -> Vec<V>
+    pub fn into_sorted<Hcx>(self, hcx: &mut Hcx, cache_sort_key: bool) -> Vec<V>
     where
-        V: ToStableHashKey<HCX>,
+        V: ToStableHashKey<Hcx>,
     {
         to_sorted_vec(hcx, self.inner.into_iter(), cache_sort_key, |x| x)
     }
@@ -399,9 +415,9 @@ impl<V: Hash + Eq, I: Iterator<Item = V>> From<UnordItems<V, I>> for UnordSet<V>
     }
 }
 
-impl<HCX, V: Hash + Eq + HashStable<HCX>> HashStable<HCX> for UnordSet<V> {
+impl<Hcx, V: Hash + Eq + HashStable<Hcx>> HashStable<Hcx> for UnordSet<V> {
     #[inline]
-    fn hash_stable(&self, hcx: &mut HCX, hasher: &mut StableHasher) {
+    fn hash_stable(&self, hcx: &mut Hcx, hasher: &mut StableHasher) {
         hash_iter_order_independent(self.inner.iter(), hcx, hasher);
     }
 }
@@ -415,17 +431,17 @@ impl<HCX, V: Hash + Eq + HashStable<HCX>> HashStable<HCX> for UnordSet<V> {
 ///
 /// See [MCP 533](https://github.com/rust-lang/compiler-team/issues/533)
 /// for more information.
-#[derive(Debug, Eq, PartialEq, Clone, Encodable_Generic, Decodable_Generic)]
+#[derive(Debug, Eq, PartialEq, Clone, Encodable_NoContext, Decodable_NoContext)]
 pub struct UnordMap<K: Eq + Hash, V> {
     inner: FxHashMap<K, V>,
 }
 
 impl<K: Eq + Hash, V> UnordCollection for UnordMap<K, V> {}
 
-impl<K: Eq + Hash, V> Default for UnordMap<K, V> {
+impl<K: Eq + Hash, V> const Default for UnordMap<K, V> {
     #[inline]
     fn default() -> Self {
-        Self { inner: FxHashMap::default() }
+        Self { inner: FxHashMap::with_hasher(FxBuildHasher) }
     }
 }
 
@@ -539,9 +555,9 @@ impl<K: Eq + Hash, V> UnordMap<K, V> {
     /// `cache_sort_key` when the [ToStableHashKey::to_stable_hash_key] implementation
     /// for `K` is expensive (e.g. a `DefId -> DefPathHash` lookup).
     #[inline]
-    pub fn to_sorted<HCX>(&self, hcx: &HCX, cache_sort_key: bool) -> Vec<(&K, &V)>
+    pub fn to_sorted<Hcx>(&self, hcx: &mut Hcx, cache_sort_key: bool) -> Vec<(&K, &V)>
     where
-        K: ToStableHashKey<HCX>,
+        K: ToStableHashKey<Hcx>,
     {
         to_sorted_vec(hcx, self.inner.iter(), cache_sort_key, |&(k, _)| k)
     }
@@ -566,9 +582,9 @@ impl<K: Eq + Hash, V> UnordMap<K, V> {
     /// `cache_sort_key` when the [ToStableHashKey::to_stable_hash_key] implementation
     /// for `K` is expensive (e.g. a `DefId -> DefPathHash` lookup).
     #[inline]
-    pub fn into_sorted<HCX>(self, hcx: &HCX, cache_sort_key: bool) -> Vec<(K, V)>
+    pub fn into_sorted<Hcx>(self, hcx: &mut Hcx, cache_sort_key: bool) -> Vec<(K, V)>
     where
-        K: ToStableHashKey<HCX>,
+        K: ToStableHashKey<Hcx>,
     {
         to_sorted_vec(hcx, self.inner.into_iter(), cache_sort_key, |(k, _)| k)
     }
@@ -594,9 +610,13 @@ impl<K: Eq + Hash, V> UnordMap<K, V> {
     /// `cache_sort_key` when the [ToStableHashKey::to_stable_hash_key] implementation
     /// for `K` is expensive (e.g. a `DefId -> DefPathHash` lookup).
     #[inline]
-    pub fn values_sorted<HCX>(&self, hcx: &HCX, cache_sort_key: bool) -> impl Iterator<Item = &V>
+    pub fn values_sorted<Hcx>(
+        &self,
+        hcx: &mut Hcx,
+        cache_sort_key: bool,
+    ) -> impl Iterator<Item = &V>
     where
-        K: ToStableHashKey<HCX>,
+        K: ToStableHashKey<Hcx>,
     {
         to_sorted_vec(hcx, self.inner.iter(), cache_sort_key, |&(k, _)| k)
             .into_iter()
@@ -622,9 +642,9 @@ where
     }
 }
 
-impl<HCX, K: Hash + Eq + HashStable<HCX>, V: HashStable<HCX>> HashStable<HCX> for UnordMap<K, V> {
+impl<Hcx, K: Hash + Eq + HashStable<Hcx>, V: HashStable<Hcx>> HashStable<Hcx> for UnordMap<K, V> {
     #[inline]
-    fn hash_stable(&self, hcx: &mut HCX, hasher: &mut StableHasher) {
+    fn hash_stable(&self, hcx: &mut Hcx, hasher: &mut StableHasher) {
         hash_iter_order_independent(self.inner.iter(), hcx, hasher);
     }
 }
@@ -639,7 +659,7 @@ impl<HCX, K: Hash + Eq + HashStable<HCX>, V: HashStable<HCX>> HashStable<HCX> fo
 ///
 /// See [MCP 533](https://github.com/rust-lang/compiler-team/issues/533)
 /// for more information.
-#[derive(Default, Debug, Eq, PartialEq, Clone, Encodable_Generic, Decodable_Generic)]
+#[derive(Default, Debug, Eq, PartialEq, Clone, Encodable_NoContext, Decodable_NoContext)]
 pub struct UnordBag<V> {
     inner: Vec<V>,
 }
@@ -685,23 +705,23 @@ impl<T, I: Iterator<Item = T>> From<UnordItems<T, I>> for UnordBag<T> {
     }
 }
 
-impl<HCX, V: Hash + Eq + HashStable<HCX>> HashStable<HCX> for UnordBag<V> {
+impl<Hcx, V: Hash + Eq + HashStable<Hcx>> HashStable<Hcx> for UnordBag<V> {
     #[inline]
-    fn hash_stable(&self, hcx: &mut HCX, hasher: &mut StableHasher) {
+    fn hash_stable(&self, hcx: &mut Hcx, hasher: &mut StableHasher) {
         hash_iter_order_independent(self.inner.iter(), hcx, hasher);
     }
 }
 
 #[inline]
-fn to_sorted_vec<HCX, T, K, I>(
-    hcx: &HCX,
+fn to_sorted_vec<Hcx, T, K, I>(
+    hcx: &mut Hcx,
     iter: I,
     cache_sort_key: bool,
     extract_key: fn(&T) -> &K,
 ) -> Vec<T>
 where
     I: Iterator<Item = T>,
-    K: ToStableHashKey<HCX>,
+    K: ToStableHashKey<Hcx>,
 {
     let mut items: Vec<T> = iter.collect();
     if cache_sort_key {
@@ -714,12 +734,12 @@ where
 }
 
 fn hash_iter_order_independent<
-    HCX,
-    T: HashStable<HCX>,
+    Hcx,
+    T: HashStable<Hcx>,
     I: Iterator<Item = T> + ExactSizeIterator,
 >(
     mut it: I,
-    hcx: &mut HCX,
+    hcx: &mut Hcx,
     hasher: &mut StableHasher,
 ) {
     let len = it.len();

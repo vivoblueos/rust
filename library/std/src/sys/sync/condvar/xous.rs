@@ -1,4 +1,4 @@
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{Atomic, AtomicUsize, Ordering};
 
 use crate::os::xous::ffi::{blocking_scalar, scalar};
 use crate::os::xous::services::{TicktimerScalar, ticktimer_server};
@@ -11,8 +11,8 @@ use crate::time::Duration;
 const NOTIFY_TRIES: usize = 3;
 
 pub struct Condvar {
-    counter: AtomicUsize,
-    timed_out: AtomicUsize,
+    counter: Atomic<usize>,
+    timed_out: Atomic<usize>,
 }
 
 unsafe impl Send for Condvar {}
@@ -38,7 +38,7 @@ impl Condvar {
         // possible for `counter` to decrease due to a condvar timing out, in which
         // case the corresponding `timed_out` will increase accordingly.
         let Ok(waiter_count) =
-            self.counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |counter| {
+            self.counter.try_update(Ordering::Relaxed, Ordering::Relaxed, |counter| {
                 if counter == 0 {
                     return None;
                 } else {

@@ -1,5 +1,8 @@
-use crate::abi::Endian;
-use crate::spec::{Cc, LinkerFlavor, Lld, StackProbeType, Target, TargetOptions, base};
+use rustc_abi::Endian;
+
+use crate::spec::{
+    Arch, Cc, LinkerFlavor, Lld, StackProbeType, Target, TargetMetadata, TargetOptions, base,
+};
 
 pub(crate) fn target() -> Target {
     let mut base = base::linux_musl::opts();
@@ -9,15 +12,15 @@ pub(crate) fn target() -> Target {
 
     Target {
         llvm_target: "powerpc-unknown-linux-musl".into(),
-        metadata: crate::spec::TargetMetadata {
-            description: Some("PowerPC Linux with musl 1.2.3".into()),
+        metadata: TargetMetadata {
+            description: Some("PowerPC Linux with musl 1.2.5".into()),
             tier: Some(3),
             host_tools: Some(false),
-            std: None, // ?
+            std: Some(true),
         },
         pointer_width: 32,
         data_layout: "E-m:e-p:32:32-Fn32-i64:64-n32".into(),
-        arch: "powerpc".into(),
+        arch: Arch::PowerPC,
         options: TargetOptions { endian: Endian::Big, mcount: "_mcount".into(), ..base },
     }
 }

@@ -1,22 +1,20 @@
 //@ run-pass
-//@ edition:2021
+//@ edition:2024
 //@ compile-flags: --test
 
 #![allow(incomplete_features)]
-#![feature(async_closure)]
 #![feature(auto_traits)]
 #![feature(box_patterns)]
+#![feature(const_block_items)]
 #![feature(const_trait_impl)]
 #![feature(coroutines)]
 #![feature(decl_macro)]
-#![feature(explicit_tail_calls)]
-#![feature(if_let_guard)]
-#![feature(let_chains)]
+#![feature(macro_guard_matcher)]
 #![feature(more_qualified_paths)]
 #![feature(never_patterns)]
+#![feature(specialization)]
 #![feature(trait_alias)]
 #![feature(try_blocks)]
-#![feature(type_ascription)]
 #![feature(yeet_expr)]
 #![deny(unused_macros)]
 
@@ -31,6 +29,7 @@ macro_rules! path { ($path:path) => { stringify!($path) }; }
 macro_rules! stmt { ($stmt:stmt) => { stringify!($stmt) }; }
 macro_rules! ty { ($ty:ty) => { stringify!($ty) }; }
 macro_rules! vis { ($vis:vis) => { stringify!($vis) }; }
+macro_rules! guard { ($guard:guard) => { stringify!($guard) }; }
 
 macro_rules! c1 {
     ($frag:ident, [$($tt:tt)*], $s:literal) => {
@@ -289,6 +288,9 @@ fn test_expr() {
     // ExprKind::OffsetOf: untestable because this test works pre-expansion.
 
     // ExprKind::MacCall
+    c1!(expr, [ mac!() ], "mac!()");
+    c1!(expr, [ mac![] ], "mac![]");
+    c1!(expr, [ mac! {} ], "mac! {}");
     c1!(expr, [ mac!(...) ], "mac!(...)");
     c1!(expr, [ mac![...] ], "mac![...]");
     c1!(expr, [ mac! { ... } ], "mac! { ... }");
@@ -354,7 +356,8 @@ fn test_item() {
     c1!(item, [ pub extern crate self as std; ], "pub extern crate self as std;");
 
     // ItemKind::Use
-    c1!(item, [ pub use crate::{a, b::c}; ], "pub use crate::{ a, b::c };"); // FIXME
+    c1!(item, [ pub use crate::{a, b::c}; ], "pub use crate::{a, b::c};");
+    c1!(item, [ pub use crate::{ e, ff }; ], "pub use crate::{ e, ff };");
     c1!(item, [ pub use A::*; ], "pub use A::*;");
 
     // ItemKind::Static
@@ -366,6 +369,9 @@ fn test_item() {
     // ItemKind::Const
     c1!(item, [ pub const S: () = {}; ], "pub const S: () = {};");
     c1!(item, [ const S: (); ], "const S: ();");
+
+    // ItemKind::ConstBlock
+    c1!(item, [ const {} ], "const {}");
 
     // ItemKind::Fn
     c1!(item,
@@ -480,12 +486,14 @@ fn test_item() {
     c1!(item, [ impl<T> Struct<T> {} ], "impl<T> Struct<T> {}");
     c1!(item, [ pub impl Trait for Struct {} ], "pub impl Trait for Struct {}");
     c1!(item, [ impl<T> const Trait for T {} ], "impl<T> const Trait for T {}");
-    c1!(item, [ impl ~const Struct {} ], "impl ~const Struct {}");
 
     // ItemKind::MacCall
+    c1!(item, [ mac!(); ], "mac!();");
+    c1!(item, [ mac![]; ], "mac![];");
+    c1!(item, [ mac! {} ], "mac! {}");
     c1!(item, [ mac!(...); ], "mac!(...);");
     c1!(item, [ mac![...]; ], "mac![...];");
-    c1!(item, [ mac! { ... } ], "mac! { ... }");
+    c1!(item, [ mac! {...} ], "mac! {...}");
 
     // ItemKind::MacroDef
     c1!(item,
@@ -516,6 +524,8 @@ fn test_meta() {
 
 #[test]
 fn test_pat() {
+    // PatKind::Missing: untestable in isolation.
+
     // PatKind::Wild
     c1!(pat, [ _ ], "_");
 
@@ -570,7 +580,7 @@ fn test_pat() {
     c1!(pat, [ &pat ], "&pat");
     c1!(pat, [ &mut pat ], "&mut pat");
 
-    // PatKind::Lit
+    // PatKind::Expr
     c1!(pat, [ 1_000_i8 ], "1_000_i8");
 
     // PatKind::Range
@@ -597,8 +607,11 @@ fn test_pat() {
     c1!(pat, [ (pat) ], "(pat)");
 
     // PatKind::MacCall
+    c1!(pat, [ mac!() ], "mac!()");
+    c1!(pat, [ mac![] ], "mac![]");
+    c1!(pat, [ mac! {} ], "mac! {}");
     c1!(pat, [ mac!(...) ], "mac!(...)");
-    c1!(pat, [ mac![...] ], "mac![...]");
+    c1!(pat, [ mac! [ ... ] ], "mac! [...]");
     c1!(pat, [ mac! { ... } ], "mac! { ... }");
 
     // Attributes are not allowed on patterns.
@@ -643,6 +656,9 @@ fn test_stmt() {
     c1!(stmt, [ ; ], ";");
 
     // StmtKind::MacCall
+    c1!(stmt, [ mac! ( ) ], "mac! ()");
+    c1!(stmt, [ mac![] ], "mac![]");
+    c1!(stmt, [ mac!{} ], "mac!{}");
     c1!(stmt, [ mac!(...) ], "mac!(...)");
     c1!(stmt, [ mac![...] ], "mac![...]");
     c1!(stmt, [ mac! { ... } ], "mac! { ... }");
@@ -716,7 +732,7 @@ fn test_ty() {
     c1!(ty, [ dyn Send + 'a ], "dyn Send + 'a");
     c1!(ty, [ dyn 'a + Send ], "dyn 'a + Send");
     c1!(ty, [ dyn ?Sized ], "dyn ?Sized");
-    c1!(ty, [ dyn ~const Clone ], "dyn ~const Clone");
+    c1!(ty, [ dyn [const] Clone ], "dyn [const] Clone");
     c1!(ty, [ dyn for<'a> Send ], "dyn for<'a> Send");
 
     // TyKind::ImplTrait
@@ -724,7 +740,7 @@ fn test_ty() {
     c1!(ty, [ impl Send + 'a ], "impl Send + 'a");
     c1!(ty, [ impl 'a + Send ], "impl 'a + Send");
     c1!(ty, [ impl ?Sized ], "impl ?Sized");
-    c1!(ty, [ impl ~const Clone ], "impl ~const Clone");
+    c1!(ty, [ impl [const] Clone ], "impl [const] Clone");
     c1!(ty, [ impl for<'a> Send ], "impl for<'a> Send");
 
     // TyKind::Paren
@@ -738,6 +754,9 @@ fn test_ty() {
     // TyKind::ImplicitSelf: there is no syntax for this.
 
     // TyKind::MacCall
+    c1!(ty, [ mac!() ], "mac!()");
+    c1!(ty, [ mac![] ], "mac![]");
+    c1!(ty, [ mac! { } ], "mac! {}");
     c1!(ty, [ mac!(...) ], "mac!(...)");
     c1!(ty, [ mac![...] ], "mac![...]");
     c1!(ty, [ mac! { ... } ], "mac! { ... }");
@@ -776,10 +795,130 @@ fn test_vis() {
     // Attributes are not allowed on visibilities.
 }
 
+#[test]
+fn test_guard() {
+    c1!(guard, [ if true ], "if true");
+    c1!(guard, [ if let Some(x) = Some(1) ], "if let Some(x) = Some(1)");
+    c1!(guard, [ if let Some(x) = Some(1) && x == 1 ], "if let Some(x) = Some(1) && x == 1");
+    c1!(guard,
+        [ if let Some(x) = Some(Some(1)) && let Some(1) = x ],
+        "if let Some(x) = Some(Some(1)) && let Some(1) = x"
+    );
+    c1!(guard,
+        [ if let Some(x) = Some(Some(1)) && let Some(y) = x && y == 1 ],
+        "if let Some(x) = Some(Some(1)) && let Some(y) = x && y == 1"
+    );
+}
+
 macro_rules! p {
     ([$($tt:tt)*], $s:literal) => {
         assert_eq!(stringify!($($tt)*), $s);
     };
+}
+
+#[test]
+fn test_impl_restriction() {
+    assert_eq!(
+        stringify!(pub impl(crate) trait Foo {}),
+        "pub impl(crate) trait Foo {}"
+    );
+    assert_eq!(
+        stringify!(pub impl(in crate) trait Foo {}),
+        "pub impl(in crate) trait Foo {}"
+    );
+    assert_eq!(
+        stringify!(pub impl(super) trait Foo {}),
+        "pub impl(super) trait Foo {}"
+    );
+    assert_eq!(
+        stringify!(pub impl(in super) trait Foo {}),
+        "pub impl(in super) trait Foo {}"
+    );
+    assert_eq!(
+        stringify!(pub impl(self) trait Foo {}),
+        "pub impl(self) trait Foo {}"
+    );
+    assert_eq!(
+        stringify!(pub impl(in self) trait Foo {}),
+        "pub impl(in self) trait Foo {}"
+    );
+    assert_eq!(
+        stringify!(pub impl(in path::to) trait Foo {}),
+        "pub impl(in path::to) trait Foo {}"
+    );
+    assert_eq!(
+        stringify!(pub impl(in ::path::to) trait Foo {}),
+        "pub impl(in ::path::to) trait Foo {}"
+    );
+    assert_eq!(
+        stringify!(pub impl(in self::path::to) trait Foo {}),
+        "pub impl(in self::path::to) trait Foo {}"
+    );
+    assert_eq!(
+        stringify!(pub impl(in super::path::to) trait Foo {}),
+        "pub impl(in super::path::to) trait Foo {}"
+    );
+    assert_eq!(
+        stringify!(pub impl(in crate::path::to) trait Foo {}),
+        "pub impl(in crate::path::to) trait Foo {}"
+    );
+
+    assert_eq!(
+        stringify!(pub auto impl(crate) trait Foo {}),
+        "pub auto impl(crate) trait Foo {}"
+    );
+    assert_eq!(
+        stringify!(pub auto impl(in crate::path::to) trait Foo {}),
+        "pub auto impl(in crate::path::to) trait Foo {}"
+    );
+    assert_eq!(
+        stringify!(pub unsafe impl(crate) trait Foo {}),
+        "pub unsafe impl(crate) trait Foo {}"
+    );
+    assert_eq!(
+        stringify!(pub unsafe impl(in crate::path::to) trait Foo {}),
+        "pub unsafe impl(in crate::path::to) trait Foo {}"
+    );
+    assert_eq!(
+        stringify!(pub const impl(crate) trait Foo {}),
+        "pub const impl(crate) trait Foo {}"
+    );
+    assert_eq!(
+        stringify!(pub const impl(in crate::path::to) trait Foo {}),
+        "pub const impl(in crate::path::to) trait Foo {}"
+    );
+    assert_eq!(
+        stringify!(pub unsafe auto impl(crate) trait Foo {}),
+        "pub unsafe auto impl(crate) trait Foo {}"
+    );
+    assert_eq!(
+        stringify!(pub unsafe auto impl(in crate::path::to) trait Foo {}),
+        "pub unsafe auto impl(in crate::path::to) trait Foo {}"
+    );
+    assert_eq!(
+        stringify!(pub const auto impl(crate) trait Foo {}),
+        "pub const auto impl(crate) trait Foo {}"
+    );
+    assert_eq!(
+        stringify!(pub const auto impl(in crate::path::to) trait Foo {}),
+        "pub const auto impl(in crate::path::to) trait Foo {}"
+    );
+    assert_eq!(
+        stringify!(pub const unsafe impl(crate) trait Foo {}),
+        "pub const unsafe impl(crate) trait Foo {}"
+    );
+    assert_eq!(
+        stringify!(pub const unsafe impl(in crate::path::to) trait Foo {}),
+        "pub const unsafe impl(in crate::path::to) trait Foo {}"
+    );
+    assert_eq!(
+        stringify!(pub const unsafe auto impl(crate) trait Foo {}),
+        "pub const unsafe auto impl(crate) trait Foo {}"
+    );
+    assert_eq!(
+        stringify!(pub const unsafe auto impl(in crate::path::to) trait Foo {}),
+        "pub const unsafe auto impl(in crate::path::to) trait Foo {}"
+    );
 }
 
 #[test]

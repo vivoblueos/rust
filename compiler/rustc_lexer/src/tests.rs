@@ -4,7 +4,7 @@ use super::*;
 
 fn check_raw_str(s: &str, expected: Result<u8, RawStrError>) {
     let s = &format!("r{}", s);
-    let mut cursor = Cursor::new(s);
+    let mut cursor = Cursor::new(s, FrontmatterAllowed::No);
     cursor.bump();
     let res = cursor.raw_double_quoted_string(0);
     assert_eq!(res, expected);
@@ -77,71 +77,65 @@ fn test_too_many_hashes() {
     check_raw_str(&s2, Err(RawStrError::TooManyDelimiters { found: u32::from(max_count) + 1 }));
 }
 
+// https://github.com/rust-lang/rust/issues/70528
 #[test]
 fn test_valid_shebang() {
-    // https://github.com/rust-lang/rust/issues/70528
-    let input = "#!/usr/bin/rustrun\nlet x = 5;";
-    assert_eq!(strip_shebang(input), Some(18));
-}
+    let input = "#!/bin/bash";
+    assert_eq!(strip_shebang(input), Some(input.len()));
 
-#[test]
-fn test_invalid_shebang_valid_rust_syntax() {
-    // https://github.com/rust-lang/rust/issues/70528
-    let input = "#!    [bad_attribute]";
+    let input = "#![attribute]";
     assert_eq!(strip_shebang(input), None);
-}
 
-#[test]
-fn test_shebang_second_line() {
+    let input = "#!    /bin/bash";
+    assert_eq!(strip_shebang(input), Some(input.len()));
+
+    let input = "#!    [attribute]";
+    assert_eq!(strip_shebang(input), None);
+
+    let input = "#! /* blah */  /bin/bash";
+    assert_eq!(strip_shebang(input), Some(input.len()));
+
+    let input = "#! /* blah */  [attribute]";
+    assert_eq!(strip_shebang(input), None);
+
+    let input = "#! // blah\n/bin/bash";
+    assert_eq!(strip_shebang(input), Some(10)); // strip up to the newline
+
+    let input = "#! // blah\n[attribute]";
+    assert_eq!(strip_shebang(input), None);
+
+    let input = "#! /* blah\nblah\nblah */  /bin/bash";
+    assert_eq!(strip_shebang(input), Some(10));
+
+    let input = "#! /* blah\nblah\nblah */  [attribute]";
+    assert_eq!(strip_shebang(input), None);
+
+    let input = "#!\n/bin/sh";
+    assert_eq!(strip_shebang(input), Some(2));
+
+    let input = "#!\n[attribute]";
+    assert_eq!(strip_shebang(input), None);
+
     // Because shebangs are interpreted by the kernel, they must be on the first line
     let input = "\n#!/bin/bash";
     assert_eq!(strip_shebang(input), None);
-}
 
-#[test]
-fn test_shebang_space() {
-    let input = "#!    /bin/bash";
-    assert_eq!(strip_shebang(input), Some(input.len()));
-}
-
-#[test]
-fn test_shebang_empty_shebang() {
-    let input = "#!    \n[attribute(foo)]";
+    let input = "\n#![attribute]";
     assert_eq!(strip_shebang(input), None);
 }
 
-#[test]
-fn test_invalid_shebang_comment() {
-    let input = "#!//bin/ami/a/comment\n[";
-    assert_eq!(strip_shebang(input), None)
-}
-
-#[test]
-fn test_invalid_shebang_another_comment() {
-    let input = "#!/*bin/ami/a/comment*/\n[attribute";
-    assert_eq!(strip_shebang(input), None)
-}
-
-#[test]
-fn test_shebang_valid_rust_after() {
-    let input = "#!/*bin/ami/a/comment*/\npub fn main() {}";
-    assert_eq!(strip_shebang(input), Some(23))
-}
-
-#[test]
-fn test_shebang_followed_by_attrib() {
-    let input = "#!/bin/rust-scripts\n#![allow_unused(true)]";
-    assert_eq!(strip_shebang(input), Some(19));
-}
-
-fn check_lexing(src: &str, expect: Expect) {
-    let actual: String = tokenize(src).map(|token| format!("{:?}\n", token)).collect();
+fn check_lexing(src: &str, frontmatter_allowed: FrontmatterAllowed, expect: Expect) {
+    let actual: String =
+        tokenize(src, frontmatter_allowed).map(|token| format!("{:?}\n", token)).collect();
     expect.assert_eq(&actual)
 }
 
 #[test]
 fn smoke_test() {
-    check_lexing("/* my source file */ fn main() { println!(\"zebra\"); }\n", expect![[r#"
+    check_lexing(
+        "/* my source file */ fn main() { println!(\"zebra\"); }\n",
+        FrontmatterAllowed::No,
+        expect![[r#"
             Token { kind: BlockComment { doc_style: None, terminated: true }, len: 20 }
             Token { kind: Whitespace, len: 1 }
             Token { kind: Ident, len: 2 }
@@ -161,7 +155,8 @@ fn smoke_test() {
             Token { kind: Whitespace, len: 1 }
             Token { kind: CloseBrace, len: 1 }
             Token { kind: Whitespace, len: 1 }
-        "#]])
+        "#]],
+    )
 }
 
 #[test]
@@ -178,6 +173,7 @@ fn comment_flavors() {
 /** outer doc block */
 /*! inner doc block */
 ",
+        FrontmatterAllowed::No,
         expect![[r#"
             Token { kind: Whitespace, len: 1 }
             Token { kind: LineComment { doc_style: None }, len: 7 }
@@ -204,35 +200,51 @@ fn comment_flavors() {
 
 #[test]
 fn nested_block_comments() {
-    check_lexing("/* /* */ */'a'", expect![[r#"
+    check_lexing(
+        "/* /* */ */'a'",
+        FrontmatterAllowed::No,
+        expect![[r#"
             Token { kind: BlockComment { doc_style: None, terminated: true }, len: 11 }
             Token { kind: Literal { kind: Char { terminated: true }, suffix_start: 3 }, len: 3 }
-        "#]])
+        "#]],
+    )
 }
 
 #[test]
 fn characters() {
-    check_lexing("'a' ' ' '\\n'", expect![[r#"
+    check_lexing(
+        "'a' ' ' '\\n'",
+        FrontmatterAllowed::No,
+        expect![[r#"
             Token { kind: Literal { kind: Char { terminated: true }, suffix_start: 3 }, len: 3 }
             Token { kind: Whitespace, len: 1 }
             Token { kind: Literal { kind: Char { terminated: true }, suffix_start: 3 }, len: 3 }
             Token { kind: Whitespace, len: 1 }
             Token { kind: Literal { kind: Char { terminated: true }, suffix_start: 4 }, len: 4 }
-        "#]]);
+        "#]],
+    );
 }
 
 #[test]
 fn lifetime() {
-    check_lexing("'abc", expect![[r#"
+    check_lexing(
+        "'abc",
+        FrontmatterAllowed::No,
+        expect![[r#"
             Token { kind: Lifetime { starts_with_number: false }, len: 4 }
-        "#]]);
+        "#]],
+    );
 }
 
 #[test]
 fn raw_string() {
-    check_lexing("r###\"\"#a\\b\x00c\"\"###", expect![[r#"
+    check_lexing(
+        "r###\"\"#a\\b\x00c\"\"###",
+        FrontmatterAllowed::No,
+        expect![[r#"
             Token { kind: Literal { kind: RawStr { n_hashes: Some(3) }, suffix_start: 17 }, len: 17 }
-        "#]])
+        "#]],
+    )
 }
 
 #[test]
@@ -252,6 +264,7 @@ b"a"
 r###"raw"###suffix
 br###"raw"###suffix
 "####,
+        FrontmatterAllowed::No,
         expect![[r#"
             Token { kind: Whitespace, len: 1 }
             Token { kind: Literal { kind: Char { terminated: true }, suffix_start: 3 }, len: 3 }
@@ -277,6 +290,81 @@ br###"raw"###suffix
             Token { kind: Literal { kind: RawStr { n_hashes: Some(3) }, suffix_start: 12 }, len: 18 }
             Token { kind: Whitespace, len: 1 }
             Token { kind: Literal { kind: RawByteStr { n_hashes: Some(3) }, suffix_start: 13 }, len: 19 }
+            Token { kind: Whitespace, len: 1 }
+        "#]],
+    )
+}
+
+#[test]
+fn frontmatter_allowed() {
+    check_lexing(
+        r#"
+---cargo
+[dependencies]
+clap = "4"
+---
+
+fn main() {}
+"#,
+        FrontmatterAllowed::Yes,
+        expect![[r#"
+            Token { kind: Whitespace, len: 1 }
+            Token { kind: Frontmatter { has_invalid_preceding_whitespace: false, invalid_infostring: false }, len: 38 }
+            Token { kind: Whitespace, len: 2 }
+            Token { kind: Ident, len: 2 }
+            Token { kind: Whitespace, len: 1 }
+            Token { kind: Ident, len: 4 }
+            Token { kind: OpenParen, len: 1 }
+            Token { kind: CloseParen, len: 1 }
+            Token { kind: Whitespace, len: 1 }
+            Token { kind: OpenBrace, len: 1 }
+            Token { kind: CloseBrace, len: 1 }
+            Token { kind: Whitespace, len: 1 }
+        "#]],
+    )
+}
+
+#[test]
+fn frontmatter_disallowed() {
+    check_lexing(
+        r#"
+---cargo
+[dependencies]
+clap = "4"
+---
+
+fn main() {}
+"#,
+        FrontmatterAllowed::No,
+        expect![[r#"
+            Token { kind: Whitespace, len: 1 }
+            Token { kind: Minus, len: 1 }
+            Token { kind: Minus, len: 1 }
+            Token { kind: Minus, len: 1 }
+            Token { kind: Ident, len: 5 }
+            Token { kind: Whitespace, len: 1 }
+            Token { kind: OpenBracket, len: 1 }
+            Token { kind: Ident, len: 12 }
+            Token { kind: CloseBracket, len: 1 }
+            Token { kind: Whitespace, len: 1 }
+            Token { kind: Ident, len: 4 }
+            Token { kind: Whitespace, len: 1 }
+            Token { kind: Eq, len: 1 }
+            Token { kind: Whitespace, len: 1 }
+            Token { kind: Literal { kind: Str { terminated: true }, suffix_start: 3 }, len: 3 }
+            Token { kind: Whitespace, len: 1 }
+            Token { kind: Minus, len: 1 }
+            Token { kind: Minus, len: 1 }
+            Token { kind: Minus, len: 1 }
+            Token { kind: Whitespace, len: 2 }
+            Token { kind: Ident, len: 2 }
+            Token { kind: Whitespace, len: 1 }
+            Token { kind: Ident, len: 4 }
+            Token { kind: OpenParen, len: 1 }
+            Token { kind: CloseParen, len: 1 }
+            Token { kind: Whitespace, len: 1 }
+            Token { kind: OpenBrace, len: 1 }
+            Token { kind: CloseBrace, len: 1 }
             Token { kind: Whitespace, len: 1 }
         "#]],
     )

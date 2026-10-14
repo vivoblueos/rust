@@ -2,14 +2,14 @@
 
 use hir::{Crate, Module};
 use hir_ty::db::HirDatabase;
-use ide_db::{base_db::SourceRootDatabase, LineIndexDatabase};
+use ide_db::{LineIndexDatabase, base_db::SourceDatabase};
 use profile::StopWatch;
 use project_model::{CargoConfig, RustLibSource};
 use syntax::TextRange;
 
-use load_cargo::{load_workspace_at, LoadCargoConfig, ProcMacroServerChoice};
+use load_cargo::{LoadCargoConfig, ProcMacroServerChoice, load_workspace_at};
 
-use crate::cli::{flags, full_name_of_item, Result};
+use crate::cli::{Result, flags, full_name_of_item};
 
 impl flags::RunTests {
     pub fn run(self) -> Result<()> {
@@ -23,6 +23,8 @@ impl flags::RunTests {
             load_out_dirs_from_check: true,
             with_proc_macro_server: ProcMacroServerChoice::Sysroot,
             prefill_caches: false,
+            num_worker_threads: 1,
+            proc_macro_processes: 1,
         };
         let (ref db, _vfs, _proc_macro) =
             load_workspace_at(&self.path, &cargo_config, &load_cargo_config, &|_| {})?;
@@ -40,10 +42,10 @@ impl flags::RunTests {
                 None => " (unknown line col)".to_owned(),
                 Some(x) => format!("#{}:{}", x.line + 1, x.col),
             };
-            let path = &db
-                .source_root(db.file_source_root(file_id))
-                .path_for_file(&file_id)
-                .map(|x| x.to_string());
+            let source_root = db.file_source_root(file_id).source_root_id(db);
+            let source_root = db.source_root(source_root).source_root(db);
+
+            let path = source_root.path_for_file(&file_id).map(|x| x.to_string());
             let path = path.as_deref().unwrap_or("<unknown file>");
             format!("file://{path}{line_col}")
         };
@@ -78,7 +80,7 @@ fn all_modules(db: &dyn HirDatabase) -> Vec<Module> {
     let mut worklist: Vec<_> = Crate::all(db)
         .into_iter()
         .filter(|x| x.origin(db).is_local())
-        .map(|krate| krate.root_module())
+        .map(|krate| krate.root_module(db))
         .collect();
     let mut modules = Vec::new();
 

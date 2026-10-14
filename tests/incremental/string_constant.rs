@@ -7,7 +7,7 @@
 #![crate_type = "rlib"]
 
 // Here the only thing which changes is the string constant in `x`.
-// Therefore, the compiler deduces (correctly) that typeck is not
+// Therefore, the compiler deduces (correctly) that typeck_root is not
 // needed even for callers of `x`.
 
 pub mod x {
@@ -17,7 +17,7 @@ pub mod x {
     }
 
     #[cfg(cfail2)]
-    #[rustc_clean(except = "opt_hir_owner_nodes,promoted_mir", cfg = "cfail2")]
+    #[rustc_clean(except = "opt_hir_owner_nodes,optimized_mir", cfg = "cfail2")]
     pub fn x() {
         println!("{}", "2");
     }

@@ -7,10 +7,11 @@ use rustc_middle::bug;
 use rustc_middle::ty::layout::{LayoutOf, TyAndLayout};
 use rustc_middle::ty::print::{with_no_trimmed_paths, with_no_visible_paths};
 use rustc_middle::ty::{self, CoroutineArgsExt, Ty, TypeVisitableExt};
+use rustc_span::{DUMMY_SP, Span};
 use tracing::debug;
 
 use crate::common::*;
-use crate::type_::Type;
+use crate::llvm::Type;
 
 fn uncached_llvm_type<'a, 'tcx>(
     cx: &CodegenCx<'a, 'tcx>,
@@ -19,11 +20,60 @@ fn uncached_llvm_type<'a, 'tcx>(
 ) -> &'a Type {
     match layout.backend_repr {
         BackendRepr::Scalar(_) => bug!("handled elsewhere"),
-        BackendRepr::Vector { element, count } => {
+        BackendRepr::SimdVector { element, count } => {
             let element = layout.scalar_llvm_type_at(cx, element);
             return cx.type_vector(element, count);
         }
-        BackendRepr::Uninhabited | BackendRepr::Memory { .. } | BackendRepr::ScalarPair(..) => {}
+        BackendRepr::SimdScalableVector { ref element, count, number_of_vectors } => {
+            let element = if element.is_bool() {
+                cx.type_i1()
+            } else {
+                layout.scalar_llvm_type_at(cx, *element)
+            };
+
+            let vector_type = cx.type_scalable_vector(element, count);
+            return match number_of_vectors.0 {
+                1 => vector_type,
+                2 => cx.type_struct(&[vector_type, vector_type], false),
+                3 => cx.type_struct(&[vector_type, vector_type, vector_type], false),
+                4 => cx.type_struct(&[vector_type, vector_type, vector_type, vector_type], false),
+                5 => cx.type_struct(
+                    &[vector_type, vector_type, vector_type, vector_type, vector_type],
+                    false,
+                ),
+                6 => cx.type_struct(
+                    &[vector_type, vector_type, vector_type, vector_type, vector_type, vector_type],
+                    false,
+                ),
+                7 => cx.type_struct(
+                    &[
+                        vector_type,
+                        vector_type,
+                        vector_type,
+                        vector_type,
+                        vector_type,
+                        vector_type,
+                        vector_type,
+                    ],
+                    false,
+                ),
+                8 => cx.type_struct(
+                    &[
+                        vector_type,
+                        vector_type,
+                        vector_type,
+                        vector_type,
+                        vector_type,
+                        vector_type,
+                        vector_type,
+                        vector_type,
+                    ],
+                    false,
+                ),
+                _ => bug!("`#[rustc_scalable_vector]` tuple struct with too many fields"),
+            };
+        }
+        BackendRepr::Memory { .. } | BackendRepr::ScalarPair(..) => {}
     }
 
     let name = match layout.ty.kind() {
@@ -38,7 +88,7 @@ fn uncached_llvm_type<'a, 'tcx>(
             if let (&ty::Adt(def, _), &Variants::Single { index }) =
                 (layout.ty.kind(), &layout.variants)
             {
-                if def.is_enum() && !def.variants().is_empty() {
+                if def.is_enum() {
                     write!(&mut name, "::{}", def.variant(index).name).unwrap();
                 }
             }
@@ -149,7 +199,11 @@ impl<'a, 'tcx> CodegenCx<'a, 'tcx> {
     }
 
     pub(crate) fn size_and_align_of(&self, ty: Ty<'tcx>) -> (Size, Align) {
-        let layout = self.layout_of(ty);
+        self.spanned_size_and_align_of(ty, DUMMY_SP)
+    }
+
+    pub(crate) fn spanned_size_and_align_of(&self, ty: Ty<'tcx>, span: Span) -> (Size, Align) {
+        let layout = self.spanned_layout_of(ty, span);
         (layout.size, layout.align.abi)
     }
 }
@@ -171,19 +225,19 @@ pub(crate) trait LayoutLlvmExt<'tcx> {
 impl<'tcx> LayoutLlvmExt<'tcx> for TyAndLayout<'tcx> {
     fn is_llvm_immediate(&self) -> bool {
         match self.backend_repr {
-            BackendRepr::Scalar(_) | BackendRepr::Vector { .. } => true,
-            BackendRepr::ScalarPair(..) | BackendRepr::Uninhabited | BackendRepr::Memory { .. } => {
-                false
-            }
+            BackendRepr::Scalar(_)
+            | BackendRepr::SimdVector { .. }
+            | BackendRepr::SimdScalableVector { .. } => true,
+            BackendRepr::ScalarPair(..) | BackendRepr::Memory { .. } => false,
         }
     }
 
     fn is_llvm_scalar_pair(&self) -> bool {
         match self.backend_repr {
             BackendRepr::ScalarPair(..) => true,
-            BackendRepr::Uninhabited
-            | BackendRepr::Scalar(_)
-            | BackendRepr::Vector { .. }
+            BackendRepr::Scalar(_)
+            | BackendRepr::SimdVector { .. }
+            | BackendRepr::SimdScalableVector { .. }
             | BackendRepr::Memory { .. } => false,
         }
     }
@@ -229,7 +283,7 @@ impl<'tcx> LayoutLlvmExt<'tcx> for TyAndLayout<'tcx> {
 
         // Make sure lifetimes are erased, to avoid generating distinct LLVM
         // types for Rust types that only differ in the choice of lifetimes.
-        let normal_ty = cx.tcx.erase_regions(self.ty);
+        let normal_ty = cx.tcx.erase_and_anonymize_regions(self.ty);
 
         let mut defer = None;
         let llty = if self.ty != normal_ty {

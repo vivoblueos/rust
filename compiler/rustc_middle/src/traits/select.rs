@@ -5,26 +5,20 @@
 use rustc_errors::ErrorGuaranteed;
 use rustc_hir::def_id::DefId;
 use rustc_macros::{HashStable, TypeVisitable};
-use rustc_query_system::cache::Cache;
+use rustc_type_ir::solve::AliasBoundKind;
 
 use self::EvaluationResult::*;
 use super::{SelectionError, SelectionResult};
+use crate::traits::cache::WithDepNodeCache;
 use crate::ty;
 
-pub type SelectionCache<'tcx> = Cache<
-    // This cache does not use `ParamEnvAnd` in its keys because `ParamEnv::and` can replace
-    // caller bounds with an empty list if the `TraitPredicate` looks global, which may happen
-    // after erasing lifetimes from the predicate.
-    (ty::ParamEnv<'tcx>, ty::TraitPredicate<'tcx>),
+pub type SelectionCache<'tcx, ENV> = WithDepNodeCache<
+    (ENV, ty::TraitPredicate<'tcx>),
     SelectionResult<'tcx, SelectionCandidate<'tcx>>,
 >;
 
-pub type EvaluationCache<'tcx> = Cache<
-    // See above: this cache does not use `ParamEnvAnd` in its keys due to sometimes incorrectly
-    // caching with the wrong `ParamEnv`.
-    (ty::ParamEnv<'tcx>, ty::PolyTraitPredicate<'tcx>),
-    EvaluationResult,
->;
+pub type EvaluationCache<'tcx, ENV> =
+    WithDepNodeCache<(ENV, ty::PolyTraitPredicate<'tcx>), EvaluationResult>;
 
 /// The selection process begins by considering all impls, where
 /// clauses, and so forth that might resolve an obligation. Sometimes
@@ -105,16 +99,17 @@ pub type EvaluationCache<'tcx> = Cache<
 /// parameter environment.
 #[derive(PartialEq, Eq, Debug, Clone, TypeVisitable)]
 pub enum SelectionCandidate<'tcx> {
+    /// A built-in implementation for the `Sized` trait. This is preferred
+    /// over all other candidates.
+    SizedCandidate,
+
     /// A builtin implementation for some specific traits, used in cases
     /// where we cannot rely an ordinary library implementations.
     ///
-    /// The most notable examples are `sized`, `Copy` and `Clone`. This is also
+    /// The most notable examples are `Copy` and `Clone`. This is also
     /// used for the `DiscriminantKind` and `Pointee` trait, both of which have
     /// an associated type.
-    BuiltinCandidate {
-        /// `false` if there are no *further* obligations.
-        has_nested: bool,
-    },
+    BuiltinCandidate,
 
     /// Implementation of transmutability trait.
     TransmutabilityCandidate,
@@ -125,8 +120,13 @@ pub enum SelectionCandidate<'tcx> {
 
     /// This is a trait matching with a projected type as `Self`, and we found
     /// an applicable bound in the trait definition. The `usize` is an index
-    /// into the list returned by `tcx.item_bounds`.
-    ProjectionCandidate(usize),
+    /// into the list returned by `tcx.item_bounds` and the `AliasBoundKind`
+    /// is whether this is candidate from recursion on the self type of a
+    /// projection.
+    ProjectionCandidate {
+        idx: usize,
+        kind: AliasBoundKind,
+    },
 
     /// Implementation of a `Fn`-family trait by one of the anonymous types
     /// generated for an `||` expression.
@@ -178,6 +178,8 @@ pub enum SelectionCandidate<'tcx> {
     BuiltinObjectCandidate,
 
     BuiltinUnsizeCandidate,
+
+    BikeshedGuaranteedNoDropCandidate,
 }
 
 /// The result of trait evaluation. The order is important
@@ -269,8 +271,6 @@ impl From<ErrorGuaranteed> for OverflowError {
         OverflowError::Error(e)
     }
 }
-
-TrivialTypeTraversalImpls! { OverflowError }
 
 impl<'tcx> From<OverflowError> for SelectionError<'tcx> {
     fn from(overflow_error: OverflowError) -> SelectionError<'tcx> {

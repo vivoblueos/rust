@@ -4,7 +4,7 @@
 
 A collection of lints to catch common mistakes and improve your [Rust](https://github.com/rust-lang/rust) code.
 
-[There are over 750 lints included in this crate!](https://rust-lang.github.io/rust-clippy/master/index.html)
+[There are over 800 lints included in this crate!](https://rust-lang.github.io/rust-clippy/master/index.html)
 
 Lints are divided into categories, each with a default [lint level](https://doc.rust-lang.org/rustc/lints/levels.html).
 You can choose how much Clippy is supposed to ~~annoy~~ help you by changing the lint level by category.
@@ -159,11 +159,11 @@ line. (You can swap `clippy::all` with the specific lint category you are target
 You can add options to your code to `allow`/`warn`/`deny` Clippy lints:
 
 * the whole set of `Warn` lints using the `clippy` lint group (`#![deny(clippy::all)]`).
-    Note that `rustc` has additional [lint groups](https://doc.rust-lang.org/rustc/lints/groups.html).
+  Note that `rustc` has additional [lint groups](https://doc.rust-lang.org/rustc/lints/groups.html).
 
 * all lints using both the `clippy` and `clippy::pedantic` lint groups (`#![deny(clippy::all)]`,
-    `#![deny(clippy::pedantic)]`). Note that `clippy::pedantic` contains some very aggressive
-    lints prone to false positives.
+  `#![deny(clippy::pedantic)]`). Note that `clippy::pedantic` contains some very aggressive
+  lints prone to false positives.
 
 * only some lints (`#![deny(clippy::single_match, clippy::box_vec)]`, etc.)
 
@@ -277,7 +277,7 @@ If you want to contribute to Clippy, you can find more information in [CONTRIBUT
 
 <!-- REUSE-IgnoreStart -->
 
-Copyright 2014-2024 The Rust Project Developers
+Copyright (c) The Rust Project Contributors
 
 Licensed under the Apache License, Version 2.0 <LICENSE-APACHE or
 [https://www.apache.org/licenses/LICENSE-2.0](https://www.apache.org/licenses/LICENSE-2.0)> or the MIT license

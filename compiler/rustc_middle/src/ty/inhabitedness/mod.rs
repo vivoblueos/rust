@@ -47,8 +47,7 @@ use rustc_type_ir::TyKind::*;
 use tracing::instrument;
 
 use crate::query::Providers;
-use crate::ty::context::TyCtxt;
-use crate::ty::{self, DefId, Ty, TypeVisitableExt, VariantDef, Visibility};
+use crate::ty::{self, DefId, Ty, TyCtxt, TypeVisitableExt, VariantDef, Visibility};
 
 pub mod inhabited_predicate;
 
@@ -62,10 +61,9 @@ pub(crate) fn provide(providers: &mut Providers) {
 /// requires calling [`InhabitedPredicate::instantiate`]
 fn inhabited_predicate_adt(tcx: TyCtxt<'_>, def_id: DefId) -> InhabitedPredicate<'_> {
     if let Some(def_id) = def_id.as_local() {
-        if matches!(tcx.representability(def_id), ty::Representability::Infinite(_)) {
-            return InhabitedPredicate::True;
-        }
+        tcx.ensure_ok().check_representability(def_id);
     }
+
     let adt = tcx.adt_def(def_id);
     InhabitedPredicate::any(
         tcx,
@@ -107,27 +105,25 @@ impl<'tcx> Ty<'tcx> {
             // For now, unions are always considered inhabited
             Adt(adt, _) if adt.is_union() => InhabitedPredicate::True,
             // Non-exhaustive ADTs from other crates are always considered inhabited
-            Adt(adt, _) if adt.is_variant_list_non_exhaustive() && !adt.did().is_local() => {
+            Adt(adt, _) if adt.variant_list_has_applicable_non_exhaustive() => {
                 InhabitedPredicate::True
             }
             Never => InhabitedPredicate::False,
-            Param(_) | Alias(ty::Projection | ty::Weak, _) => InhabitedPredicate::GenericType(self),
-            Alias(ty::Opaque, alias_ty) => {
-                match alias_ty.def_id.as_local() {
+            Param(_)
+            | Alias(ty::AliasTy {
+                kind: ty::Inherent { .. } | ty::Projection { .. } | ty::Free { .. },
+                ..
+            }) => InhabitedPredicate::GenericType(self),
+            &Alias(ty::AliasTy { kind: ty::Opaque { def_id }, args, .. }) => {
+                match def_id.as_local() {
                     // Foreign opaque is considered inhabited.
                     None => InhabitedPredicate::True,
                     // Local opaque type may possibly be revealed.
                     Some(local_def_id) => {
-                        let key = ty::OpaqueTypeKey { def_id: local_def_id, args: alias_ty.args };
+                        let key = ty::OpaqueTypeKey { def_id: local_def_id, args };
                         InhabitedPredicate::OpaqueType(key)
                     }
                 }
-            }
-            // FIXME(inherent_associated_types): Most likely we can just map to `GenericType` like above.
-            // However it's unclear if the args passed to `InhabitedPredicate::instantiate` are of the correct
-            // format, i.e. don't contain parent args. If you hit this case, please verify this beforehand.
-            Alias(ty::Inherent, _) => {
-                bug!("unimplemented: inhabitedness checking for inherent projections")
             }
             Tuple(tys) if tys.is_empty() => InhabitedPredicate::True,
             // use a query for more complex cases

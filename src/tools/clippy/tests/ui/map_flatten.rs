@@ -1,13 +1,14 @@
 #![warn(clippy::map_flatten)]
-#![feature(result_flattening)]
-//@no-rustfix
+#![allow(clippy::unnecessary_filter_map)]
+
 // issue #8506, multi-line
 #[rustfmt::skip]
 fn long_span() {
     let _: Option<i32> = Some(1)
         .map(|x| {
-        //~^ ERROR: called `map(..).flatten()` on `Option`
-        //~| NOTE: `-D clippy::map-flatten` implied by `-D warnings`
+        //~^ map_flatten
+
+
             if x <= 5 {
                 Some(x)
             } else {
@@ -18,7 +19,8 @@ fn long_span() {
 
     let _: Result<i32, i32> = Ok(1)
         .map(|x| {
-        //~^ ERROR: called `map(..).flatten()` on `Result`
+        //~^ map_flatten
+
             if x == 1 {
                 Ok(x)
             } else {
@@ -31,7 +33,8 @@ fn long_span() {
     fn do_something() { }
     let _: Result<i32, i32> = result
         .map(|res| {
-        //~^ ERROR: called `map(..).flatten()` on `Result`
+        //~^ map_flatten
+
             if res > 0 {
                 do_something();
                 Ok(res)
@@ -40,11 +43,12 @@ fn long_span() {
             }
         })
         .flatten();
-        
+
     let _: Vec<_> = vec![5_i8; 6]
         .into_iter()
         .map(|some_value| {
-        //~^ ERROR: called `map(..).flatten()` on `Iterator`
+        //~^ map_flatten
+
             if some_value > 3 {
                 Some(some_value)
             } else {
@@ -55,6 +59,16 @@ fn long_span() {
         .collect();
 }
 
-fn main() {
-    long_span();
+#[allow(clippy::useless_vec)]
+fn no_suggestion_if_comments_present() {
+    let vec = vec![vec![1, 2, 3]];
+    let _ = vec
+        .iter()
+        // a lovely comment explaining the code in very detail
+        .map(|x| x.iter())
+        //~^ map_flatten
+        // the answer to life, the universe and everything could be here
+        .flatten();
 }
+
+fn main() {}

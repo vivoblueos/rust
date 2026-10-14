@@ -1,124 +1,148 @@
+from __future__ import annotations
+from typing import List
+
+
 import lldb
 
 from lldb_providers import *
-from rust_types import RustType, classify_struct, classify_union
+from rust_types import (
+    ENUM_DISR_FIELD_NAME,
+    ENUM_LLDB_ENCODED_VARIANTS,
+    RustType,
+    classify_union,
+    is_tuple_fields,
+)
+
+####################################################################################################
+# This file contains lookup functions that associate rust types with their synthetic/summary
+# providers.
+#
+# LLDB caches the results of the the commands in `lldb_commands`, but that caching is "shallow". It
+# purely associates the type with the function given, whether it is a regular function or a class
+# constructor. If the function makes decisions about what type of SyntheticProvider to return, that
+# processing is done **each time a value of that type is encountered**.
+#
+# To reiterate, inspecting a `vec![T; 100_000]` will call `T`'s lookup function/constructor 100,000
+# times. This can lead to significant delays in value visualization if the lookup logic is complex.
+#
+# As such, lookup functions should be kept as minimal as possible. LLDB technically expects a
+# SyntheticProvider class constructor. If you can provide just a class constructor, that should be
+# preferred. If extra processing must be done, try to keep it as minimal and as targeted as possible
+# (see: `classify_hashmap()` vs `classify_hashset()`).
+####################################################################################################
 
 
 # BACKCOMPAT: rust 1.35
-def is_hashbrown_hashmap(hash_map):
+def is_hashbrown_hashmap(hash_map: lldb.SBValue) -> bool:
     return len(hash_map.type.fields) == 1
 
 
-def classify_rust_type(type):
+def classify_hashmap(valobj: lldb.SBValue, _dict: LLDBOpaque) -> object:
+    if is_hashbrown_hashmap(valobj):
+        return StdHashMapSyntheticProvider(valobj, _dict)
+    else:
+        return StdOldHashMapSyntheticProvider(valobj, _dict)
+
+
+def classify_hashset(valobj: lldb.SBValue, _dict: LLDBOpaque) -> object:
+    hash_map = valobj.GetChildAtIndex(0)
+    if is_hashbrown_hashmap(hash_map):
+        return StdHashMapSyntheticProvider(valobj, _dict, show_values=False)
+    else:
+        return StdOldHashMapSyntheticProvider(hash_map, _dict, show_values=False)
+
+
+def arc_synthetic(valobj: lldb.SBValue, _dict: LLDBOpaque) -> object:
+    return StdRcSyntheticProvider(valobj, _dict, is_atomic=True)
+
+
+def classify_rust_type(type: lldb.SBType, is_msvc: bool) -> RustType:
+    if type.IsPointerType():
+        return RustType.Indirection
+
+    # there is a bit of code duplication here because we don't want to check all of the standard
+    # library regexes since LLDB handles that for us
     type_class = type.GetTypeClass()
     if type_class == lldb.eTypeClassStruct:
-        return classify_struct(type.name, type.fields)
+        fields: List[lldb.SBTypeMember] = type.fields
+        if len(fields) == 0:
+            return RustType.Empty
+
+        # <<variant>> is emitted by GDB while LLDB(18.1+) emits "$variants$"
+        if (
+            fields[0].name == ENUM_DISR_FIELD_NAME
+            or fields[0].name == ENUM_LLDB_ENCODED_VARIANTS
+        ):
+            return RustType.Enum
+
+        if is_tuple_fields(fields):
+            return RustType.Tuple
+
+        return RustType.Struct
     if type_class == lldb.eTypeClassUnion:
+        # If we're debugging msvc, sum-type enums should have been caught by the regex in lldb
+        # commands since they all start with "enum2$<"
+        if is_msvc:
+            return RustType.Union
         return classify_union(type.fields)
 
-    return RustType.OTHER
+    return RustType.Other
 
 
-def summary_lookup(valobj, dict):
-    # type: (SBValue, dict) -> str
-    """Returns the summary provider for the given value"""
-    rust_type = classify_rust_type(valobj.GetType())
-
-    if rust_type == RustType.STD_STRING:
-        return StdStringSummaryProvider(valobj, dict)
-    if rust_type == RustType.STD_OS_STRING:
-        return StdOsStringSummaryProvider(valobj, dict)
-    if rust_type == RustType.STD_STR:
-        return StdStrSummaryProvider(valobj, dict)
-
-    if rust_type == RustType.STD_VEC:
-        return SizeSummaryProvider(valobj, dict)
-    if rust_type == RustType.STD_VEC_DEQUE:
-        return SizeSummaryProvider(valobj, dict)
-    if rust_type == RustType.STD_SLICE:
-        return SizeSummaryProvider(valobj, dict)
-
-    if rust_type == RustType.STD_HASH_MAP:
-        return SizeSummaryProvider(valobj, dict)
-    if rust_type == RustType.STD_HASH_SET:
-        return SizeSummaryProvider(valobj, dict)
-
-    if rust_type == RustType.STD_RC:
-        return StdRcSummaryProvider(valobj, dict)
-    if rust_type == RustType.STD_ARC:
-        return StdRcSummaryProvider(valobj, dict)
-
-    if rust_type == RustType.STD_REF:
-        return StdRefSummaryProvider(valobj, dict)
-    if rust_type == RustType.STD_REF_MUT:
-        return StdRefSummaryProvider(valobj, dict)
-    if rust_type == RustType.STD_REF_CELL:
-        return StdRefSummaryProvider(valobj, dict)
-
-    if rust_type == RustType.STD_NONZERO_NUMBER:
-        return StdNonZeroNumberSummaryProvider(valobj, dict)
-
-    if rust_type == RustType.STD_PATHBUF:
-        return StdPathBufSummaryProvider(valobj, dict)
-    if rust_type == RustType.STD_PATH:
-        return StdPathSummaryProvider(valobj, dict)
-
-    return ""
-
-
-def synthetic_lookup(valobj, dict):
-    # type: (SBValue, dict) -> object
+def synthetic_lookup(valobj: lldb.SBValue, _dict: LLDBOpaque) -> object:
     """Returns the synthetic provider for the given value"""
-    rust_type = classify_rust_type(valobj.GetType())
 
-    if rust_type == RustType.STRUCT:
-        return StructSyntheticProvider(valobj, dict)
-    if rust_type == RustType.STRUCT_VARIANT:
-        return StructSyntheticProvider(valobj, dict, is_variant=True)
-    if rust_type == RustType.TUPLE:
-        return TupleSyntheticProvider(valobj, dict)
-    if rust_type == RustType.TUPLE_VARIANT:
-        return TupleSyntheticProvider(valobj, dict, is_variant=True)
-    if rust_type == RustType.EMPTY:
-        return EmptySyntheticProvider(valobj, dict)
-    if rust_type == RustType.REGULAR_ENUM:
+    # small hack to check for the DWARF debug info section, since SBTarget.triple and
+    # SBProcess.triple report lldb's target rather than the executable's. SBProcessInfo.triple
+    # returns a triple without the ABI. It is also possible for any of those functions to return a
+    # None object.
+    # Instead, we look for the GNU `.debug_info` section, as MSVC does not have one with the same
+    # name
+    # FIXME: I don't know if this works when the DWARF lives in a separate file
+    # (see: https://gcc.gnu.org/wiki/DebugFissionDWP). Splitting the DWARF is very uncommon afaik so
+    # it should be okay for the time being.
+    is_msvc = not valobj.GetFrame().GetModule().FindSection(".debug_info").IsValid()
+
+    rust_type = classify_rust_type(valobj.GetType(), is_msvc)
+
+    if rust_type == RustType.Struct or rust_type == RustType.Union:
+        return StructSyntheticProvider(valobj, _dict)
+    if rust_type == RustType.StructVariant:
+        return StructSyntheticProvider(valobj, _dict, is_variant=True)
+    if rust_type == RustType.Tuple:
+        return TupleSyntheticProvider(valobj, _dict)
+    if rust_type == RustType.TupleVariant:
+        return TupleSyntheticProvider(valobj, _dict, is_variant=True)
+    if rust_type == RustType.Empty:
+        return EmptySyntheticProvider(valobj, _dict)
+    if rust_type == RustType.RegularEnum:
         discriminant = valobj.GetChildAtIndex(0).GetChildAtIndex(0).GetValueAsUnsigned()
-        return synthetic_lookup(valobj.GetChildAtIndex(discriminant), dict)
-    if rust_type == RustType.SINGLETON_ENUM:
-        return synthetic_lookup(valobj.GetChildAtIndex(0), dict)
-    if rust_type == RustType.ENUM:
-        return ClangEncodedEnumProvider(valobj, dict)
-    if rust_type == RustType.STD_VEC:
-        return StdVecSyntheticProvider(valobj, dict)
-    if rust_type == RustType.STD_VEC_DEQUE:
-        return StdVecDequeSyntheticProvider(valobj, dict)
-    if rust_type == RustType.STD_SLICE or rust_type == RustType.STD_STR:
-        return StdSliceSyntheticProvider(valobj, dict)
+        return synthetic_lookup(valobj.GetChildAtIndex(discriminant), _dict)
+    if rust_type == RustType.SingletonEnum:
+        return synthetic_lookup(valobj.GetChildAtIndex(0), _dict)
+    if rust_type == RustType.Enum:
+        # this little trick lets us treat `synthetic_lookup` as a "recognizer function" for the enum
+        # summary providers, reducing the number of lookups we have to do. This is a huge time save
+        # because there's no way (via type name) to recognize sum-type enums on `*-gnu` targets. The
+        # alternative would be to shove every single type through `summary_lookup`, which is
+        # incredibly wasteful. Once these scripts are updated for LLDB 19.0 and we can use
+        # `--recognizer-function`, this hack will only be needed for backwards compatibility.
+        summary: lldb.SBTypeSummary = valobj.GetTypeSummary()
+        if (
+            summary.summary_data is None
+            or summary.summary_data.strip()
+            != "lldb_lookup.ClangEncodedEnumSummaryProvider(valobj,internal_dict)"
+        ):
+            rust_category: lldb.SBTypeCategory = lldb.debugger.GetCategory("Rust")
+            rust_category.AddTypeSummary(
+                lldb.SBTypeNameSpecifier(valobj.GetTypeName()),
+                lldb.SBTypeSummary().CreateWithFunctionName(
+                    "lldb_lookup.ClangEncodedEnumSummaryProvider"
+                ),
+            )
 
-    if rust_type == RustType.STD_HASH_MAP:
-        if is_hashbrown_hashmap(valobj):
-            return StdHashMapSyntheticProvider(valobj, dict)
-        else:
-            return StdOldHashMapSyntheticProvider(valobj, dict)
-    if rust_type == RustType.STD_HASH_SET:
-        hash_map = valobj.GetChildAtIndex(0)
-        if is_hashbrown_hashmap(hash_map):
-            return StdHashMapSyntheticProvider(valobj, dict, show_values=False)
-        else:
-            return StdOldHashMapSyntheticProvider(hash_map, dict, show_values=False)
+        return ClangEncodedEnumProvider(valobj, _dict)
+    if rust_type == RustType.Indirection:
+        return IndirectionSyntheticProvider(valobj, _dict)
 
-    if rust_type == RustType.STD_RC:
-        return StdRcSyntheticProvider(valobj, dict)
-    if rust_type == RustType.STD_ARC:
-        return StdRcSyntheticProvider(valobj, dict, is_atomic=True)
-
-    if rust_type == RustType.STD_CELL:
-        return StdCellSyntheticProvider(valobj, dict)
-    if rust_type == RustType.STD_REF:
-        return StdRefSyntheticProvider(valobj, dict)
-    if rust_type == RustType.STD_REF_MUT:
-        return StdRefSyntheticProvider(valobj, dict)
-    if rust_type == RustType.STD_REF_CELL:
-        return StdRefSyntheticProvider(valobj, dict, is_cell=True)
-
-    return DefaultSyntheticProvider(valobj, dict)
+    return DefaultSyntheticProvider(valobj, _dict)

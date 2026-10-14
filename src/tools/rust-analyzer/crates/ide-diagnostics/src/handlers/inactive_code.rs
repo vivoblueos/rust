@@ -33,15 +33,20 @@ pub(crate) fn inactive_code(
         message,
         ctx.sema.diagnostics_display_range(d.node),
     )
+    .stable()
     .with_unused(true);
     Some(res)
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::{tests::check_diagnostics_with_config, DiagnosticsConfig};
+    use ide_db::RootDatabase;
+    use test_fixture::WithFixture;
 
-    pub(crate) fn check(ra_fixture: &str) {
+    use crate::{DiagnosticCode, DiagnosticsConfig, tests::check_diagnostics_with_config};
+
+    #[track_caller]
+    pub(crate) fn check(#[rust_analyzer::rust_fixture] ra_fixture: &str) {
         let config = DiagnosticsConfig {
             disabled: std::iter::once("unlinked-file".to_owned()).collect(),
             ..DiagnosticsConfig::test_sample()
@@ -93,7 +98,7 @@ fn f() {
   //^^^^^^^^^^^^^^^^^^^^^^^^ weak: code is inactive due to #[cfg] directives: no is disabled
 
     #[cfg(no)] #[cfg(no2)] mod m;
-  //^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ weak: code is inactive due to #[cfg] directives: no and no2 are disabled
+  //^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ weak: code is inactive due to #[cfg] directives: no is disabled
 
     #[cfg(all(not(a), b))] enum E {}
   //^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ weak: code is inactive due to #[cfg] directives: b is disabled
@@ -128,7 +133,6 @@ trait Bar {
     /// Tests that `cfg` attributes behind `cfg_attr` is handled properly.
     #[test]
     fn inactive_via_cfg_attr() {
-        cov_mark::check!(cfg_attr_active);
         check(
             r#"
     #[cfg_attr(not(never), cfg(no))] fn f() {}
@@ -209,6 +213,43 @@ union FooBar {
 //^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ weak: code is inactive due to #[cfg] directives: true is enabled
 
 "#,
+        );
+    }
+
+    #[test]
+    fn inactive_crate() {
+        let db = RootDatabase::with_files(
+            r#"
+#![cfg(false)]
+
+fn foo() {}
+        "#,
+        );
+        let file_id = db.test_crate().root_file_id(&db);
+        let diagnostics = hir::attach_db(&db, || {
+            crate::full_diagnostics(
+                &db,
+                &DiagnosticsConfig::test_sample(),
+                &ide_db::assists::AssistResolveStrategy::All,
+                file_id.file_id(&db),
+            )
+        });
+        let [inactive_code] = &*diagnostics else {
+            panic!("expected one inactive_code diagnostic, found {diagnostics:#?}");
+        };
+        assert_eq!(
+            inactive_code.code,
+            DiagnosticCode::Ra("inactive-code", ide_db::Severity::WeakWarning)
+        );
+        assert_eq!(
+            inactive_code.message,
+            "code is inactive due to #[cfg] directives: false is disabled",
+        );
+        assert!(inactive_code.fixes.is_none());
+        let full_file_range = file_id.parse(&db).syntax_node().text_range();
+        assert_eq!(
+            inactive_code.range,
+            ide_db::FileRange { file_id: file_id.file_id(&db), range: full_file_range },
         );
     }
 }

@@ -142,13 +142,13 @@ pub(super) fn symbols(input: TokenStream) -> TokenStream {
     output
 }
 
-struct Preinterned {
+struct Predefined {
     idx: u32,
     span_of_name: Span,
 }
 
 struct Entries {
-    map: HashMap<String, Preinterned>,
+    map: HashMap<String, Predefined>,
 }
 
 impl Entries {
@@ -156,14 +156,14 @@ impl Entries {
         Entries { map: HashMap::with_capacity(capacity) }
     }
 
-    fn insert(&mut self, span: Span, str: &str, errors: &mut Errors) -> u32 {
-        if let Some(prev) = self.map.get(str) {
-            errors.error(span, format!("Symbol `{str}` is duplicated"));
+    fn insert(&mut self, span: Span, s: &str, errors: &mut Errors) -> u32 {
+        if let Some(prev) = self.map.get(s) {
+            errors.error(span, format!("Symbol `{s}` is duplicated"));
             errors.error(prev.span_of_name, "location of previous definition".to_string());
             prev.idx
         } else {
             let idx = self.len();
-            self.map.insert(str.to_string(), Preinterned { idx, span_of_name: span });
+            self.map.insert(s.to_string(), Predefined { idx, span_of_name: span });
             idx
         }
     }
@@ -189,18 +189,14 @@ fn symbols_with_errors(input: TokenStream) -> (TokenStream, Vec<syn::Error>) {
     let mut keyword_stream = quote! {};
     let mut symbols_stream = quote! {};
     let mut prefill_stream = quote! {};
-    let mut entries = Entries::with_capacity(input.keywords.len() + input.symbols.len() + 10);
-    let mut prev_key: Option<(Span, String)> = None;
-
-    let mut check_order = |span: Span, str: &str, errors: &mut Errors| {
-        if let Some((prev_span, ref prev_str)) = prev_key {
-            if str < prev_str {
-                errors.error(span, format!("Symbol `{str}` must precede `{prev_str}`"));
-                errors.error(prev_span, format!("location of previous symbol `{prev_str}`"));
-            }
-        }
-        prev_key = Some((span, str.to_string()));
-    };
+    let prefill_ints = 0..=9;
+    let prefill_letters = ('A'..='Z').chain('a'..='z');
+    let mut entries = Entries::with_capacity(
+        input.keywords.len()
+            + input.symbols.len()
+            + prefill_ints.clone().count()
+            + prefill_letters.clone().count(),
+    );
 
     // Generate the listed keywords.
     for keyword in input.keywords.iter() {
@@ -219,7 +215,6 @@ fn symbols_with_errors(input: TokenStream) -> (TokenStream, Vec<syn::Error>) {
     // Generate the listed symbols.
     for symbol in input.symbols.iter() {
         let name = &symbol.name;
-        check_order(symbol.name.span(), &name.to_string(), &mut errors);
 
         let value = match &symbol.value {
             Value::SameAsName => name.to_string(),
@@ -246,12 +241,11 @@ fn symbols_with_errors(input: TokenStream) -> (TokenStream, Vec<syn::Error>) {
         });
     }
 
-    // Generate symbols for the strings "0", "1", ..., "9".
-    for n in 0..10 {
-        let n = n.to_string();
-        entries.insert(Span::call_site(), &n, &mut errors);
+    // Generate symbols for ascii letters and digits
+    for s in prefill_ints.map(|n| n.to_string()).chain(prefill_letters.map(|c| c.to_string())) {
+        entries.insert(Span::call_site(), &s, &mut errors);
         prefill_stream.extend(quote! {
-            #n,
+            #s,
         });
     }
 
@@ -271,7 +265,9 @@ fn symbols_with_errors(input: TokenStream) -> (TokenStream, Vec<syn::Error>) {
             break;
         }
 
-        let value = match proc_macro::tracked_env::var(env_var.value()) {
+        let tracked_env = proc_macro::tracked::env_var(env_var.value());
+
+        let value = match tracked_env {
             Ok(value) => value,
             Err(err) => {
                 errors.list.push(syn::Error::new_spanned(expr, err));
@@ -295,10 +291,18 @@ fn symbols_with_errors(input: TokenStream) -> (TokenStream, Vec<syn::Error>) {
     }
 
     let symbol_digits_base = entries.map["0"].idx;
-    let preinterned_symbols_count = entries.len();
+    let symbol_uppercase_letters_base = entries.map["A"].idx;
+    let symbol_lowercase_letters_base = entries.map["a"].idx;
+    let predefined_symbols_count = entries.len();
     let output = quote! {
         const SYMBOL_DIGITS_BASE: u32 = #symbol_digits_base;
-        const PREINTERNED_SYMBOLS_COUNT: u32 = #preinterned_symbols_count;
+        const SYMBOL_UPPERCASE_LETTERS_BASE: u32 = #symbol_uppercase_letters_base;
+        const SYMBOL_LOWERCASE_LETTERS_BASE: u32 = #symbol_lowercase_letters_base;
+
+        /// The number of predefined symbols; this is the first index for
+        /// extra pre-interned symbols in an Interner created via
+        /// [`Interner::with_extra_symbols`].
+        pub const PREDEFINED_SYMBOLS_COUNT: u32 = #predefined_symbols_count;
 
         #[doc(hidden)]
         #[allow(non_upper_case_globals)]
@@ -315,10 +319,13 @@ fn symbols_with_errors(input: TokenStream) -> (TokenStream, Vec<syn::Error>) {
         }
 
         impl Interner {
-            pub(crate) fn fresh() -> Self {
-                Interner::prefill(&[
-                    #prefill_stream
-                ])
+            /// Creates an `Interner` with the predefined symbols from the `symbols!` macro and
+            /// any extra symbols provided by external drivers such as Clippy
+            pub(crate) fn with_extra_symbols(extra_symbols: &[&'static str]) -> Self {
+                Interner::prefill(
+                    &[#prefill_stream],
+                    extra_symbols,
+                )
             }
         }
     };

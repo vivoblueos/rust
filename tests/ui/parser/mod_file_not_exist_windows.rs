@@ -5,5 +5,6 @@ mod not_a_real_file; //~ ERROR file not found for module `not_a_real_file`
 
 fn main() {
     assert_eq!(mod_file_aux::bar(), 10);
-    //~^ ERROR failed to resolve: use of undeclared crate or module `mod_file_aux`
+    //~^ ERROR cannot find module or crate `mod_file_aux` in this scope
+    //~| HELP you might be missing a crate named `mod_file_aux`
 }

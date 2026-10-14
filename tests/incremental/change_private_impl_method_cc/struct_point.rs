@@ -5,10 +5,10 @@
 //@ compile-flags: -Z query-dep-graph
 //@ aux-build:point.rs
 //@ build-pass (FIXME(62277): could be check-pass?)
+//@ ignore-backends: gcc
 
 #![crate_type = "rlib"]
 #![feature(rustc_attrs)]
-#![feature(stmt_expr_attributes)]
 #![allow(dead_code)]
 
 #![rustc_partition_reused(module="struct_point-fn_read_field", cfg="cfail2")]

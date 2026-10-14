@@ -58,6 +58,7 @@ sanitizers = true
 rpath = true
 
 [rust]
+lld = true
 omit-git-hash = false
 deny-warnings = false
 strip = true

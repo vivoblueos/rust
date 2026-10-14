@@ -13,7 +13,8 @@ use ui_test::custom_flags::edition::Edition;
 use ui_test::dependencies::DependencyBuilder;
 use ui_test::per_test_config::TestConfig;
 use ui_test::spanned::Spanned;
-use ui_test::{CommandBuilder, Config, Format, Match, OutputConflictHandling, status_emitter};
+use ui_test::status_emitter::StatusEmitter;
+use ui_test::{CommandBuilder, Config, Match, ignore_output_conflict};
 
 #[derive(Copy, Clone, Debug)]
 enum Mode {
@@ -26,31 +27,22 @@ enum Mode {
 }
 
 fn miri_path() -> PathBuf {
-    PathBuf::from(env::var("MIRI").unwrap_or_else(|_| env!("CARGO_BIN_EXE_miri").into()))
-}
-
-fn get_host() -> String {
-    rustc_version::VersionMeta::for_command(std::process::Command::new(miri_path()))
-        .expect("failed to parse rustc version info")
-        .host
-}
-
-pub fn flagsplit(flags: &str) -> Vec<String> {
-    // This code is taken from `RUSTFLAGS` handling in cargo.
-    flags.split(' ').map(str::trim).filter(|s| !s.is_empty()).map(str::to_string).collect()
+    env!("CARGO_BIN_EXE_miri").into()
 }
 
 // Build the shared object file for testing native function calls.
-fn build_native_lib() -> PathBuf {
-    let cc = env::var("CC").unwrap_or_else(|_| "cc".into());
+fn build_native_lib(target: &str) -> PathBuf {
+    // Loosely follow the logic of the `cc` crate for finding the compiler.
+    let cc = env::var(format!("CC_{target}"))
+        .or_else(|_| env::var("CC"))
+        .unwrap_or_else(|_| "cc".into());
     // Target directory that we can write to.
-    let so_target_dir =
-        Path::new(&env::var_os("CARGO_TARGET_DIR").unwrap()).join("miri-native-lib");
+    let so_target_dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("miri-native-lib");
     // Create the directory if it does not already exist.
     std::fs::create_dir_all(&so_target_dir)
         .expect("Failed to create directory for shared object file");
     // We use a platform-neutral file extension to avoid having to hard-code alternatives.
-    let native_lib_path = so_target_dir.join("native-lib.module");
+    let native_lib_path = so_target_dir.join("native-lib-tests.so");
     let cc_output = Command::new(cc)
         .args([
             "-shared",
@@ -63,7 +55,10 @@ fn build_native_lib() -> PathBuf {
             native_lib_path.to_str().unwrap(),
             // FIXME: Automate gathering of all relevant C source files in the directory.
             "tests/native-lib/scalar_arguments.c",
+            "tests/native-lib/aggregate_arguments.c",
             "tests/native-lib/ptr_read_access.c",
+            "tests/native-lib/ptr_write_access.c",
+            "tests/native-lib/fn_ptr.c",
             // Ensure we notice serious problems in the C code.
             "-Wall",
             "-Wextra",
@@ -81,9 +76,18 @@ fn build_native_lib() -> PathBuf {
     native_lib_path
 }
 
+struct WithDependencies {
+    bless: bool,
+}
+
 /// Does *not* set any args or env vars, since it is shared between the test runner and
 /// run_dep_mode.
-fn miri_config(target: &str, path: &str, mode: Mode, with_dependencies: bool) -> Config {
+fn miri_config(
+    target: &str,
+    path: &str,
+    mode: Mode,
+    with_dependencies: Option<WithDependencies>,
+) -> Config {
     // Miri is rustc-like, so we create a default builder for rustc and modify it
     let mut program = CommandBuilder::rustc();
     program.program = miri_path();
@@ -91,7 +95,9 @@ fn miri_config(target: &str, path: &str, mode: Mode, with_dependencies: bool) ->
     let mut config = Config {
         target: Some(target.to_owned()),
         program,
-        out_dir: PathBuf::from(std::env::var_os("CARGO_TARGET_DIR").unwrap()).join("miri_ui"),
+        // When changing this, remember to also adjust the logic in bootstrap, in Miri's test step,
+        // that deletes the `miri_ui` dir when it needs a rebuild.
+        out_dir: PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("miri_ui"),
         threads: std::env::var("MIRI_TEST_THREADS")
             .ok()
             .map(|threads| NonZero::new(threads.parse().unwrap()).unwrap()),
@@ -118,22 +124,35 @@ fn miri_config(target: &str, path: &str, mode: Mode, with_dependencies: bool) ->
     // keep in sync with `./miri run`
     config.comment_defaults.base().add_custom("edition", Edition("2021".into()));
 
-    if with_dependencies {
-        config.comment_defaults.base().set_custom("dependencies", DependencyBuilder {
-            program: CommandBuilder {
-                // Set the `cargo-miri` binary, which we expect to be in the same folder as the `miri` binary.
-                // (It's a separate crate, so we don't get an env var from cargo.)
-                program: miri_path()
-                    .with_file_name(format!("cargo-miri{}", env::consts::EXE_SUFFIX)),
-                // There is no `cargo miri build` so we just use `cargo miri run`.
-                args: ["miri", "run"].into_iter().map(Into::into).collect(),
-                // Reset `RUSTFLAGS` to work around <https://github.com/rust-lang/rust/pull/119574#issuecomment-1876878344>.
-                envs: vec![("RUSTFLAGS".into(), None)],
-                ..CommandBuilder::cargo()
+    if let Some(WithDependencies { bless }) = with_dependencies {
+        config.comment_defaults.base().set_custom(
+            "dependencies",
+            DependencyBuilder {
+                program: CommandBuilder {
+                    // Set the `cargo-miri` binary, which we expect to be in the same folder as the `miri` binary.
+                    // (It's a separate crate, so we don't get an env var from cargo.)
+                    program: miri_path()
+                        .with_file_name(format!("cargo-miri{}", env::consts::EXE_SUFFIX)),
+                    // Add `-Zbinary-dep-depinfo` since it is needed for bootstrap builds (and doesn't harm otherwise).
+                    args: ["miri", "build", "-Zbinary-dep-depinfo"]
+                        .into_iter()
+                        .map(Into::into)
+                        .collect(),
+                    envs: vec![
+                        // Reset `RUSTFLAGS` to work around <https://github.com/rust-lang/rust/pull/119574#issuecomment-1876878344>.
+                        ("RUSTFLAGS".into(), None),
+                        // Reset `MIRIFLAGS` because it caused trouble in the past and should not be needed.
+                        ("MIRIFLAGS".into(), None),
+                        // Allow `cargo miri build`.
+                        ("MIRI_BUILD_TEST_DEPS".into(), Some("1".into())),
+                    ],
+                    ..CommandBuilder::cargo()
+                },
+                crate_manifest_path: Path::new("tests/deps").join("Cargo.toml"),
+                build_std: None,
+                bless_lockfile: bless,
             },
-            crate_manifest_path: Path::new("test_dependencies").join("Cargo.toml"),
-            build_std: None,
-        });
+        );
     }
     config
 }
@@ -145,7 +164,20 @@ fn run_tests(
     with_dependencies: bool,
     tmpdir: &Path,
 ) -> Result<()> {
+    // Handle command-line arguments.
+    let mut args = ui_test::Args::test()?;
+    args.bless |= env::var_os("RUSTC_BLESS").is_some_and(|v| v != "0");
+
+    let with_dependencies = with_dependencies.then_some(WithDependencies { bless: args.bless });
+
     let mut config = miri_config(target, path, mode, with_dependencies);
+    config.with_args(&args);
+    config.bless_command = Some("./miri test --bless".into());
+
+    if env::var_os("MIRI_SKIP_UI_CHECKS").is_some() {
+        assert!(!args.bless, "cannot use RUSTC_BLESS and MIRI_SKIP_UI_CHECKS at the same time");
+        config.output_conflict_handling = ignore_output_conflict;
+    }
 
     // Add a test env var to do environment communication tests.
     config.program.envs.push(("MIRI_ENV_VAR_TEST".into(), Some("0".into())));
@@ -175,22 +207,12 @@ fn run_tests(
     // If we're testing the native-lib functionality, then build the shared object file for testing
     // external C function calls and push the relevant compiler flag.
     if path.starts_with("tests/native-lib/") {
-        let native_lib = build_native_lib();
+        let native_lib = build_native_lib(target);
         let mut flag = std::ffi::OsString::from("-Zmiri-native-lib=");
         flag.push(native_lib.into_os_string());
         config.program.args.push(flag);
     }
 
-    // Handle command-line arguments.
-    let mut args = ui_test::Args::test()?;
-    args.bless |= env::var_os("RUSTC_BLESS").is_some_and(|v| v != "0");
-    config.with_args(&args);
-    config.bless_command = Some("./miri test --bless".into());
-
-    if env::var_os("MIRI_SKIP_UI_CHECKS").is_some() {
-        assert!(!args.bless, "cannot use RUSTC_BLESS and MIRI_SKIP_UI_CHECKS at the same time");
-        config.output_conflict_handling = OutputConflictHandling::Ignore;
-    }
     eprintln!("   Compiler: {}", config.program.display());
     ui_test::run_tests_generic(
         // Only run one test suite. In the future we can add all test suites to one `Vec` and run
@@ -200,15 +222,8 @@ fn run_tests(
         ui_test::default_file_filter,
         // This could be used to overwrite the `Config` on a per-test basis.
         |_, _| {},
-        (
-            match args.format {
-                Format::Terse => status_emitter::Text::quiet(),
-                Format::Pretty => status_emitter::Text::verbose(),
-            },
-            status_emitter::Gha::</* GHA Actions groups*/ false> {
-                name: format!("{mode:?} {path} ({target})"),
-            },
-        ),
+        // No GHA output as that would also show in the main rustc repo.
+        Box::<dyn StatusEmitter>::from(args.format),
     )
 }
 
@@ -239,14 +254,13 @@ regexes! {
     // erase alloc ids
     "alloc[0-9]+"                    => "ALLOC",
     // erase thread ids
-    r"unnamed-[0-9]+"               => "unnamed-ID",
+    r"unnamed-[0-9]+"                => "unnamed-ID",
+    r"thread '(?P<name>.*?)' \(\d+\) panicked" => "thread '$name' ($$TID) panicked",
     // erase borrow tags
     "<[0-9]+>"                       => "<TAG>",
     "<[0-9]+="                       => "<TAG=",
     // normalize width of Tree Borrows diagnostic borders (which otherwise leak borrow tag info)
     "(─{50})─+"                      => "$1",
-    // erase whitespace that differs between platforms
-    r" +at (.*\.rs)"                 => " at $1",
     // erase generics in backtraces
     "([0-9]+: .*)::<.*>"             => "$1",
     // erase long hexadecimals
@@ -257,15 +271,17 @@ regexes! {
     // erase thread caller ids
     r"call [0-9]+"                  => "call ID",
     // erase platform module paths
-    "sys::pal::[a-z]+::"                  => "sys::pal::PLATFORM::",
+    r"\bsys::([a-z_]+)::[a-z]+::"   => "sys::$1::PLATFORM::",
     // Windows file paths
     r"\\"                           => "/",
     // erase Rust stdlib path
     "[^ \n`]*/(rust[^/]*|checkout)/library/" => "RUSTLIB/",
     // erase platform file paths
-    "sys/pal/[a-z]+/"                    => "sys/pal/PLATFORM/",
+    r"\bsys/([a-z_]+)/[a-z]+\b"     => "sys/$1/PLATFORM",
     // erase paths into the crate registry
     r"[^ ]*/\.?cargo/registry/.*/(.*\.rs)"  => "CARGO_REGISTRY/.../$1",
+    // remove time print from GenMC estimation mode output.
+    "\nExpected verification time: .* ± .*" => "\nExpected verification time: [MEAN] ± [SD]",
 }
 
 enum Dependencies {
@@ -293,23 +309,30 @@ fn ui(
         .with_context(|| format!("ui tests in {path} for {target} failed"))
 }
 
-fn get_target() -> String {
-    env::var("MIRI_TEST_TARGET").ok().unwrap_or_else(get_host)
+fn get_host() -> String {
+    rustc_version::VersionMeta::for_command(std::process::Command::new(miri_path()))
+        .expect("failed to parse rustc version info")
+        .host
+}
+
+fn get_target(host: &str) -> String {
+    env::var("MIRI_TEST_TARGET").ok().unwrap_or_else(|| host.to_owned())
 }
 
 fn main() -> Result<()> {
     ui_test::color_eyre::install()?;
 
-    let target = get_target();
+    let host = get_host();
+    let target = get_target(&host);
     let tmpdir = tempfile::Builder::new().prefix("miri-uitest-").tempdir()?;
 
     let mut args = std::env::args_os();
 
     // Skip the program name and check whether this is a `./miri run-dep` invocation
-    if let Some(first) = args.nth(1) {
-        if first == "--miri-run-dep-mode" {
-            return run_dep_mode(target, args);
-        }
+    if let Some(first) = args.nth(1)
+        && first == "--miri-run-dep-mode"
+    {
+        return run_dep_mode(target, args);
     }
 
     ui(Mode::Pass, "tests/pass", &target, WithoutDependencies, tmpdir.path())?;
@@ -317,27 +340,43 @@ fn main() -> Result<()> {
     ui(Mode::Panic, "tests/panic", &target, WithDependencies, tmpdir.path())?;
     ui(Mode::Fail, "tests/fail", &target, WithoutDependencies, tmpdir.path())?;
     ui(Mode::Fail, "tests/fail-dep", &target, WithDependencies, tmpdir.path())?;
-    if cfg!(unix) {
+    if cfg!(all(unix, feature = "native-lib")) && target == host {
         ui(Mode::Pass, "tests/native-lib/pass", &target, WithoutDependencies, tmpdir.path())?;
         ui(Mode::Fail, "tests/native-lib/fail", &target, WithoutDependencies, tmpdir.path())?;
+    }
+
+    // We only enable GenMC tests when the `genmc` feature is enabled, but also only on platforms we support:
+    // FIXME(genmc,cross-platform): Technically we do support cross-target execution as long as the
+    // target is also 64bit little-endian, so `host == target` is too strict.
+    if cfg!(all(
+        feature = "genmc",
+        target_os = "linux",
+        target_pointer_width = "64",
+        target_endian = "little"
+    )) && host == target
+    {
+        ui(Mode::Pass, "tests/genmc/pass", &target, WithDependencies, tmpdir.path())?;
+        ui(Mode::Fail, "tests/genmc/fail", &target, WithDependencies, tmpdir.path())?;
     }
 
     Ok(())
 }
 
 fn run_dep_mode(target: String, args: impl Iterator<Item = OsString>) -> Result<()> {
-    let mut config = miri_config(&target, "", Mode::RunDep, /* with dependencies */ true);
+    let mut config =
+        miri_config(&target, "", Mode::RunDep, Some(WithDependencies { bless: false }));
     config.comment_defaults.base().custom.remove("edition"); // `./miri` adds an `--edition` in `args`, so don't set it twice
     config.fill_host_and_target()?;
+    let dep_builder = BuildManager::one_off(config.clone());
+    // Only set these for the actual run, not the dep builder, so invalid flags do not fail
+    // the dependency build.
     config.program.args = args.collect();
+    let test_config = TestConfig::one_off_runner(config, PathBuf::new());
 
-    let test_config = TestConfig::one_off_runner(config.clone(), PathBuf::new());
-
-    let build_manager = BuildManager::one_off(config);
     let mut cmd = test_config.config.program.build(&test_config.config.out_dir);
     cmd.arg("--target").arg(test_config.config.target.as_ref().unwrap());
     // Build dependencies
-    test_config.apply_custom(&mut cmd, &build_manager).unwrap();
+    test_config.apply_custom(&mut cmd, &dep_builder).expect("failed to build dependencies");
 
     if cmd.spawn()?.wait()?.success() { Ok(()) } else { std::process::exit(1) }
 }

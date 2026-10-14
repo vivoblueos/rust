@@ -1,26 +1,31 @@
-#[allow(clippy::borrow_as_ptr)]
+#[allow(clippy::borrow_as_ptr, clippy::ptr_offset_by_literal)]
 fn main() {
     unsafe {
         let m = &mut () as *mut ();
         m.offset(0);
-        //~^ ERROR: offset calculation on zero-sized value
-        //~| NOTE: `#[deny(clippy::zst_offset)]` on by default
+        //~^ zst_offset
+
         m.wrapping_add(0);
-        //~^ ERROR: offset calculation on zero-sized value
+        //~^ zst_offset
+
         m.sub(0);
-        //~^ ERROR: offset calculation on zero-sized value
+        //~^ zst_offset
+
         m.wrapping_sub(0);
-        //~^ ERROR: offset calculation on zero-sized value
+        //~^ zst_offset
 
         let c = &() as *const ();
         c.offset(0);
-        //~^ ERROR: offset calculation on zero-sized value
+        //~^ zst_offset
+
         c.wrapping_add(0);
-        //~^ ERROR: offset calculation on zero-sized value
+        //~^ zst_offset
+
         c.sub(0);
-        //~^ ERROR: offset calculation on zero-sized value
+        //~^ zst_offset
+
         c.wrapping_sub(0);
-        //~^ ERROR: offset calculation on zero-sized value
+        //~^ zst_offset
 
         let sized = &1 as *const i32;
         sized.offset(0);

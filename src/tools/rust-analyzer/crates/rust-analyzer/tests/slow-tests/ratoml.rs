@@ -1,10 +1,10 @@
 use crate::support::{Project, Server};
 use crate::testdir::TestDir;
 use lsp_types::{
-    notification::{DidChangeTextDocument, DidOpenTextDocument, DidSaveTextDocument},
     DidChangeTextDocumentParams, DidOpenTextDocumentParams, DidSaveTextDocumentParams,
     TextDocumentContentChangeEvent, TextDocumentIdentifier, TextDocumentItem, Url,
     VersionedTextDocumentIdentifier,
+    notification::{DidChangeTextDocument, DidOpenTextDocument, DidSaveTextDocument},
 };
 use paths::Utf8PathBuf;
 
@@ -46,7 +46,7 @@ impl RatomlTest {
             project = project.with_config(client_config);
         }
 
-        let server = project.server().wait_until_workspace_is_loaded();
+        let server = project.server_with_lock(true).wait_until_workspace_is_loaded();
 
         let mut case = Self { urls: vec![], server, tmp_path };
         let urls = fixtures.iter().map(|fixture| case.fixture_path(fixture)).collect::<Vec<_>>();
@@ -72,7 +72,7 @@ impl RatomlTest {
         let mut spl = spl.into_iter();
         if let Some(first) = spl.next() {
             if first == "$$CONFIG_DIR$$" {
-                path = Config::user_config_path().unwrap().to_path_buf().into();
+                path = Config::user_config_dir_path().unwrap().into();
             } else {
                 path = path.join(first);
             }
@@ -82,11 +82,8 @@ impl RatomlTest {
         }
 
         Url::parse(
-            format!(
-                "file://{}",
-                path.into_string().to_owned().replace("C:\\", "/c:/").replace('\\', "/")
-            )
-            .as_str(),
+            format!("file://{}", path.into_string().replace("C:\\", "/c:/").replace('\\', "/"))
+                .as_str(),
         )
         .unwrap()
     }
@@ -285,7 +282,6 @@ enum Value {
 //     }
 
 #[test]
-#[ignore = "the user config is currently not being watched on startup, fix this"]
 fn ratoml_user_config_detected() {
     if skip_slow_tests() {
         return;
@@ -294,7 +290,7 @@ fn ratoml_user_config_detected() {
     let server = RatomlTest::new(
         vec![
             r#"
-//- /$$CONFIG_DIR$$/rust-analyzer/rust-analyzer.toml
+//- /$$CONFIG_DIR$$/rust-analyzer.toml
 assist.emitMustUse = true
 "#,
             r#"
@@ -322,7 +318,6 @@ enum Value {
 }
 
 #[test]
-#[ignore = "the user config is currently not being watched on startup, fix this"]
 fn ratoml_create_user_config() {
     if skip_slow_tests() {
         return;
@@ -353,10 +348,7 @@ enum Value {
         1,
         InternalTestingFetchConfigResponse::AssistEmitMustUse(false),
     );
-    server.create(
-        "//- /$$CONFIG_DIR$$/rust-analyzer/rust-analyzer.toml",
-        RatomlTest::EMIT_MUST_USE.to_owned(),
-    );
+    server.create("//- /$$CONFIG_DIR$$/rust-analyzer.toml", RatomlTest::EMIT_MUST_USE.to_owned());
     server.query(
         InternalTestingFetchConfigOption::AssistEmitMustUse,
         1,
@@ -365,7 +357,6 @@ enum Value {
 }
 
 #[test]
-#[ignore = "the user config is currently not being watched on startup, fix this"]
 fn ratoml_modify_user_config() {
     if skip_slow_tests() {
         return;
@@ -386,7 +377,7 @@ enum Value {
     Text(String),
 }"#,
             r#"
-//- /$$CONFIG_DIR$$/rust-analyzer/rust-analyzer.toml
+//- /$$CONFIG_DIR$$/rust-analyzer.toml
 assist.emitMustUse = true"#,
         ],
         vec!["p1"],
@@ -407,7 +398,6 @@ assist.emitMustUse = true"#,
 }
 
 #[test]
-#[ignore = "the user config is currently not being watched on startup, fix this"]
 fn ratoml_delete_user_config() {
     if skip_slow_tests() {
         return;
@@ -428,7 +418,7 @@ enum Value {
     Text(String),
 }"#,
             r#"
-//- /$$CONFIG_DIR$$/rust-analyzer/rust-analyzer.toml
+//- /$$CONFIG_DIR$$/rust-analyzer.toml
 assist.emitMustUse = true"#,
         ],
         vec!["p1"],
@@ -449,6 +439,7 @@ assist.emitMustUse = true"#,
 }
 
 #[test]
+#[ignore = "flaky test that tends to hang"]
 fn ratoml_inherit_config_from_ws_root() {
     if skip_slow_tests() {
         return;
@@ -1015,5 +1006,47 @@ fn main() {
         InternalTestingFetchConfigOption::CheckWorkspace,
         2,
         InternalTestingFetchConfigResponse::CheckWorkspace(true),
+    );
+}
+
+#[test]
+fn ratoml_virtual_workspace() {
+    if skip_slow_tests() {
+        return;
+    }
+
+    let server = RatomlTest::new(
+        vec![
+            r#"
+//- /p1/Cargo.toml
+[workspace]
+members = ["member"]
+"#,
+            r#"
+//- /p1/rust-analyzer.toml
+assist.emitMustUse = true
+"#,
+            r#"
+//- /p1/member/Cargo.toml
+[package]
+name = "member"
+version = "0.1.0"
+edition = "2021"
+"#,
+            r#"
+//- /p1/member/src/lib.rs
+pub fn add(left: usize, right: usize) -> usize {
+    left + right
+}
+"#,
+        ],
+        vec!["p1"],
+        None,
+    );
+
+    server.query(
+        InternalTestingFetchConfigOption::AssistEmitMustUse,
+        3,
+        InternalTestingFetchConfigResponse::AssistEmitMustUse(true),
     );
 }

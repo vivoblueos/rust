@@ -1,11 +1,11 @@
 use std::cell::UnsafeCell;
-use std::intrinsics::likely;
+use std::hint;
 use std::marker::PhantomData;
 use std::ops::{Deref, DerefMut};
 use std::ptr::NonNull;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 
-use crate::sync::{AtomicBool, DynSend, DynSync, ReadGuard, RwLock, WriteGuard};
+use crate::sync::{DynSend, DynSync, ReadGuard, RwLock, WriteGuard};
 
 /// A type which allows mutation using a lock until
 /// the value is frozen and can be accessed lock-free.
@@ -60,10 +60,11 @@ impl<T> FreezeLock<T> {
     /// Get the inner value if frozen.
     #[inline]
     pub fn get(&self) -> Option<&T> {
-        if likely(self.frozen.load(Ordering::Acquire)) {
+        if self.frozen.load(Ordering::Acquire) {
             // SAFETY: This is frozen so the data cannot be modified.
             unsafe { Some(&*self.data.get()) }
         } else {
+            hint::cold_path();
             None
         }
     }
@@ -88,7 +89,7 @@ impl<T> FreezeLock<T> {
     #[inline]
     #[track_caller]
     pub fn write(&self) -> FreezeWriteGuard<'_, T> {
-        self.try_write().expect("still mutable")
+        self.try_write().expect("data should not be frozen if we're still attempting to mutate it")
     }
 
     #[inline]

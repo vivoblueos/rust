@@ -39,13 +39,15 @@
 
 // Notably, `should_panic` is a `AttributeType::Normal` attribute that is checked separately.
 
+#![deny(unused_attributes)]
+
 struct Foo {
     #[should_panic::skip]
-    //~^ ERROR failed to resolve
+    //~^ ERROR cannot find
     pub field: u8,
 
     #[should_panic::a::b::c]
-    //~^ ERROR failed to resolve
+    //~^ ERROR cannot find
     pub field2: u8,
 }
 
@@ -53,6 +55,6 @@ fn foo() {}
 
 fn main() {
     #[deny::skip]
-    //~^ ERROR failed to resolve
+    //~^ ERROR cannot find
     foo();
 }

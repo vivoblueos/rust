@@ -4,6 +4,7 @@ mod tests;
 use hashbrown::hash_map as base;
 
 use self::Entry::*;
+use crate::alloc::{Allocator, Global};
 use crate::borrow::Borrow;
 use crate::collections::{TryReserveError, TryReserveErrorKind};
 use crate::error::Error;
@@ -135,6 +136,8 @@ use crate::ops::Index;
 /// ]);
 /// ```
 ///
+/// ## `Entry` API
+///
 /// `HashMap` implements an [`Entry` API](#method.entry), which allows
 /// for complex methods of getting, setting, updating and removing keys and
 /// their values:
@@ -166,6 +169,8 @@ use crate::ops::Index;
 /// // modify an entry before an insert with in-place mutation
 /// player_stats.entry("mana").and_modify(|mana| *mana += 200).or_insert(100);
 /// ```
+///
+/// ## Usage with custom key types
 ///
 /// The easiest way to use `HashMap` with a custom key type is to derive [`Eq`] and [`Hash`].
 /// We must also derive [`PartialEq`].
@@ -204,12 +209,48 @@ use crate::ops::Index;
 ///     println!("{viking:?} has {health} hp");
 /// }
 /// ```
+///
+/// # Usage in `const` and `static`
+///
+/// As explained above, `HashMap` is randomly seeded: each `HashMap` instance uses a different seed,
+/// which means that `HashMap::new` normally cannot be used in a `const` or `static` initializer.
+///
+/// However, if you need to use a `HashMap` in a `const` or `static` initializer while retaining
+/// random seed generation, you can wrap the `HashMap` in [`LazyLock`].
+///
+/// Alternatively, you can construct a `HashMap` in a `const` or `static` initializer using a different
+/// hasher that does not rely on a random seed. **Be aware that a `HashMap` created this way is not
+/// resistant to HashDoS attacks!**
+///
+/// [`LazyLock`]: crate::sync::LazyLock
+/// ```rust
+/// use std::collections::HashMap;
+/// use std::hash::{BuildHasherDefault, DefaultHasher};
+/// use std::sync::{LazyLock, Mutex};
+///
+/// // HashMaps with a fixed, non-random hasher
+/// const NONRANDOM_EMPTY_MAP: HashMap<String, Vec<i32>, BuildHasherDefault<DefaultHasher>> =
+///     HashMap::with_hasher(BuildHasherDefault::new());
+/// static NONRANDOM_MAP: Mutex<HashMap<String, Vec<i32>, BuildHasherDefault<DefaultHasher>>> =
+///     Mutex::new(HashMap::with_hasher(BuildHasherDefault::new()));
+///
+/// // HashMaps using LazyLock to retain random seeding
+/// const RANDOM_EMPTY_MAP: LazyLock<HashMap<String, Vec<i32>>> =
+///     LazyLock::new(HashMap::new);
+/// static RANDOM_MAP: LazyLock<Mutex<HashMap<String, Vec<i32>>>> =
+///     LazyLock::new(|| Mutex::new(HashMap::new()));
+/// ```
 
 #[cfg_attr(not(test), rustc_diagnostic_item = "HashMap")]
 #[stable(feature = "rust1", since = "1.0.0")]
 #[rustc_insignificant_dtor]
-pub struct HashMap<K, V, S = RandomState> {
-    base: base::HashMap<K, V, S>,
+pub struct HashMap<
+    K,
+    V,
+    S = RandomState,
+    #[unstable(feature = "allocator_api", issue = "32838")] A: Allocator = Global,
+> {
+    base: base::HashMap<K, V, S, A>,
 }
 
 impl<K, V> HashMap<K, V, RandomState> {
@@ -235,7 +276,7 @@ impl<K, V> HashMap<K, V, RandomState> {
     ///
     /// The hash map will be able to hold at least `capacity` elements without
     /// reallocating. This method is allowed to allocate for more elements than
-    /// `capacity`. If `capacity` is 0, the hash map will not allocate.
+    /// `capacity`. If `capacity` is zero, the hash map will not allocate.
     ///
     /// # Examples
     ///
@@ -251,6 +292,52 @@ impl<K, V> HashMap<K, V, RandomState> {
     }
 }
 
+impl<K, V, A: Allocator> HashMap<K, V, RandomState, A> {
+    /// Creates an empty `HashMap` using the given allocator.
+    ///
+    /// The hash map is initially created with a capacity of 0, so it will not allocate until it
+    /// is first inserted into.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # #![feature(allocator_api)]
+    /// use std::collections::HashMap;
+    /// use std::alloc::Global;
+    ///
+    /// let map: HashMap<i32, i32> = HashMap::new_in(Global);
+    /// ```
+    #[inline]
+    #[must_use]
+    #[unstable(feature = "allocator_api", issue = "32838")]
+    pub fn new_in(alloc: A) -> Self {
+        HashMap::with_hasher_in(Default::default(), alloc)
+    }
+
+    /// Creates an empty `HashMap` with at least the specified capacity using
+    /// the given allocator.
+    ///
+    /// The hash map will be able to hold at least `capacity` elements without
+    /// reallocating. This method is allowed to allocate for more elements than
+    /// `capacity`. If `capacity` is zero, the hash map will not allocate.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # #![feature(allocator_api)]
+    /// use std::collections::HashMap;
+    /// use std::alloc::Global;
+    ///
+    /// let map: HashMap<i32, i32> = HashMap::with_capacity_in(10, Global);
+    /// ```
+    #[inline]
+    #[must_use]
+    #[unstable(feature = "allocator_api", issue = "32838")]
+    pub fn with_capacity_in(capacity: usize, alloc: A) -> Self {
+        HashMap::with_capacity_and_hasher_in(capacity, Default::default(), alloc)
+    }
+}
+
 impl<K, V, S> HashMap<K, V, S> {
     /// Creates an empty `HashMap` which will use the given hash builder to hash
     /// keys.
@@ -263,7 +350,7 @@ impl<K, V, S> HashMap<K, V, S> {
     /// manually using this function can expose a DoS attack vector.
     ///
     /// The `hash_builder` passed should implement the [`BuildHasher`] trait for
-    /// the HashMap to be useful, see its documentation for details.
+    /// the `HashMap` to be useful, see its documentation for details.
     ///
     /// # Examples
     ///
@@ -276,8 +363,9 @@ impl<K, V, S> HashMap<K, V, S> {
     /// map.insert(1, 2);
     /// ```
     #[inline]
+    #[must_use]
     #[stable(feature = "hashmap_build_hasher", since = "1.7.0")]
-    #[rustc_const_unstable(feature = "const_collections_with_hasher", issue = "102575")]
+    #[rustc_const_stable(feature = "const_collections_with_hasher", since = "1.85.0")]
     pub const fn with_hasher(hash_builder: S) -> HashMap<K, V, S> {
         HashMap { base: base::HashMap::with_hasher(hash_builder) }
     }
@@ -287,7 +375,7 @@ impl<K, V, S> HashMap<K, V, S> {
     ///
     /// The hash map will be able to hold at least `capacity` elements without
     /// reallocating. This method is allowed to allocate for more elements than
-    /// `capacity`. If `capacity` is 0, the hash map will not allocate.
+    /// `capacity`. If `capacity` is zero, the hash map will not allocate.
     ///
     /// Warning: `hasher` is normally randomly generated, and
     /// is designed to allow HashMaps to be resistant to attacks that
@@ -295,7 +383,7 @@ impl<K, V, S> HashMap<K, V, S> {
     /// manually using this function can expose a DoS attack vector.
     ///
     /// The `hasher` passed should implement the [`BuildHasher`] trait for
-    /// the HashMap to be useful, see its documentation for details.
+    /// the `HashMap` to be useful, see its documentation for details.
     ///
     /// # Examples
     ///
@@ -308,9 +396,76 @@ impl<K, V, S> HashMap<K, V, S> {
     /// map.insert(1, 2);
     /// ```
     #[inline]
+    #[must_use]
     #[stable(feature = "hashmap_build_hasher", since = "1.7.0")]
     pub fn with_capacity_and_hasher(capacity: usize, hasher: S) -> HashMap<K, V, S> {
         HashMap { base: base::HashMap::with_capacity_and_hasher(capacity, hasher) }
+    }
+}
+
+impl<K, V, S, A: Allocator> HashMap<K, V, S, A> {
+    /// Creates an empty `HashMap` which will use the given hash builder and
+    /// allocator.
+    ///
+    /// The created map has the default initial capacity.
+    ///
+    /// Warning: `hash_builder` is normally randomly generated, and
+    /// is designed to allow HashMaps to be resistant to attacks that
+    /// cause many collisions and very poor performance. Setting it
+    /// manually using this function can expose a DoS attack vector.
+    ///
+    /// The `hash_builder` passed should implement the [`BuildHasher`] trait for
+    /// the `HashMap` to be useful, see its documentation for details.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// #![feature(allocator_api)]
+    /// use std::alloc::Global;
+    /// use std::collections::HashMap;
+    /// use std::hash::RandomState;
+    ///
+    /// let s = RandomState::new();
+    /// let map: HashMap<i32, i32> = HashMap::with_hasher_in(s, Global);
+    /// ```
+    #[inline]
+    #[must_use]
+    #[unstable(feature = "allocator_api", issue = "32838")]
+    pub fn with_hasher_in(hash_builder: S, alloc: A) -> Self {
+        HashMap { base: base::HashMap::with_hasher_in(hash_builder, alloc) }
+    }
+
+    /// Creates an empty `HashMap` with at least the specified capacity, using
+    /// `hasher` to hash the keys and `alloc` to allocate memory.
+    ///
+    /// The hash map will be able to hold at least `capacity` elements without
+    /// reallocating. This method is allowed to allocate for more elements than
+    /// `capacity`. If `capacity` is zero, the hash map will not allocate.
+    ///
+    /// Warning: `hasher` is normally randomly generated, and
+    /// is designed to allow HashMaps to be resistant to attacks that
+    /// cause many collisions and very poor performance. Setting it
+    /// manually using this function can expose a DoS attack vector.
+    ///
+    /// The `hasher` passed should implement the [`BuildHasher`] trait for
+    /// the `HashMap` to be useful, see its documentation for details.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// #![feature(allocator_api)]
+    /// use std::alloc::Global;
+    /// use std::collections::HashMap;
+    /// use std::hash::RandomState;
+    ///
+    /// let s = RandomState::new();
+    /// let map: HashMap<i32, i32> = HashMap::with_capacity_and_hasher_in(10, s, Global);
+    /// ```
+    #[inline]
+    #[must_use]
+    #[unstable(feature = "allocator_api", issue = "32838")]
+    pub fn with_capacity_and_hasher_in(capacity: usize, hash_builder: S, alloc: A) -> Self {
+        HashMap { base: base::HashMap::with_capacity_and_hasher_in(capacity, hash_builder, alloc) }
     }
 
     /// Returns the number of elements the map can hold without reallocating.
@@ -389,7 +544,7 @@ impl<K, V, S> HashMap<K, V, S> {
     #[inline]
     #[rustc_lint_query_instability]
     #[stable(feature = "map_into_keys_values", since = "1.54.0")]
-    pub fn into_keys(self) -> IntoKeys<K, V> {
+    pub fn into_keys(self) -> IntoKeys<K, V, A> {
         IntoKeys { inner: self.into_iter() }
     }
 
@@ -484,7 +639,7 @@ impl<K, V, S> HashMap<K, V, S> {
     #[inline]
     #[rustc_lint_query_instability]
     #[stable(feature = "map_into_keys_values", since = "1.54.0")]
-    pub fn into_values(self) -> IntoValues<K, V> {
+    pub fn into_values(self) -> IntoValues<K, V, A> {
         IntoValues { inner: self.into_iter() }
     }
 
@@ -613,18 +768,18 @@ impl<K, V, S> HashMap<K, V, S> {
     #[inline]
     #[rustc_lint_query_instability]
     #[stable(feature = "drain", since = "1.6.0")]
-    pub fn drain(&mut self) -> Drain<'_, K, V> {
+    pub fn drain(&mut self) -> Drain<'_, K, V, A> {
         Drain { base: self.base.drain() }
     }
 
-    /// Creates an iterator which uses a closure to determine if an element should be removed.
+    /// Creates an iterator which uses a closure to determine if an element (key-value pair) should be removed.
     ///
-    /// If the closure returns true, the element is removed from the map and yielded.
-    /// If the closure returns false, or panics, the element remains in the map and will not be
-    /// yielded.
+    /// If the closure returns `true`, the element is removed from the map and
+    /// yielded. If the closure returns `false`, or panics, the element remains
+    /// in the map and will not be yielded.
     ///
-    /// Note that `extract_if` lets you mutate every value in the filter closure, regardless of
-    /// whether you choose to keep or remove it.
+    /// The iterator also lets you mutate the value of each element in the
+    /// closure, regardless of whether you choose to keep or remove it.
     ///
     /// If the returned `ExtractIf` is not exhausted, e.g. because it is dropped without iterating
     /// or the iteration short-circuits, then the remaining elements will be retained.
@@ -637,7 +792,6 @@ impl<K, V, S> HashMap<K, V, S> {
     /// Splitting a map into even and odd keys, reusing the original map:
     ///
     /// ```
-    /// #![feature(hash_extract_if)]
     /// use std::collections::HashMap;
     ///
     /// let mut map: HashMap<i32, i32> = (0..8).map(|x| (x, x)).collect();
@@ -653,8 +807,8 @@ impl<K, V, S> HashMap<K, V, S> {
     /// ```
     #[inline]
     #[rustc_lint_query_instability]
-    #[unstable(feature = "hash_extract_if", issue = "59618")]
-    pub fn extract_if<F>(&mut self, pred: F) -> ExtractIf<'_, K, V, F>
+    #[stable(feature = "hash_extract_if", since = "1.88.0")]
+    pub fn extract_if<F>(&mut self, pred: F) -> ExtractIf<'_, K, V, F, A>
     where
         F: FnMut(&K, &mut V) -> bool,
     {
@@ -728,10 +882,11 @@ impl<K, V, S> HashMap<K, V, S> {
     }
 }
 
-impl<K, V, S> HashMap<K, V, S>
+impl<K, V, S, A> HashMap<K, V, S, A>
 where
     K: Eq + Hash,
     S: BuildHasher,
+    A: Allocator,
 {
     /// Reserves capacity for at least `additional` more elements to be inserted
     /// in the `HashMap`. The collection may reserve more space to speculatively
@@ -850,7 +1005,7 @@ where
     /// ```
     #[inline]
     #[stable(feature = "rust1", since = "1.0.0")]
-    pub fn entry(&mut self, key: K) -> Entry<'_, K, V> {
+    pub fn entry(&mut self, key: K) -> Entry<'_, K, V, A> {
         map_entry(self.base.rustc_entry(key))
     }
 
@@ -943,6 +1098,9 @@ where
     /// Returns an array of length `N` with the results of each query. For soundness, at most one
     /// mutable reference will be returned to any value. `None` will be used if the key is missing.
     ///
+    /// This method performs a check to ensure there are no duplicate keys, which currently has a time-complexity of O(n^2),
+    /// so be careful when passing many keys.
+    ///
     /// # Panics
     ///
     /// Panics if any keys are overlapping.
@@ -950,7 +1108,6 @@ where
     /// # Examples
     ///
     /// ```
-    /// #![feature(map_many_mut)]
     /// use std::collections::HashMap;
     ///
     /// let mut libraries = HashMap::new();
@@ -960,13 +1117,13 @@ where
     /// libraries.insert("Library of Congress".to_string(), 1800);
     ///
     /// // Get Athenæum and Bodleian Library
-    /// let [Some(a), Some(b)] = libraries.get_many_mut([
+    /// let [Some(a), Some(b)] = libraries.get_disjoint_mut([
     ///     "Athenæum",
     ///     "Bodleian Library",
     /// ]) else { panic!() };
     ///
     /// // Assert values of Athenæum and Library of Congress
-    /// let got = libraries.get_many_mut([
+    /// let got = libraries.get_disjoint_mut([
     ///     "Athenæum",
     ///     "Library of Congress",
     /// ]);
@@ -979,7 +1136,7 @@ where
     /// );
     ///
     /// // Missing keys result in None
-    /// let got = libraries.get_many_mut([
+    /// let got = libraries.get_disjoint_mut([
     ///     "Athenæum",
     ///     "New York Public Library",
     /// ]);
@@ -993,26 +1150,29 @@ where
     /// ```
     ///
     /// ```should_panic
-    /// #![feature(map_many_mut)]
     /// use std::collections::HashMap;
     ///
     /// let mut libraries = HashMap::new();
     /// libraries.insert("Athenæum".to_string(), 1807);
     ///
     /// // Duplicate keys panic!
-    /// let got = libraries.get_many_mut([
+    /// let got = libraries.get_disjoint_mut([
     ///     "Athenæum",
     ///     "Athenæum",
     /// ]);
     /// ```
     #[inline]
-    #[unstable(feature = "map_many_mut", issue = "97601")]
-    pub fn get_many_mut<Q: ?Sized, const N: usize>(&mut self, ks: [&Q; N]) -> [Option<&'_ mut V>; N]
+    #[doc(alias = "get_many_mut")]
+    #[stable(feature = "map_many_mut", since = "1.86.0")]
+    pub fn get_disjoint_mut<Q: ?Sized, const N: usize>(
+        &mut self,
+        ks: [&Q; N],
+    ) -> [Option<&'_ mut V>; N]
     where
         K: Borrow<Q>,
         Q: Hash + Eq,
     {
-        self.base.get_many_mut(ks)
+        self.base.get_disjoint_mut(ks)
     }
 
     /// Attempts to get mutable references to `N` values in the map at once, without validating that
@@ -1021,7 +1181,7 @@ where
     /// Returns an array of length `N` with the results of each query. `None` will be used if
     /// the key is missing.
     ///
-    /// For a safe alternative see [`get_many_mut`](`HashMap::get_many_mut`).
+    /// For a safe alternative see [`get_disjoint_mut`](`HashMap::get_disjoint_mut`).
     ///
     /// # Safety
     ///
@@ -1033,7 +1193,6 @@ where
     /// # Examples
     ///
     /// ```
-    /// #![feature(map_many_mut)]
     /// use std::collections::HashMap;
     ///
     /// let mut libraries = HashMap::new();
@@ -1043,13 +1202,13 @@ where
     /// libraries.insert("Library of Congress".to_string(), 1800);
     ///
     /// // SAFETY: The keys do not overlap.
-    /// let [Some(a), Some(b)] = (unsafe { libraries.get_many_unchecked_mut([
+    /// let [Some(a), Some(b)] = (unsafe { libraries.get_disjoint_unchecked_mut([
     ///     "Athenæum",
     ///     "Bodleian Library",
     /// ]) }) else { panic!() };
     ///
     /// // SAFETY: The keys do not overlap.
-    /// let got = unsafe { libraries.get_many_unchecked_mut([
+    /// let got = unsafe { libraries.get_disjoint_unchecked_mut([
     ///     "Athenæum",
     ///     "Library of Congress",
     /// ]) };
@@ -1062,7 +1221,7 @@ where
     /// );
     ///
     /// // SAFETY: The keys do not overlap.
-    /// let got = unsafe { libraries.get_many_unchecked_mut([
+    /// let got = unsafe { libraries.get_disjoint_unchecked_mut([
     ///     "Athenæum",
     ///     "New York Public Library",
     /// ]) };
@@ -1070,8 +1229,9 @@ where
     /// assert_eq!(got, [Some(&mut 1807), None]);
     /// ```
     #[inline]
-    #[unstable(feature = "map_many_mut", issue = "97601")]
-    pub unsafe fn get_many_unchecked_mut<Q: ?Sized, const N: usize>(
+    #[doc(alias = "get_many_unchecked_mut")]
+    #[stable(feature = "map_many_mut", since = "1.86.0")]
+    pub unsafe fn get_disjoint_unchecked_mut<Q: ?Sized, const N: usize>(
         &mut self,
         ks: [&Q; N],
     ) -> [Option<&'_ mut V>; N]
@@ -1079,7 +1239,7 @@ where
         K: Borrow<Q>,
         Q: Hash + Eq,
     {
-        unsafe { self.base.get_many_unchecked_mut(ks) }
+        unsafe { self.base.get_disjoint_unchecked_mut(ks) }
     }
 
     /// Returns `true` if the map contains a value for the specified key.
@@ -1193,7 +1353,7 @@ where
     /// assert_eq!(err.value, "b");
     /// ```
     #[unstable(feature = "map_try_insert", issue = "82766")]
-    pub fn try_insert(&mut self, key: K, value: V) -> Result<&mut V, OccupiedError<'_, K, V>> {
+    pub fn try_insert(&mut self, key: K, value: V) -> Result<&mut V, OccupiedError<'_, K, V, A>> {
         match self.entry(key) {
             Occupied(entry) => Err(OccupiedError { entry, value }),
             Vacant(entry) => Ok(entry.insert(value)),
@@ -1258,75 +1418,13 @@ where
     }
 }
 
-impl<K, V, S> HashMap<K, V, S>
-where
-    S: BuildHasher,
-{
-    /// Creates a raw entry builder for the HashMap.
-    ///
-    /// Raw entries provide the lowest level of control for searching and
-    /// manipulating a map. They must be manually initialized with a hash and
-    /// then manually searched. After this, insertions into a vacant entry
-    /// still require an owned key to be provided.
-    ///
-    /// Raw entries are useful for such exotic situations as:
-    ///
-    /// * Hash memoization
-    /// * Deferring the creation of an owned key until it is known to be required
-    /// * Using a search key that doesn't work with the Borrow trait
-    /// * Using custom comparison logic without newtype wrappers
-    ///
-    /// Because raw entries provide much more low-level control, it's much easier
-    /// to put the HashMap into an inconsistent state which, while memory-safe,
-    /// will cause the map to produce seemingly random results. Higher-level and
-    /// more foolproof APIs like `entry` should be preferred when possible.
-    ///
-    /// In particular, the hash used to initialize the raw entry must still be
-    /// consistent with the hash of the key that is ultimately stored in the entry.
-    /// This is because implementations of HashMap may need to recompute hashes
-    /// when resizing, at which point only the keys are available.
-    ///
-    /// Raw entries give mutable access to the keys. This must not be used
-    /// to modify how the key would compare or hash, as the map will not re-evaluate
-    /// where the key should go, meaning the keys may become "lost" if their
-    /// location does not reflect their state. For instance, if you change a key
-    /// so that the map now contains keys which compare equal, search may start
-    /// acting erratically, with two keys randomly masking each other. Implementations
-    /// are free to assume this doesn't happen (within the limits of memory-safety).
-    #[inline]
-    #[unstable(feature = "hash_raw_entry", issue = "56167")]
-    pub fn raw_entry_mut(&mut self) -> RawEntryBuilderMut<'_, K, V, S> {
-        RawEntryBuilderMut { map: self }
-    }
-
-    /// Creates a raw immutable entry builder for the HashMap.
-    ///
-    /// Raw entries provide the lowest level of control for searching and
-    /// manipulating a map. They must be manually initialized with a hash and
-    /// then manually searched.
-    ///
-    /// This is useful for
-    /// * Hash memoization
-    /// * Using a search key that doesn't work with the Borrow trait
-    /// * Using custom comparison logic without newtype wrappers
-    ///
-    /// Unless you are in such a situation, higher-level and more foolproof APIs like
-    /// `get` should be preferred.
-    ///
-    /// Immutable raw entries have very limited use; you might instead want `raw_entry_mut`.
-    #[inline]
-    #[unstable(feature = "hash_raw_entry", issue = "56167")]
-    pub fn raw_entry(&self) -> RawEntryBuilder<'_, K, V, S> {
-        RawEntryBuilder { map: self }
-    }
-}
-
 #[stable(feature = "rust1", since = "1.0.0")]
-impl<K, V, S> Clone for HashMap<K, V, S>
+impl<K, V, S, A> Clone for HashMap<K, V, S, A>
 where
     K: Clone,
     V: Clone,
     S: Clone,
+    A: Allocator + Clone,
 {
     #[inline]
     fn clone(&self) -> Self {
@@ -1340,13 +1438,14 @@ where
 }
 
 #[stable(feature = "rust1", since = "1.0.0")]
-impl<K, V, S> PartialEq for HashMap<K, V, S>
+impl<K, V, S, A> PartialEq for HashMap<K, V, S, A>
 where
     K: Eq + Hash,
     V: PartialEq,
     S: BuildHasher,
+    A: Allocator,
 {
-    fn eq(&self, other: &HashMap<K, V, S>) -> bool {
+    fn eq(&self, other: &HashMap<K, V, S, A>) -> bool {
         if self.len() != other.len() {
             return false;
         }
@@ -1356,19 +1455,21 @@ where
 }
 
 #[stable(feature = "rust1", since = "1.0.0")]
-impl<K, V, S> Eq for HashMap<K, V, S>
+impl<K, V, S, A> Eq for HashMap<K, V, S, A>
 where
     K: Eq + Hash,
     V: Eq,
     S: BuildHasher,
+    A: Allocator,
 {
 }
 
 #[stable(feature = "rust1", since = "1.0.0")]
-impl<K, V, S> Debug for HashMap<K, V, S>
+impl<K, V, S, A> Debug for HashMap<K, V, S, A>
 where
     K: Debug,
     V: Debug,
+    A: Allocator,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_map().entries(self.iter()).finish()
@@ -1376,9 +1477,10 @@ where
 }
 
 #[stable(feature = "rust1", since = "1.0.0")]
-impl<K, V, S> Default for HashMap<K, V, S>
+#[rustc_const_unstable(feature = "const_default", issue = "143894")]
+impl<K, V, S> const Default for HashMap<K, V, S>
 where
-    S: Default,
+    S: [const] Default,
 {
     /// Creates an empty `HashMap<K, V, S>`, with the `Default` value for the hasher.
     #[inline]
@@ -1388,11 +1490,12 @@ where
 }
 
 #[stable(feature = "rust1", since = "1.0.0")]
-impl<K, Q: ?Sized, V, S> Index<&Q> for HashMap<K, V, S>
+impl<K, Q: ?Sized, V, S, A> Index<&Q> for HashMap<K, V, S, A>
 where
     K: Eq + Hash + Borrow<Q>,
     Q: Eq + Hash,
     S: BuildHasher,
+    A: Allocator,
 {
     type Output = V;
 
@@ -1424,6 +1527,11 @@ impl<K, V, const N: usize> From<[(K, V); N]> for HashMap<K, V, RandomState>
 where
     K: Eq + Hash,
 {
+    /// Converts a `[(K, V); N]` into a `HashMap<K, V>`.
+    ///
+    /// If any entries in the array have equal keys,
+    /// all but one of the corresponding values will be dropped.
+    ///
     /// # Examples
     ///
     /// ```
@@ -1542,11 +1650,15 @@ impl<K, V> Default for IterMut<'_, K, V> {
 /// let iter = map.into_iter();
 /// ```
 #[stable(feature = "rust1", since = "1.0.0")]
-pub struct IntoIter<K, V> {
-    base: base::IntoIter<K, V>,
+pub struct IntoIter<
+    K,
+    V,
+    #[unstable(feature = "allocator_api", issue = "32838")] A: Allocator = Global,
+> {
+    base: base::IntoIter<K, V, A>,
 }
 
-impl<K, V> IntoIter<K, V> {
+impl<K, V, A: Allocator> IntoIter<K, V, A> {
     /// Returns an iterator of references over the remaining items.
     #[inline]
     pub(super) fn iter(&self) -> Iter<'_, K, V> {
@@ -1675,11 +1787,16 @@ impl<K, V: Debug> fmt::Debug for Values<'_, K, V> {
 /// ```
 #[stable(feature = "drain", since = "1.6.0")]
 #[cfg_attr(not(test), rustc_diagnostic_item = "hashmap_drain_ty")]
-pub struct Drain<'a, K: 'a, V: 'a> {
-    base: base::Drain<'a, K, V>,
+pub struct Drain<
+    'a,
+    K: 'a,
+    V: 'a,
+    #[unstable(feature = "allocator_api", issue = "32838")] A: Allocator = Global,
+> {
+    base: base::Drain<'a, K, V, A>,
 }
 
-impl<'a, K, V> Drain<'a, K, V> {
+impl<'a, K, V, A: Allocator> Drain<'a, K, V, A> {
     /// Returns an iterator of references over the remaining items.
     #[inline]
     pub(super) fn iter(&self) -> Iter<'_, K, V> {
@@ -1696,8 +1813,6 @@ impl<'a, K, V> Drain<'a, K, V> {
 /// # Example
 ///
 /// ```
-/// #![feature(hash_extract_if)]
-///
 /// use std::collections::HashMap;
 ///
 /// let mut map = HashMap::from([
@@ -1705,13 +1820,17 @@ impl<'a, K, V> Drain<'a, K, V> {
 /// ]);
 /// let iter = map.extract_if(|_k, v| *v % 2 == 0);
 /// ```
-#[unstable(feature = "hash_extract_if", issue = "59618")]
-#[must_use = "iterators are lazy and do nothing unless consumed"]
-pub struct ExtractIf<'a, K, V, F>
-where
-    F: FnMut(&K, &mut V) -> bool,
-{
-    base: base::ExtractIf<'a, K, V, F>,
+#[stable(feature = "hash_extract_if", since = "1.88.0")]
+#[must_use = "iterators are lazy and do nothing unless consumed; \
+    use `retain` to remove and discard elements"]
+pub struct ExtractIf<
+    'a,
+    K,
+    V,
+    F,
+    #[unstable(feature = "allocator_api", issue = "32838")] A: Allocator = Global,
+> {
+    base: base::ExtractIf<'a, K, V, F, A>,
 }
 
 /// A mutable iterator over the values of a `HashMap`.
@@ -1763,8 +1882,12 @@ impl<K, V> Default for ValuesMut<'_, K, V> {
 /// let iter_keys = map.into_keys();
 /// ```
 #[stable(feature = "map_into_keys_values", since = "1.54.0")]
-pub struct IntoKeys<K, V> {
-    inner: IntoIter<K, V>,
+pub struct IntoKeys<
+    K,
+    V,
+    #[unstable(feature = "allocator_api", issue = "32838")] A: Allocator = Global,
+> {
+    inner: IntoIter<K, V, A>,
 }
 
 #[stable(feature = "default_iters_hash", since = "1.83.0")]
@@ -1793,8 +1916,12 @@ impl<K, V> Default for IntoKeys<K, V> {
 /// let iter_keys = map.into_values();
 /// ```
 #[stable(feature = "map_into_keys_values", since = "1.54.0")]
-pub struct IntoValues<K, V> {
-    inner: IntoIter<K, V>,
+pub struct IntoValues<
+    K,
+    V,
+    #[unstable(feature = "allocator_api", issue = "32838")] A: Allocator = Global,
+> {
+    inner: IntoIter<K, V, A>,
 }
 
 #[stable(feature = "default_iters_hash", since = "1.83.0")]
@@ -1805,404 +1932,6 @@ impl<K, V> Default for IntoValues<K, V> {
     }
 }
 
-/// A builder for computing where in a HashMap a key-value pair would be stored.
-///
-/// See the [`HashMap::raw_entry_mut`] docs for usage examples.
-#[unstable(feature = "hash_raw_entry", issue = "56167")]
-pub struct RawEntryBuilderMut<'a, K: 'a, V: 'a, S: 'a> {
-    map: &'a mut HashMap<K, V, S>,
-}
-
-/// A view into a single entry in a map, which may either be vacant or occupied.
-///
-/// This is a lower-level version of [`Entry`].
-///
-/// This `enum` is constructed through the [`raw_entry_mut`] method on [`HashMap`],
-/// then calling one of the methods of that [`RawEntryBuilderMut`].
-///
-/// [`raw_entry_mut`]: HashMap::raw_entry_mut
-#[unstable(feature = "hash_raw_entry", issue = "56167")]
-pub enum RawEntryMut<'a, K: 'a, V: 'a, S: 'a> {
-    /// An occupied entry.
-    Occupied(RawOccupiedEntryMut<'a, K, V, S>),
-    /// A vacant entry.
-    Vacant(RawVacantEntryMut<'a, K, V, S>),
-}
-
-/// A view into an occupied entry in a `HashMap`.
-/// It is part of the [`RawEntryMut`] enum.
-#[unstable(feature = "hash_raw_entry", issue = "56167")]
-pub struct RawOccupiedEntryMut<'a, K: 'a, V: 'a, S: 'a> {
-    base: base::RawOccupiedEntryMut<'a, K, V, S>,
-}
-
-/// A view into a vacant entry in a `HashMap`.
-/// It is part of the [`RawEntryMut`] enum.
-#[unstable(feature = "hash_raw_entry", issue = "56167")]
-pub struct RawVacantEntryMut<'a, K: 'a, V: 'a, S: 'a> {
-    base: base::RawVacantEntryMut<'a, K, V, S>,
-}
-
-/// A builder for computing where in a HashMap a key-value pair would be stored.
-///
-/// See the [`HashMap::raw_entry`] docs for usage examples.
-#[unstable(feature = "hash_raw_entry", issue = "56167")]
-pub struct RawEntryBuilder<'a, K: 'a, V: 'a, S: 'a> {
-    map: &'a HashMap<K, V, S>,
-}
-
-impl<'a, K, V, S> RawEntryBuilderMut<'a, K, V, S>
-where
-    S: BuildHasher,
-{
-    /// Creates a `RawEntryMut` from the given key.
-    #[inline]
-    #[unstable(feature = "hash_raw_entry", issue = "56167")]
-    pub fn from_key<Q: ?Sized>(self, k: &Q) -> RawEntryMut<'a, K, V, S>
-    where
-        K: Borrow<Q>,
-        Q: Hash + Eq,
-    {
-        map_raw_entry(self.map.base.raw_entry_mut().from_key(k))
-    }
-
-    /// Creates a `RawEntryMut` from the given key and its hash.
-    #[inline]
-    #[unstable(feature = "hash_raw_entry", issue = "56167")]
-    pub fn from_key_hashed_nocheck<Q: ?Sized>(self, hash: u64, k: &Q) -> RawEntryMut<'a, K, V, S>
-    where
-        K: Borrow<Q>,
-        Q: Eq,
-    {
-        map_raw_entry(self.map.base.raw_entry_mut().from_key_hashed_nocheck(hash, k))
-    }
-
-    /// Creates a `RawEntryMut` from the given hash.
-    #[inline]
-    #[unstable(feature = "hash_raw_entry", issue = "56167")]
-    pub fn from_hash<F>(self, hash: u64, is_match: F) -> RawEntryMut<'a, K, V, S>
-    where
-        for<'b> F: FnMut(&'b K) -> bool,
-    {
-        map_raw_entry(self.map.base.raw_entry_mut().from_hash(hash, is_match))
-    }
-}
-
-impl<'a, K, V, S> RawEntryBuilder<'a, K, V, S>
-where
-    S: BuildHasher,
-{
-    /// Access an entry by key.
-    #[inline]
-    #[unstable(feature = "hash_raw_entry", issue = "56167")]
-    pub fn from_key<Q: ?Sized>(self, k: &Q) -> Option<(&'a K, &'a V)>
-    where
-        K: Borrow<Q>,
-        Q: Hash + Eq,
-    {
-        self.map.base.raw_entry().from_key(k)
-    }
-
-    /// Access an entry by a key and its hash.
-    #[inline]
-    #[unstable(feature = "hash_raw_entry", issue = "56167")]
-    pub fn from_key_hashed_nocheck<Q: ?Sized>(self, hash: u64, k: &Q) -> Option<(&'a K, &'a V)>
-    where
-        K: Borrow<Q>,
-        Q: Hash + Eq,
-    {
-        self.map.base.raw_entry().from_key_hashed_nocheck(hash, k)
-    }
-
-    /// Access an entry by hash.
-    #[inline]
-    #[unstable(feature = "hash_raw_entry", issue = "56167")]
-    pub fn from_hash<F>(self, hash: u64, is_match: F) -> Option<(&'a K, &'a V)>
-    where
-        F: FnMut(&K) -> bool,
-    {
-        self.map.base.raw_entry().from_hash(hash, is_match)
-    }
-}
-
-impl<'a, K, V, S> RawEntryMut<'a, K, V, S> {
-    /// Ensures a value is in the entry by inserting the default if empty, and returns
-    /// mutable references to the key and value in the entry.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// #![feature(hash_raw_entry)]
-    /// use std::collections::HashMap;
-    ///
-    /// let mut map: HashMap<&str, u32> = HashMap::new();
-    ///
-    /// map.raw_entry_mut().from_key("poneyland").or_insert("poneyland", 3);
-    /// assert_eq!(map["poneyland"], 3);
-    ///
-    /// *map.raw_entry_mut().from_key("poneyland").or_insert("poneyland", 10).1 *= 2;
-    /// assert_eq!(map["poneyland"], 6);
-    /// ```
-    #[inline]
-    #[unstable(feature = "hash_raw_entry", issue = "56167")]
-    pub fn or_insert(self, default_key: K, default_val: V) -> (&'a mut K, &'a mut V)
-    where
-        K: Hash,
-        S: BuildHasher,
-    {
-        match self {
-            RawEntryMut::Occupied(entry) => entry.into_key_value(),
-            RawEntryMut::Vacant(entry) => entry.insert(default_key, default_val),
-        }
-    }
-
-    /// Ensures a value is in the entry by inserting the result of the default function if empty,
-    /// and returns mutable references to the key and value in the entry.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// #![feature(hash_raw_entry)]
-    /// use std::collections::HashMap;
-    ///
-    /// let mut map: HashMap<&str, String> = HashMap::new();
-    ///
-    /// map.raw_entry_mut().from_key("poneyland").or_insert_with(|| {
-    ///     ("poneyland", "hoho".to_string())
-    /// });
-    ///
-    /// assert_eq!(map["poneyland"], "hoho".to_string());
-    /// ```
-    #[inline]
-    #[unstable(feature = "hash_raw_entry", issue = "56167")]
-    pub fn or_insert_with<F>(self, default: F) -> (&'a mut K, &'a mut V)
-    where
-        F: FnOnce() -> (K, V),
-        K: Hash,
-        S: BuildHasher,
-    {
-        match self {
-            RawEntryMut::Occupied(entry) => entry.into_key_value(),
-            RawEntryMut::Vacant(entry) => {
-                let (k, v) = default();
-                entry.insert(k, v)
-            }
-        }
-    }
-
-    /// Provides in-place mutable access to an occupied entry before any
-    /// potential inserts into the map.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// #![feature(hash_raw_entry)]
-    /// use std::collections::HashMap;
-    ///
-    /// let mut map: HashMap<&str, u32> = HashMap::new();
-    ///
-    /// map.raw_entry_mut()
-    ///    .from_key("poneyland")
-    ///    .and_modify(|_k, v| { *v += 1 })
-    ///    .or_insert("poneyland", 42);
-    /// assert_eq!(map["poneyland"], 42);
-    ///
-    /// map.raw_entry_mut()
-    ///    .from_key("poneyland")
-    ///    .and_modify(|_k, v| { *v += 1 })
-    ///    .or_insert("poneyland", 0);
-    /// assert_eq!(map["poneyland"], 43);
-    /// ```
-    #[inline]
-    #[unstable(feature = "hash_raw_entry", issue = "56167")]
-    pub fn and_modify<F>(self, f: F) -> Self
-    where
-        F: FnOnce(&mut K, &mut V),
-    {
-        match self {
-            RawEntryMut::Occupied(mut entry) => {
-                {
-                    let (k, v) = entry.get_key_value_mut();
-                    f(k, v);
-                }
-                RawEntryMut::Occupied(entry)
-            }
-            RawEntryMut::Vacant(entry) => RawEntryMut::Vacant(entry),
-        }
-    }
-}
-
-impl<'a, K, V, S> RawOccupiedEntryMut<'a, K, V, S> {
-    /// Gets a reference to the key in the entry.
-    #[inline]
-    #[must_use]
-    #[unstable(feature = "hash_raw_entry", issue = "56167")]
-    pub fn key(&self) -> &K {
-        self.base.key()
-    }
-
-    /// Gets a mutable reference to the key in the entry.
-    #[inline]
-    #[must_use]
-    #[unstable(feature = "hash_raw_entry", issue = "56167")]
-    pub fn key_mut(&mut self) -> &mut K {
-        self.base.key_mut()
-    }
-
-    /// Converts the entry into a mutable reference to the key in the entry
-    /// with a lifetime bound to the map itself.
-    #[inline]
-    #[must_use = "`self` will be dropped if the result is not used"]
-    #[unstable(feature = "hash_raw_entry", issue = "56167")]
-    pub fn into_key(self) -> &'a mut K {
-        self.base.into_key()
-    }
-
-    /// Gets a reference to the value in the entry.
-    #[inline]
-    #[must_use]
-    #[unstable(feature = "hash_raw_entry", issue = "56167")]
-    pub fn get(&self) -> &V {
-        self.base.get()
-    }
-
-    /// Converts the `OccupiedEntry` into a mutable reference to the value in the entry
-    /// with a lifetime bound to the map itself.
-    #[inline]
-    #[must_use = "`self` will be dropped if the result is not used"]
-    #[unstable(feature = "hash_raw_entry", issue = "56167")]
-    pub fn into_mut(self) -> &'a mut V {
-        self.base.into_mut()
-    }
-
-    /// Gets a mutable reference to the value in the entry.
-    #[inline]
-    #[must_use]
-    #[unstable(feature = "hash_raw_entry", issue = "56167")]
-    pub fn get_mut(&mut self) -> &mut V {
-        self.base.get_mut()
-    }
-
-    /// Gets a reference to the key and value in the entry.
-    #[inline]
-    #[must_use]
-    #[unstable(feature = "hash_raw_entry", issue = "56167")]
-    pub fn get_key_value(&mut self) -> (&K, &V) {
-        self.base.get_key_value()
-    }
-
-    /// Gets a mutable reference to the key and value in the entry.
-    #[inline]
-    #[unstable(feature = "hash_raw_entry", issue = "56167")]
-    pub fn get_key_value_mut(&mut self) -> (&mut K, &mut V) {
-        self.base.get_key_value_mut()
-    }
-
-    /// Converts the `OccupiedEntry` into a mutable reference to the key and value in the entry
-    /// with a lifetime bound to the map itself.
-    #[inline]
-    #[must_use = "`self` will be dropped if the result is not used"]
-    #[unstable(feature = "hash_raw_entry", issue = "56167")]
-    pub fn into_key_value(self) -> (&'a mut K, &'a mut V) {
-        self.base.into_key_value()
-    }
-
-    /// Sets the value of the entry, and returns the entry's old value.
-    #[inline]
-    #[unstable(feature = "hash_raw_entry", issue = "56167")]
-    pub fn insert(&mut self, value: V) -> V {
-        self.base.insert(value)
-    }
-
-    /// Sets the value of the entry, and returns the entry's old value.
-    #[inline]
-    #[unstable(feature = "hash_raw_entry", issue = "56167")]
-    pub fn insert_key(&mut self, key: K) -> K {
-        self.base.insert_key(key)
-    }
-
-    /// Takes the value out of the entry, and returns it.
-    #[inline]
-    #[unstable(feature = "hash_raw_entry", issue = "56167")]
-    pub fn remove(self) -> V {
-        self.base.remove()
-    }
-
-    /// Take the ownership of the key and value from the map.
-    #[inline]
-    #[unstable(feature = "hash_raw_entry", issue = "56167")]
-    pub fn remove_entry(self) -> (K, V) {
-        self.base.remove_entry()
-    }
-}
-
-impl<'a, K, V, S> RawVacantEntryMut<'a, K, V, S> {
-    /// Sets the value of the entry with the `VacantEntry`'s key,
-    /// and returns a mutable reference to it.
-    #[inline]
-    #[unstable(feature = "hash_raw_entry", issue = "56167")]
-    pub fn insert(self, key: K, value: V) -> (&'a mut K, &'a mut V)
-    where
-        K: Hash,
-        S: BuildHasher,
-    {
-        self.base.insert(key, value)
-    }
-
-    /// Sets the value of the entry with the VacantEntry's key,
-    /// and returns a mutable reference to it.
-    #[inline]
-    #[unstable(feature = "hash_raw_entry", issue = "56167")]
-    pub fn insert_hashed_nocheck(self, hash: u64, key: K, value: V) -> (&'a mut K, &'a mut V)
-    where
-        K: Hash,
-        S: BuildHasher,
-    {
-        self.base.insert_hashed_nocheck(hash, key, value)
-    }
-}
-
-#[unstable(feature = "hash_raw_entry", issue = "56167")]
-impl<K, V, S> Debug for RawEntryBuilderMut<'_, K, V, S> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("RawEntryBuilder").finish_non_exhaustive()
-    }
-}
-
-#[unstable(feature = "hash_raw_entry", issue = "56167")]
-impl<K: Debug, V: Debug, S> Debug for RawEntryMut<'_, K, V, S> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match *self {
-            RawEntryMut::Vacant(ref v) => f.debug_tuple("RawEntry").field(v).finish(),
-            RawEntryMut::Occupied(ref o) => f.debug_tuple("RawEntry").field(o).finish(),
-        }
-    }
-}
-
-#[unstable(feature = "hash_raw_entry", issue = "56167")]
-impl<K: Debug, V: Debug, S> Debug for RawOccupiedEntryMut<'_, K, V, S> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("RawOccupiedEntryMut")
-            .field("key", self.key())
-            .field("value", self.get())
-            .finish_non_exhaustive()
-    }
-}
-
-#[unstable(feature = "hash_raw_entry", issue = "56167")]
-impl<K, V, S> Debug for RawVacantEntryMut<'_, K, V, S> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("RawVacantEntryMut").finish_non_exhaustive()
-    }
-}
-
-#[unstable(feature = "hash_raw_entry", issue = "56167")]
-impl<K, V, S> Debug for RawEntryBuilder<'_, K, V, S> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("RawEntryBuilder").finish_non_exhaustive()
-    }
-}
-
 /// A view into a single entry in a map, which may either be vacant or occupied.
 ///
 /// This `enum` is constructed from the [`entry`] method on [`HashMap`].
@@ -2210,14 +1939,19 @@ impl<K, V, S> Debug for RawEntryBuilder<'_, K, V, S> {
 /// [`entry`]: HashMap::entry
 #[stable(feature = "rust1", since = "1.0.0")]
 #[cfg_attr(not(test), rustc_diagnostic_item = "HashMapEntry")]
-pub enum Entry<'a, K: 'a, V: 'a> {
+pub enum Entry<
+    'a,
+    K: 'a,
+    V: 'a,
+    #[unstable(feature = "allocator_api", issue = "32838")] A: Allocator = Global,
+> {
     /// An occupied entry.
     #[stable(feature = "rust1", since = "1.0.0")]
-    Occupied(#[stable(feature = "rust1", since = "1.0.0")] OccupiedEntry<'a, K, V>),
+    Occupied(#[stable(feature = "rust1", since = "1.0.0")] OccupiedEntry<'a, K, V, A>),
 
     /// A vacant entry.
     #[stable(feature = "rust1", since = "1.0.0")]
-    Vacant(#[stable(feature = "rust1", since = "1.0.0")] VacantEntry<'a, K, V>),
+    Vacant(#[stable(feature = "rust1", since = "1.0.0")] VacantEntry<'a, K, V, A>),
 }
 
 #[stable(feature = "debug_hash_map", since = "1.12.0")]
@@ -2233,12 +1967,17 @@ impl<K: Debug, V: Debug> Debug for Entry<'_, K, V> {
 /// A view into an occupied entry in a `HashMap`.
 /// It is part of the [`Entry`] enum.
 #[stable(feature = "rust1", since = "1.0.0")]
-pub struct OccupiedEntry<'a, K: 'a, V: 'a> {
-    base: base::RustcOccupiedEntry<'a, K, V>,
+pub struct OccupiedEntry<
+    'a,
+    K: 'a,
+    V: 'a,
+    #[unstable(feature = "allocator_api", issue = "32838")] A: Allocator = Global,
+> {
+    base: base::RustcOccupiedEntry<'a, K, V, A>,
 }
 
 #[stable(feature = "debug_hash_map", since = "1.12.0")]
-impl<K: Debug, V: Debug> Debug for OccupiedEntry<'_, K, V> {
+impl<K: Debug, V: Debug, A: Allocator> Debug for OccupiedEntry<'_, K, V, A> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("OccupiedEntry")
             .field("key", self.key())
@@ -2250,12 +1989,17 @@ impl<K: Debug, V: Debug> Debug for OccupiedEntry<'_, K, V> {
 /// A view into a vacant entry in a `HashMap`.
 /// It is part of the [`Entry`] enum.
 #[stable(feature = "rust1", since = "1.0.0")]
-pub struct VacantEntry<'a, K: 'a, V: 'a> {
-    base: base::RustcVacantEntry<'a, K, V>,
+pub struct VacantEntry<
+    'a,
+    K: 'a,
+    V: 'a,
+    #[unstable(feature = "allocator_api", issue = "32838")] A: Allocator = Global,
+> {
+    base: base::RustcVacantEntry<'a, K, V, A>,
 }
 
 #[stable(feature = "debug_hash_map", since = "1.12.0")]
-impl<K: Debug, V> Debug for VacantEntry<'_, K, V> {
+impl<K: Debug, V, A: Allocator> Debug for VacantEntry<'_, K, V, A> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_tuple("VacantEntry").field(self.key()).finish()
     }
@@ -2265,15 +2009,20 @@ impl<K: Debug, V> Debug for VacantEntry<'_, K, V> {
 ///
 /// Contains the occupied entry, and the value that was not inserted.
 #[unstable(feature = "map_try_insert", issue = "82766")]
-pub struct OccupiedError<'a, K: 'a, V: 'a> {
+pub struct OccupiedError<
+    'a,
+    K: 'a,
+    V: 'a,
+    #[unstable(feature = "allocator_api", issue = "32838")] A: Allocator = Global,
+> {
     /// The entry in the map that was already occupied.
-    pub entry: OccupiedEntry<'a, K, V>,
+    pub entry: OccupiedEntry<'a, K, V, A>,
     /// The value which was not inserted, because the entry was already occupied.
     pub value: V,
 }
 
 #[unstable(feature = "map_try_insert", issue = "82766")]
-impl<K: Debug, V: Debug> Debug for OccupiedError<'_, K, V> {
+impl<K: Debug, V: Debug, A: Allocator> Debug for OccupiedError<'_, K, V, A> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("OccupiedError")
             .field("key", self.entry.key())
@@ -2284,7 +2033,7 @@ impl<K: Debug, V: Debug> Debug for OccupiedError<'_, K, V> {
 }
 
 #[unstable(feature = "map_try_insert", issue = "82766")]
-impl<'a, K: Debug, V: Debug> fmt::Display for OccupiedError<'a, K, V> {
+impl<'a, K: Debug, V: Debug, A: Allocator> fmt::Display for OccupiedError<'a, K, V, A> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
@@ -2297,15 +2046,10 @@ impl<'a, K: Debug, V: Debug> fmt::Display for OccupiedError<'a, K, V> {
 }
 
 #[unstable(feature = "map_try_insert", issue = "82766")]
-impl<'a, K: fmt::Debug, V: fmt::Debug> Error for OccupiedError<'a, K, V> {
-    #[allow(deprecated)]
-    fn description(&self) -> &str {
-        "key already exists"
-    }
-}
+impl<'a, K: Debug, V: Debug, A: Allocator> Error for OccupiedError<'a, K, V, A> {}
 
 #[stable(feature = "rust1", since = "1.0.0")]
-impl<'a, K, V, S> IntoIterator for &'a HashMap<K, V, S> {
+impl<'a, K, V, S, A: Allocator> IntoIterator for &'a HashMap<K, V, S, A> {
     type Item = (&'a K, &'a V);
     type IntoIter = Iter<'a, K, V>;
 
@@ -2317,7 +2061,7 @@ impl<'a, K, V, S> IntoIterator for &'a HashMap<K, V, S> {
 }
 
 #[stable(feature = "rust1", since = "1.0.0")]
-impl<'a, K, V, S> IntoIterator for &'a mut HashMap<K, V, S> {
+impl<'a, K, V, S, A: Allocator> IntoIterator for &'a mut HashMap<K, V, S, A> {
     type Item = (&'a K, &'a mut V);
     type IntoIter = IterMut<'a, K, V>;
 
@@ -2329,9 +2073,9 @@ impl<'a, K, V, S> IntoIterator for &'a mut HashMap<K, V, S> {
 }
 
 #[stable(feature = "rust1", since = "1.0.0")]
-impl<K, V, S> IntoIterator for HashMap<K, V, S> {
+impl<K, V, S, A: Allocator> IntoIterator for HashMap<K, V, S, A> {
     type Item = (K, V);
-    type IntoIter = IntoIter<K, V>;
+    type IntoIter = IntoIter<K, V, A>;
 
     /// Creates a consuming iterator, that is, one that moves each key-value
     /// pair out of the map in arbitrary order. The map cannot be used after
@@ -2353,7 +2097,7 @@ impl<K, V, S> IntoIterator for HashMap<K, V, S> {
     /// ```
     #[inline]
     #[rustc_lint_query_instability]
-    fn into_iter(self) -> IntoIter<K, V> {
+    fn into_iter(self) -> IntoIter<K, V, A> {
         IntoIter { base: self.base.into_iter() }
     }
 }
@@ -2441,7 +2185,7 @@ where
 }
 
 #[stable(feature = "rust1", since = "1.0.0")]
-impl<K, V> Iterator for IntoIter<K, V> {
+impl<K, V, A: Allocator> Iterator for IntoIter<K, V, A> {
     type Item = (K, V);
 
     #[inline]
@@ -2466,17 +2210,17 @@ impl<K, V> Iterator for IntoIter<K, V> {
     }
 }
 #[stable(feature = "rust1", since = "1.0.0")]
-impl<K, V> ExactSizeIterator for IntoIter<K, V> {
+impl<K, V, A: Allocator> ExactSizeIterator for IntoIter<K, V, A> {
     #[inline]
     fn len(&self) -> usize {
         self.base.len()
     }
 }
 #[stable(feature = "fused", since = "1.26.0")]
-impl<K, V> FusedIterator for IntoIter<K, V> {}
+impl<K, V, A: Allocator> FusedIterator for IntoIter<K, V, A> {}
 
 #[stable(feature = "std_debug", since = "1.16.0")]
-impl<K: Debug, V: Debug> fmt::Debug for IntoIter<K, V> {
+impl<K: Debug, V: Debug, A: Allocator> fmt::Debug for IntoIter<K, V, A> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_list().entries(self.iter()).finish()
     }
@@ -2595,7 +2339,7 @@ impl<K, V: fmt::Debug> fmt::Debug for ValuesMut<'_, K, V> {
 }
 
 #[stable(feature = "map_into_keys_values", since = "1.54.0")]
-impl<K, V> Iterator for IntoKeys<K, V> {
+impl<K, V, A: Allocator> Iterator for IntoKeys<K, V, A> {
     type Item = K;
 
     #[inline]
@@ -2620,24 +2364,24 @@ impl<K, V> Iterator for IntoKeys<K, V> {
     }
 }
 #[stable(feature = "map_into_keys_values", since = "1.54.0")]
-impl<K, V> ExactSizeIterator for IntoKeys<K, V> {
+impl<K, V, A: Allocator> ExactSizeIterator for IntoKeys<K, V, A> {
     #[inline]
     fn len(&self) -> usize {
         self.inner.len()
     }
 }
 #[stable(feature = "map_into_keys_values", since = "1.54.0")]
-impl<K, V> FusedIterator for IntoKeys<K, V> {}
+impl<K, V, A: Allocator> FusedIterator for IntoKeys<K, V, A> {}
 
 #[stable(feature = "map_into_keys_values", since = "1.54.0")]
-impl<K: Debug, V> fmt::Debug for IntoKeys<K, V> {
+impl<K: Debug, V, A: Allocator> fmt::Debug for IntoKeys<K, V, A> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_list().entries(self.inner.iter().map(|(k, _)| k)).finish()
     }
 }
 
 #[stable(feature = "map_into_keys_values", since = "1.54.0")]
-impl<K, V> Iterator for IntoValues<K, V> {
+impl<K, V, A: Allocator> Iterator for IntoValues<K, V, A> {
     type Item = V;
 
     #[inline]
@@ -2662,24 +2406,24 @@ impl<K, V> Iterator for IntoValues<K, V> {
     }
 }
 #[stable(feature = "map_into_keys_values", since = "1.54.0")]
-impl<K, V> ExactSizeIterator for IntoValues<K, V> {
+impl<K, V, A: Allocator> ExactSizeIterator for IntoValues<K, V, A> {
     #[inline]
     fn len(&self) -> usize {
         self.inner.len()
     }
 }
 #[stable(feature = "map_into_keys_values", since = "1.54.0")]
-impl<K, V> FusedIterator for IntoValues<K, V> {}
+impl<K, V, A: Allocator> FusedIterator for IntoValues<K, V, A> {}
 
 #[stable(feature = "map_into_keys_values", since = "1.54.0")]
-impl<K, V: Debug> fmt::Debug for IntoValues<K, V> {
+impl<K, V: Debug, A: Allocator> fmt::Debug for IntoValues<K, V, A> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_list().entries(self.inner.iter().map(|(_, v)| v)).finish()
     }
 }
 
 #[stable(feature = "drain", since = "1.6.0")]
-impl<'a, K, V> Iterator for Drain<'a, K, V> {
+impl<'a, K, V, A: Allocator> Iterator for Drain<'a, K, V, A> {
     type Item = (K, V);
 
     #[inline]
@@ -2700,17 +2444,17 @@ impl<'a, K, V> Iterator for Drain<'a, K, V> {
     }
 }
 #[stable(feature = "drain", since = "1.6.0")]
-impl<K, V> ExactSizeIterator for Drain<'_, K, V> {
+impl<K, V, A: Allocator> ExactSizeIterator for Drain<'_, K, V, A> {
     #[inline]
     fn len(&self) -> usize {
         self.base.len()
     }
 }
 #[stable(feature = "fused", since = "1.26.0")]
-impl<K, V> FusedIterator for Drain<'_, K, V> {}
+impl<K, V, A: Allocator> FusedIterator for Drain<'_, K, V, A> {}
 
 #[stable(feature = "std_debug", since = "1.16.0")]
-impl<K, V> fmt::Debug for Drain<'_, K, V>
+impl<K, V, A: Allocator> fmt::Debug for Drain<'_, K, V, A>
 where
     K: fmt::Debug,
     V: fmt::Debug,
@@ -2720,8 +2464,8 @@ where
     }
 }
 
-#[unstable(feature = "hash_extract_if", issue = "59618")]
-impl<K, V, F> Iterator for ExtractIf<'_, K, V, F>
+#[stable(feature = "hash_extract_if", since = "1.88.0")]
+impl<K, V, F, A: Allocator> Iterator for ExtractIf<'_, K, V, F, A>
 where
     F: FnMut(&K, &mut V) -> bool,
 {
@@ -2737,20 +2481,24 @@ where
     }
 }
 
-#[unstable(feature = "hash_extract_if", issue = "59618")]
-impl<K, V, F> FusedIterator for ExtractIf<'_, K, V, F> where F: FnMut(&K, &mut V) -> bool {}
+#[stable(feature = "hash_extract_if", since = "1.88.0")]
+impl<K, V, F, A: Allocator> FusedIterator for ExtractIf<'_, K, V, F, A> where
+    F: FnMut(&K, &mut V) -> bool
+{
+}
 
-#[unstable(feature = "hash_extract_if", issue = "59618")]
-impl<'a, K, V, F> fmt::Debug for ExtractIf<'a, K, V, F>
+#[stable(feature = "hash_extract_if", since = "1.88.0")]
+impl<K, V, F, A: Allocator> fmt::Debug for ExtractIf<'_, K, V, F, A>
 where
-    F: FnMut(&K, &mut V) -> bool,
+    K: fmt::Debug,
+    V: fmt::Debug,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ExtractIf").finish_non_exhaustive()
     }
 }
 
-impl<'a, K, V> Entry<'a, K, V> {
+impl<'a, K, V, A: Allocator> Entry<'a, K, V, A> {
     /// Ensures a value is in the entry by inserting the default if empty, and returns
     /// a mutable reference to the value in the entry.
     ///
@@ -2898,7 +2646,7 @@ impl<'a, K, V> Entry<'a, K, V> {
     /// ```
     #[inline]
     #[stable(feature = "entry_insert", since = "1.83.0")]
-    pub fn insert_entry(self, value: V) -> OccupiedEntry<'a, K, V> {
+    pub fn insert_entry(self, value: V) -> OccupiedEntry<'a, K, V, A> {
         match self {
             Occupied(mut entry) => {
                 entry.insert(value);
@@ -2935,7 +2683,7 @@ impl<'a, K, V: Default> Entry<'a, K, V> {
     }
 }
 
-impl<'a, K, V> OccupiedEntry<'a, K, V> {
+impl<'a, K, V, A: Allocator> OccupiedEntry<'a, K, V, A> {
     /// Gets a reference to the key in the entry.
     ///
     /// # Examples
@@ -3107,7 +2855,7 @@ impl<'a, K, V> OccupiedEntry<'a, K, V> {
     }
 }
 
-impl<'a, K: 'a, V: 'a> VacantEntry<'a, K, V> {
+impl<'a, K: 'a, V: 'a, A: Allocator> VacantEntry<'a, K, V, A> {
     /// Gets a reference to the key that would be used when inserting a value
     /// through the `VacantEntry`.
     ///
@@ -3185,7 +2933,7 @@ impl<'a, K: 'a, V: 'a> VacantEntry<'a, K, V> {
     /// ```
     #[inline]
     #[stable(feature = "entry_insert", since = "1.83.0")]
-    pub fn insert_entry(self, value: V) -> OccupiedEntry<'a, K, V> {
+    pub fn insert_entry(self, value: V) -> OccupiedEntry<'a, K, V, A> {
         let base = self.base.insert_entry(value);
         OccupiedEntry { base }
     }
@@ -3197,6 +2945,10 @@ where
     K: Eq + Hash,
     S: BuildHasher + Default,
 {
+    /// Constructs a `HashMap<K, V>` from an iterator of key-value pairs.
+    ///
+    /// If the iterator produces any pairs with equal keys,
+    /// all but one of the corresponding values will be dropped.
     fn from_iter<T: IntoIterator<Item = (K, V)>>(iter: T) -> HashMap<K, V, S> {
         let mut map = HashMap::with_hasher(Default::default());
         map.extend(iter);
@@ -3207,10 +2959,11 @@ where
 /// Inserts all new key-values from the iterator and replaces values with existing
 /// keys with new values returned from the iterator.
 #[stable(feature = "rust1", since = "1.0.0")]
-impl<K, V, S> Extend<(K, V)> for HashMap<K, V, S>
+impl<K, V, S, A> Extend<(K, V)> for HashMap<K, V, S, A>
 where
     K: Eq + Hash,
     S: BuildHasher,
+    A: Allocator,
 {
     #[inline]
     fn extend<T: IntoIterator<Item = (K, V)>>(&mut self, iter: T) {
@@ -3229,11 +2982,12 @@ where
 }
 
 #[stable(feature = "hash_extend_copy", since = "1.4.0")]
-impl<'a, K, V, S> Extend<(&'a K, &'a V)> for HashMap<K, V, S>
+impl<'a, K, V, S, A> Extend<(&'a K, &'a V)> for HashMap<K, V, S, A>
 where
     K: Eq + Hash + Copy,
     V: Copy,
     S: BuildHasher,
+    A: Allocator,
 {
     #[inline]
     fn extend<T: IntoIterator<Item = (&'a K, &'a V)>>(&mut self, iter: T) {
@@ -3252,7 +3006,9 @@ where
 }
 
 #[inline]
-fn map_entry<'a, K: 'a, V: 'a>(raw: base::RustcEntry<'a, K, V>) -> Entry<'a, K, V> {
+fn map_entry<'a, K: 'a, V: 'a, A: Allocator>(
+    raw: base::RustcEntry<'a, K, V, A>,
+) -> Entry<'a, K, V, A> {
     match raw {
         base::RustcEntry::Occupied(base) => Entry::Occupied(OccupiedEntry { base }),
         base::RustcEntry::Vacant(base) => Entry::Vacant(VacantEntry { base }),
@@ -3268,16 +3024,6 @@ pub(super) fn map_try_reserve_error(err: hashbrown::TryReserveError) -> TryReser
         hashbrown::TryReserveError::AllocError { layout } => {
             TryReserveErrorKind::AllocError { layout, non_exhaustive: () }.into()
         }
-    }
-}
-
-#[inline]
-fn map_raw_entry<'a, K: 'a, V: 'a, S: 'a>(
-    raw: base::RawEntryMut<'a, K, V, S>,
-) -> RawEntryMut<'a, K, V, S> {
-    match raw {
-        base::RawEntryMut::Occupied(base) => RawEntryMut::Occupied(RawOccupiedEntryMut { base }),
-        base::RawEntryMut::Vacant(base) => RawEntryMut::Vacant(RawVacantEntryMut { base }),
     }
 }
 

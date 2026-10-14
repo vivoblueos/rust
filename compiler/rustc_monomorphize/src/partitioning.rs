@@ -99,31 +99,32 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use rustc_data_structures::fx::{FxIndexMap, FxIndexSet};
-use rustc_data_structures::sync;
+use rustc_data_structures::sync::par_join;
 use rustc_data_structures::unord::{UnordMap, UnordSet};
 use rustc_hir::LangItem;
+use rustc_hir::attrs::{InlineAttr, Linkage};
 use rustc_hir::def::DefKind;
 use rustc_hir::def_id::{DefId, DefIdSet, LOCAL_CRATE};
 use rustc_hir::definitions::DefPathDataName;
 use rustc_middle::bug;
 use rustc_middle::middle::codegen_fn_attrs::CodegenFnAttrFlags;
 use rustc_middle::middle::exported_symbols::{SymbolExportInfo, SymbolExportLevel};
-use rustc_middle::mir::mono::{
-    CodegenUnit, CodegenUnitNameBuilder, InstantiationMode, Linkage, MonoItem, MonoItemData,
-    Visibility,
+use rustc_middle::mono::{
+    CodegenUnit, CodegenUnitNameBuilder, InstantiationMode, MonoItem, MonoItemData,
+    MonoItemPartitions, Visibility,
 };
 use rustc_middle::ty::print::{characteristic_def_id_of_type, with_no_trimmed_paths};
-use rustc_middle::ty::visit::TypeVisitableExt;
 use rustc_middle::ty::{self, InstanceKind, TyCtxt};
 use rustc_middle::util::Providers;
 use rustc_session::CodegenUnits;
 use rustc_session::config::{DumpMonoStatsFormat, SwitchWithOptPath};
-use rustc_span::symbol::Symbol;
+use rustc_span::Symbol;
 use rustc_target::spec::SymbolVisibility;
 use tracing::debug;
 
 use crate::collector::{self, MonoItemCollectionStrategy, UsageMap};
-use crate::errors::{CouldntDumpMonoStats, SymbolAlreadyDefined, UnknownCguCollectionMode};
+use crate::errors::{CouldntDumpMonoStats, SymbolAlreadyDefined};
+use crate::graph_checks::target_specific_checks;
 
 struct PartitioningCx<'a, 'tcx> {
     tcx: TyCtxt<'tcx>,
@@ -208,8 +209,8 @@ where
     // available to downstream crates. This depends on whether we are in
     // share-generics mode and whether the current crate can even have
     // downstream crates.
-    let export_generics =
-        cx.tcx.sess.opts.share_generics() && cx.tcx.local_crate_exports_generics();
+    let can_export_generics = cx.tcx.local_crate_exports_generics();
+    let always_export_generics = can_export_generics && cx.tcx.sess.opts.share_generics();
 
     let cgu_name_builder = &mut CodegenUnitNameBuilder::new(cx.tcx);
     let cgu_name_cache = &mut UnordMap::default();
@@ -221,11 +222,7 @@ where
         // So even if its mode is LocalCopy, we need to treat it like a root.
         match mono_item.instantiation_mode(cx.tcx) {
             InstantiationMode::GloballyShared { .. } => {}
-            InstantiationMode::LocalCopy => {
-                if Some(mono_item.def_id()) != cx.tcx.lang_items().start_fn() {
-                    continue;
-                }
-            }
+            InstantiationMode::LocalCopy => continue,
         }
 
         let characteristic_def_id = characteristic_def_id_of_mono_item(cx.tcx, mono_item);
@@ -249,19 +246,17 @@ where
             cx.tcx,
             &mono_item,
             &mut can_be_internalized,
-            export_generics,
+            can_export_generics,
+            always_export_generics,
         );
+
         if visibility == Visibility::Hidden && can_be_internalized {
             internalization_candidates.insert(mono_item);
         }
         let size_estimate = mono_item.size_estimate(cx.tcx);
 
-        cgu.items_mut().insert(mono_item, MonoItemData {
-            inlined: false,
-            linkage,
-            visibility,
-            size_estimate,
-        });
+        cgu.items_mut()
+            .insert(mono_item, MonoItemData { inlined: false, linkage, visibility, size_estimate });
 
         // Get all inlined items that are reachable from `mono_item` without
         // going via another root item. This includes drop-glue, functions from
@@ -291,8 +286,8 @@ where
         codegen_units.insert(cgu_name, CodegenUnit::new(cgu_name));
     }
 
-    let mut codegen_units: Vec<_> = cx.tcx.with_stable_hashing_context(|ref hcx| {
-        codegen_units.into_items().map(|(_, cgu)| cgu).collect_sorted(hcx, true)
+    let mut codegen_units: Vec<_> = cx.tcx.with_stable_hashing_context(|mut hcx| {
+        codegen_units.into_items().map(|(_, cgu)| cgu).collect_sorted(&mut hcx, true)
     });
 
     for cgu in codegen_units.iter_mut() {
@@ -451,15 +446,15 @@ fn merge_codegen_units<'tcx>(
 
         for cgu in codegen_units.iter_mut() {
             if let Some(new_cgu_name) = new_cgu_names.get(&cgu.name()) {
-                if cx.tcx.sess.opts.unstable_opts.human_readable_cgu_names {
-                    cgu.set_name(Symbol::intern(new_cgu_name));
+                let new_cgu_name = if cx.tcx.sess.opts.unstable_opts.human_readable_cgu_names {
+                    Symbol::intern(&CodegenUnit::shorten_name(new_cgu_name))
                 } else {
                     // If we don't require CGU names to be human-readable,
                     // we use a fixed length hash of the composite CGU name
                     // instead.
-                    let new_cgu_name = CodegenUnit::mangle_name(new_cgu_name);
-                    cgu.set_name(Symbol::intern(&new_cgu_name));
-                }
+                    Symbol::intern(&CodegenUnit::mangle_name(new_cgu_name))
+                };
+                cgu.set_name(new_cgu_name);
             }
         }
 
@@ -586,6 +581,16 @@ fn internalize_symbols<'tcx>(
                 }
             }
 
+            // When LTO inlines the caller of a naked function, it will attempt but fail to make the
+            // naked function symbol visible. To ensure that LTO works correctly, do not default
+            // naked functions to internal linkage and default visibility.
+            if let MonoItem::Fn(instance) = item {
+                let flags = cx.tcx.codegen_instance_attrs(instance.def).flags;
+                if flags.contains(CodegenFnAttrFlags::NAKED) {
+                    continue;
+                }
+            }
+
             // If we got here, we did not find any uses from other CGUs, so
             // it's fine to make this monomorphization internal.
             data.linkage = Linkage::Internal;
@@ -635,6 +640,8 @@ fn characteristic_def_id_of_mono_item<'tcx>(
                 | ty::InstanceKind::CloneShim(..)
                 | ty::InstanceKind::ThreadLocalShim(..)
                 | ty::InstanceKind::FnPtrAddrShim(..)
+                | ty::InstanceKind::FutureDropPollShim(..)
+                | ty::InstanceKind::AsyncDropGlue(..)
                 | ty::InstanceKind::AsyncDropGlueCtorShim(..) => return None,
             };
 
@@ -642,17 +649,18 @@ fn characteristic_def_id_of_mono_item<'tcx>(
             // its self-type. If the self-type does not provide a characteristic
             // DefId, we use the location of the impl after all.
 
-            if tcx.trait_of_item(def_id).is_some() {
+            let assoc_parent = tcx.assoc_parent(def_id);
+
+            if let Some((_, DefKind::Trait)) = assoc_parent {
                 let self_ty = instance.args.type_at(0);
                 // This is a default implementation of a trait method.
                 return characteristic_def_id_of_type(self_ty).or(Some(def_id));
             }
 
-            if let Some(impl_def_id) = tcx.impl_of_method(def_id) {
-                if tcx.sess.opts.incremental.is_some()
-                    && tcx
-                        .trait_id_of_impl(impl_def_id)
-                        .is_some_and(|def_id| tcx.is_lang_item(def_id, LangItem::Drop))
+            if let Some((impl_def_id, DefKind::Impl { of_trait })) = assoc_parent {
+                if of_trait
+                    && tcx.sess.opts.incremental.is_some()
+                    && tcx.is_lang_item(tcx.impl_trait_id(impl_def_id), LangItem::Drop)
                 {
                     // Put `Drop::drop` into the same cgu as `drop_in_place`
                     // since `drop_in_place` is the only thing that can
@@ -660,18 +668,14 @@ fn characteristic_def_id_of_mono_item<'tcx>(
                     return None;
                 }
 
-                // When polymorphization is enabled, methods which do not depend on their generic
-                // parameters, but the self-type of their impl block do will fail to normalize.
-                if !tcx.sess.opts.unstable_opts.polymorphize || !instance.has_param() {
-                    // This is a method within an impl, find out what the self-type is:
-                    let impl_self_ty = tcx.instantiate_and_normalize_erasing_regions(
-                        instance.args,
-                        ty::TypingEnv::fully_monomorphized(),
-                        tcx.type_of(impl_def_id),
-                    );
-                    if let Some(def_id) = characteristic_def_id_of_type(impl_self_ty) {
-                        return Some(def_id);
-                    }
+                // This is a method within an impl, find out what the self-type is:
+                let impl_self_ty = tcx.instantiate_and_normalize_erasing_regions(
+                    instance.args,
+                    ty::TypingEnv::fully_monomorphized(),
+                    tcx.type_of(impl_def_id),
+                );
+                if let Some(def_id) = characteristic_def_id_of_type(impl_self_ty) {
+                    return Some(def_id);
                 }
             }
 
@@ -739,12 +743,19 @@ fn mono_item_linkage_and_visibility<'tcx>(
     tcx: TyCtxt<'tcx>,
     mono_item: &MonoItem<'tcx>,
     can_be_internalized: &mut bool,
-    export_generics: bool,
+    can_export_generics: bool,
+    always_export_generics: bool,
 ) -> (Linkage, Visibility) {
     if let Some(explicit_linkage) = mono_item.explicit_linkage(tcx) {
         return (explicit_linkage, Visibility::Default);
     }
-    let vis = mono_item_visibility(tcx, mono_item, can_be_internalized, export_generics);
+    let vis = mono_item_visibility(
+        tcx,
+        mono_item,
+        can_be_internalized,
+        can_export_generics,
+        always_export_generics,
+    );
     (Linkage::External, vis)
 }
 
@@ -767,7 +778,8 @@ fn mono_item_visibility<'tcx>(
     tcx: TyCtxt<'tcx>,
     mono_item: &MonoItem<'tcx>,
     can_be_internalized: &mut bool,
-    export_generics: bool,
+    can_export_generics: bool,
+    always_export_generics: bool,
 ) -> Visibility {
     let instance = match mono_item {
         // This is pretty complicated; see below.
@@ -783,7 +795,9 @@ fn mono_item_visibility<'tcx>(
     let def_id = match instance.def {
         InstanceKind::Item(def_id)
         | InstanceKind::DropGlue(def_id, Some(_))
-        | InstanceKind::AsyncDropGlueCtorShim(def_id, Some(_)) => def_id,
+        | InstanceKind::FutureDropPollShim(def_id, _, _)
+        | InstanceKind::AsyncDropGlue(def_id, _)
+        | InstanceKind::AsyncDropGlueCtorShim(def_id, _) => def_id,
 
         // We match the visibility of statics here
         InstanceKind::ThreadLocalShim(def_id) => {
@@ -799,15 +813,13 @@ fn mono_item_visibility<'tcx>(
         | InstanceKind::ClosureOnceShim { .. }
         | InstanceKind::ConstructCoroutineInClosureShim { .. }
         | InstanceKind::DropGlue(..)
-        | InstanceKind::AsyncDropGlueCtorShim(..)
         | InstanceKind::CloneShim(..)
         | InstanceKind::FnPtrAddrShim(..) => return Visibility::Hidden,
     };
 
-    // The `start_fn` lang item is actually a monomorphized instance of a
-    // function in the standard library, used for the `main` function. We don't
-    // want to export it so we tag it with `Hidden` visibility but this symbol
-    // is only referenced from the actual `main` symbol which we unfortunately
+    // Both the `start_fn` lang item and `main` itself should not be exported,
+    // so we give them with `Hidden` visibility but these symbols are
+    // only referenced from the actual `main` symbol which we unfortunately
     // don't know anything about during partitioning/collection. As a result we
     // forcibly keep this symbol out of the `internalization_candidates` set.
     //
@@ -817,7 +829,7 @@ fn mono_item_visibility<'tcx>(
     //        from the `main` symbol we'll generate later.
     //
     //        This may be fixable with a new `InstanceKind` perhaps? Unsure!
-    if tcx.is_lang_item(def_id, LangItem::Start) {
+    if tcx.is_entrypoint(def_id) {
         *can_be_internalized = false;
         return Visibility::Hidden;
     }
@@ -826,7 +838,11 @@ fn mono_item_visibility<'tcx>(
 
     // Upstream `DefId` instances get different handling than local ones.
     let Some(def_id) = def_id.as_local() else {
-        return if export_generics && is_generic {
+        return if is_generic
+            && (always_export_generics
+                || (can_export_generics
+                    && tcx.codegen_fn_attrs(def_id).inline == InlineAttr::Never))
+        {
             // If it is an upstream monomorphization and we export generics, we must make
             // it available to downstream crates.
             *can_be_internalized = false;
@@ -837,7 +853,9 @@ fn mono_item_visibility<'tcx>(
     };
 
     if is_generic {
-        if export_generics {
+        if always_export_generics
+            || (can_export_generics && tcx.codegen_fn_attrs(def_id).inline == InlineAttr::Never)
+        {
             if tcx.is_unreachable_local_definition(def_id) {
                 // This instance cannot be used from another crate.
                 Visibility::Hidden
@@ -865,12 +883,12 @@ fn mono_item_visibility<'tcx>(
         // visibility. In some situations though we'll want to prevent this
         // symbol from being internalized.
         //
-        // There's two categories of items here:
+        // There's three categories of items here:
         //
         // * First is weak lang items. These are basically mechanisms for
         //   libcore to forward-reference symbols defined later in crates like
         //   the standard library or `#[panic_handler]` definitions. The
-        //   definition of these weak lang items needs to be referencable by
+        //   definition of these weak lang items needs to be referenceable by
         //   libcore, so we're no longer a candidate for internalization.
         //   Removal of these functions can't be done by LLVM but rather must be
         //   done by the linker as it's a non-local decision.
@@ -895,8 +913,16 @@ fn mono_item_visibility<'tcx>(
         //   visibility below. Like the weak lang items, though, we can't let
         //   LLVM internalize them as this decision is left up to the linker to
         //   omit them, so prevent them from being internalized.
+        //
+        // * Externally implementable items. They work (in this case) pretty much the same as
+        //   RUSTC_STD_INTERNAL_SYMBOL in that their implementation is also chosen later in
+        //   the compilation process and we can't let them be internalized and they can't
+        //   show up as an external interface.
         let attrs = tcx.codegen_fn_attrs(def_id);
-        if attrs.flags.contains(CodegenFnAttrFlags::RUSTC_STD_INTERNAL_SYMBOL) {
+        if attrs.flags.intersects(
+            CodegenFnAttrFlags::RUSTC_STD_INTERNAL_SYMBOL
+                | CodegenFnAttrFlags::EXTERNALLY_IMPLEMENTABLE_ITEM,
+        ) {
             *can_be_internalized = false;
         }
 
@@ -1102,31 +1128,16 @@ where
     }
 }
 
-fn collect_and_partition_mono_items(tcx: TyCtxt<'_>, (): ()) -> (&DefIdSet, &[CodegenUnit<'_>]) {
-    let collection_strategy = match tcx.sess.opts.unstable_opts.print_mono_items {
-        Some(ref s) => {
-            let mode = s.to_lowercase();
-            let mode = mode.trim();
-            if mode == "eager" {
-                MonoItemCollectionStrategy::Eager
-            } else {
-                if mode != "lazy" {
-                    tcx.dcx().emit_warn(UnknownCguCollectionMode { mode });
-                }
-
-                MonoItemCollectionStrategy::Lazy
-            }
-        }
-        None => {
-            if tcx.sess.link_dead_code() {
-                MonoItemCollectionStrategy::Eager
-            } else {
-                MonoItemCollectionStrategy::Lazy
-            }
-        }
+fn collect_and_partition_mono_items(tcx: TyCtxt<'_>, (): ()) -> MonoItemPartitions<'_> {
+    let collection_strategy = if tcx.sess.link_dead_code() {
+        MonoItemCollectionStrategy::Eager
+    } else {
+        MonoItemCollectionStrategy::Lazy
     };
 
     let (items, usage_map) = collector::collect_crate_mono_items(tcx, collection_strategy);
+    // Perform checks that need to operate on the entire mono item graph
+    target_specific_checks(tcx, &items, &usage_map);
 
     // If there was an error during collection (e.g. from one of the constants we evaluated),
     // then we stop here. This way codegen does not have to worry about failing constants.
@@ -1134,7 +1145,7 @@ fn collect_and_partition_mono_items(tcx: TyCtxt<'_>, (): ()) -> (&DefIdSet, &[Co
     tcx.dcx().abort_if_errors();
 
     let (codegen_units, _) = tcx.sess.time("partition_and_assert_distinct_symbols", || {
-        sync::join(
+        par_join(
             || {
                 let mut codegen_units = partition(tcx, items.iter().copied(), &usage_map);
                 codegen_units[0].make_primary();
@@ -1165,15 +1176,14 @@ fn collect_and_partition_mono_items(tcx: TyCtxt<'_>, (): ()) -> (&DefIdSet, &[Co
         .collect();
 
     // Output monomorphization stats per def_id
-    if let SwitchWithOptPath::Enabled(ref path) = tcx.sess.opts.unstable_opts.dump_mono_stats {
-        if let Err(err) =
+    if let SwitchWithOptPath::Enabled(ref path) = tcx.sess.opts.unstable_opts.dump_mono_stats
+        && let Err(err) =
             dump_mono_items_stats(tcx, codegen_units, path, tcx.crate_name(LOCAL_CRATE))
-        {
-            tcx.dcx().emit_fatal(CouldntDumpMonoStats { error: err.to_string() });
-        }
+    {
+        tcx.dcx().emit_fatal(CouldntDumpMonoStats { error: err.to_string() });
     }
 
-    if tcx.sess.opts.unstable_opts.print_mono_items.is_some() {
+    if tcx.sess.opts.unstable_opts.print_mono_items {
         let mut item_to_cgus: UnordMap<_, Vec<_>> = Default::default();
 
         for cgu in codegen_units {
@@ -1202,9 +1212,7 @@ fn collect_and_partition_mono_items(tcx: TyCtxt<'_>, (): ()) -> (&DefIdSet, &[Co
                         Linkage::LinkOnceODR => "OnceODR",
                         Linkage::WeakAny => "WeakAny",
                         Linkage::WeakODR => "WeakODR",
-                        Linkage::Appending => "Appending",
                         Linkage::Internal => "Internal",
-                        Linkage::Private => "Private",
                         Linkage::ExternalWeak => "ExternalWeak",
                         Linkage::Common => "Common",
                     };
@@ -1224,7 +1232,7 @@ fn collect_and_partition_mono_items(tcx: TyCtxt<'_>, (): ()) -> (&DefIdSet, &[Co
         }
     }
 
-    (tcx.arena.alloc(mono_items), codegen_units)
+    MonoItemPartitions { all_mono_items: tcx.arena.alloc(mono_items), codegen_units }
 }
 
 /// Outputs stats about instantiation counts and estimated size, per `MonoItem`'s
@@ -1235,7 +1243,7 @@ fn dump_mono_items_stats<'tcx>(
     output_directory: &Option<PathBuf>,
     crate_name: Symbol,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let output_directory = if let Some(ref directory) = output_directory {
+    let output_directory = if let Some(directory) = output_directory {
         fs::create_dir_all(directory)?;
         directory
     } else {
@@ -1305,21 +1313,20 @@ fn dump_mono_items_stats<'tcx>(
 }
 
 pub(crate) fn provide(providers: &mut Providers) {
-    providers.collect_and_partition_mono_items = collect_and_partition_mono_items;
+    providers.queries.collect_and_partition_mono_items = collect_and_partition_mono_items;
 
-    providers.is_codegened_item = |tcx, def_id| {
-        let (all_mono_items, _) = tcx.collect_and_partition_mono_items(());
-        all_mono_items.contains(&def_id)
-    };
+    providers.queries.is_codegened_item =
+        |tcx, def_id| tcx.collect_and_partition_mono_items(()).all_mono_items.contains(&def_id);
 
-    providers.codegen_unit = |tcx, name| {
-        let (_, all) = tcx.collect_and_partition_mono_items(());
-        all.iter()
+    providers.queries.codegen_unit = |tcx, name| {
+        tcx.collect_and_partition_mono_items(())
+            .codegen_units
+            .iter()
             .find(|cgu| cgu.name() == name)
             .unwrap_or_else(|| panic!("failed to find cgu with name {name:?}"))
     };
 
-    providers.size_estimate = |tcx, instance| {
+    providers.queries.size_estimate = |tcx, instance| {
         match instance.def {
             // "Normal" functions size estimate: the number of
             // statements, plus one for the terminator.

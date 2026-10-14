@@ -1,21 +1,18 @@
-// tidy-alphabetical-start
-#![warn(unreachable_pub)]
-// tidy-alphabetical-end
+use std::borrow::Cow;
+use std::fmt::Display;
 
-use rustc_abi::ExternAbi;
-use rustc_ast::node_id::NodeId;
-use rustc_ast::{AttrId, Attribute};
-use rustc_data_structures::fx::{FxIndexMap, FxIndexSet};
+use rustc_ast::AttrId;
+use rustc_ast::attr::AttributeExt;
+use rustc_data_structures::fx::FxIndexSet;
 use rustc_data_structures::stable_hasher::{
     HashStable, StableCompare, StableHasher, ToStableHashKey,
 };
-use rustc_error_messages::{DiagMessage, MultiSpan};
-use rustc_hir::def::Namespace;
-use rustc_hir::{HashStableContext, HirId, MissingLifetimeKind};
+use rustc_error_messages::{DiagArgValue, IntoDiagArg};
+use rustc_hir_id::{HirId, ItemLocalId};
 use rustc_macros::{Decodable, Encodable, HashStable_Generic};
+use rustc_span::def_id::DefPathHash;
 pub use rustc_span::edition::Edition;
-use rustc_span::symbol::{Ident, MacroRulesNormalizedIdent};
-use rustc_span::{Span, Symbol, sym};
+use rustc_span::{HashStableContext, Ident, Span, Symbol, sym};
 use serde::{Deserialize, Serialize};
 
 pub use self::Level::*;
@@ -40,6 +37,23 @@ macro_rules! pluralize {
     ("this", $x:expr) => {
         if $x == 1 { "this" } else { "these" }
     };
+}
+
+/// Grammatical tool for displaying messages to end users in a nice form.
+///
+/// Take a list of items and a function to turn those items into a `String`, and output a display
+/// friendly comma separated list of those items.
+// FIXME(estebank): this needs to be changed to go through the translation machinery.
+pub fn listify<T>(list: &[T], fmt: impl Fn(&T) -> String) -> Option<String> {
+    Some(match list {
+        [only] => fmt(&only),
+        [others @ .., last] => format!(
+            "{} and {}",
+            others.iter().map(|i| fmt(i)).collect::<Vec<_>>().join(", "),
+            fmt(&last),
+        ),
+        [] => return None,
+    })
 }
 
 /// Indicates the confidence in the correctness of a suggestion.
@@ -89,7 +103,7 @@ pub enum Applicability {
 /// The index values have a type of `u16` to reduce the size of the `LintExpectationId`.
 /// It's reasonable to assume that no user will define 2^16 attributes on one node or
 /// have that amount of lints listed. `u16` values should therefore suffice.
-#[derive(Clone, Copy, PartialEq, PartialOrd, Eq, Ord, Debug, Hash, Encodable, Decodable)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash, Encodable, Decodable)]
 pub enum LintExpectationId {
     /// Used for lints emitted during the `EarlyLintPass`. This id is not
     /// hash stable and should not be cached.
@@ -117,16 +131,16 @@ impl LintExpectationId {
     }
 
     pub fn set_lint_index(&mut self, new_lint_index: Option<u16>) {
-        let (LintExpectationId::Unstable { ref mut lint_index, .. }
-        | LintExpectationId::Stable { ref mut lint_index, .. }) = self;
+        let (LintExpectationId::Unstable { lint_index, .. }
+        | LintExpectationId::Stable { lint_index, .. }) = self;
 
         *lint_index = new_lint_index
     }
 }
 
-impl<HCX: rustc_hir::HashStableContext> HashStable<HCX> for LintExpectationId {
+impl<Hcx: HashStableContext> HashStable<Hcx> for LintExpectationId {
     #[inline]
-    fn hash_stable(&self, hcx: &mut HCX, hasher: &mut StableHasher) {
+    fn hash_stable(&self, hcx: &mut Hcx, hasher: &mut StableHasher) {
         match self {
             LintExpectationId::Stable { hir_id, attr_index, lint_index: Some(lint_index) } => {
                 hir_id.hash_stable(hcx, hasher);
@@ -142,14 +156,15 @@ impl<HCX: rustc_hir::HashStableContext> HashStable<HCX> for LintExpectationId {
     }
 }
 
-impl<HCX: rustc_hir::HashStableContext> ToStableHashKey<HCX> for LintExpectationId {
-    type KeyType = (HirId, u16, u16);
+impl<Hcx: HashStableContext> ToStableHashKey<Hcx> for LintExpectationId {
+    type KeyType = (DefPathHash, ItemLocalId, u16, u16);
 
     #[inline]
-    fn to_stable_hash_key(&self, _: &HCX) -> Self::KeyType {
+    fn to_stable_hash_key(&self, hcx: &mut Hcx) -> Self::KeyType {
         match self {
             LintExpectationId::Stable { hir_id, attr_index, lint_index: Some(lint_index) } => {
-                (*hir_id, *attr_index, *lint_index)
+                let (def_path_hash, lint_idx) = hir_id.to_stable_hash_key(hcx);
+                (def_path_hash, lint_idx, *attr_index, *lint_index)
             }
             _ => {
                 unreachable!("HashStable should only be called for a filled `LintExpectationId`")
@@ -161,7 +176,19 @@ impl<HCX: rustc_hir::HashStableContext> ToStableHashKey<HCX> for LintExpectation
 /// Setting for how to handle a lint.
 ///
 /// See: <https://doc.rust-lang.org/rustc/lints/levels.html>
-#[derive(Clone, Copy, PartialEq, PartialOrd, Eq, Ord, Debug, Hash, HashStable_Generic)]
+#[derive(
+    Clone,
+    Copy,
+    PartialEq,
+    PartialOrd,
+    Eq,
+    Ord,
+    Debug,
+    Hash,
+    Encodable,
+    Decodable,
+    HashStable_Generic
+)]
 pub enum Level {
     /// The `allow` level will not issue any message.
     Allow,
@@ -174,9 +201,9 @@ pub enum Level {
     ///
     /// See RFC 2383.
     ///
-    /// The [`LintExpectationId`] is used to later link a lint emission to the actual
+    /// Requires a [`LintExpectationId`] to later link a lint emission to the actual
     /// expectation. It can be ignored in most cases.
-    Expect(LintExpectationId),
+    Expect,
     /// The `warn` level will produce a warning if the lint was violated, however the
     /// compiler will continue with its execution.
     Warn,
@@ -184,9 +211,9 @@ pub enum Level {
     /// to ensure that a lint can't be suppressed. This lint level can currently only be set
     /// via the console and is therefore session specific.
     ///
-    /// The [`LintExpectationId`] is intended to fulfill expectations marked via the
+    /// Requires a [`LintExpectationId`] to fulfill expectations marked via the
     /// `#[expect]` attribute, that will still be suppressed due to the level.
-    ForceWarn(Option<LintExpectationId>),
+    ForceWarn,
     /// The `deny` level will produce an error and stop further execution after the lint
     /// pass is complete.
     Deny,
@@ -200,9 +227,9 @@ impl Level {
     pub fn as_str(self) -> &'static str {
         match self {
             Level::Allow => "allow",
-            Level::Expect(_) => "expect",
+            Level::Expect => "expect",
             Level::Warn => "warn",
-            Level::ForceWarn(_) => "force-warn",
+            Level::ForceWarn => "force-warn",
             Level::Deny => "deny",
             Level::Forbid => "forbid",
         }
@@ -221,20 +248,30 @@ impl Level {
     }
 
     /// Converts an `Attribute` to a level.
-    pub fn from_attr(attr: &Attribute) -> Option<Self> {
-        Self::from_symbol(attr.name_or_empty(), Some(attr.id))
+    pub fn from_attr(attr: &impl AttributeExt) -> Option<(Self, Option<LintExpectationId>)> {
+        attr.name().and_then(|name| Self::from_symbol(name, || Some(attr.id())))
     }
 
     /// Converts a `Symbol` to a level.
-    pub fn from_symbol(s: Symbol, id: Option<AttrId>) -> Option<Self> {
-        match (s, id) {
-            (sym::allow, _) => Some(Level::Allow),
-            (sym::expect, Some(attr_id)) => {
-                Some(Level::Expect(LintExpectationId::Unstable { attr_id, lint_index: None }))
+    pub fn from_symbol(
+        s: Symbol,
+        id: impl FnOnce() -> Option<AttrId>,
+    ) -> Option<(Self, Option<LintExpectationId>)> {
+        match s {
+            sym::allow => Some((Level::Allow, None)),
+            sym::expect => {
+                if let Some(attr_id) = id() {
+                    Some((
+                        Level::Expect,
+                        Some(LintExpectationId::Unstable { attr_id, lint_index: None }),
+                    ))
+                } else {
+                    None
+                }
             }
-            (sym::warn, _) => Some(Level::Warn),
-            (sym::deny, _) => Some(Level::Deny),
-            (sym::forbid, _) => Some(Level::Forbid),
+            sym::warn => Some((Level::Warn, None)),
+            sym::deny => Some((Level::Deny, None)),
+            sym::forbid => Some((Level::Forbid, None)),
             _ => None,
         }
     }
@@ -245,8 +282,8 @@ impl Level {
             Level::Deny => "-D",
             Level::Forbid => "-F",
             Level::Allow => "-A",
-            Level::ForceWarn(_) => "--force-warn",
-            Level::Expect(_) => {
+            Level::ForceWarn => "--force-warn",
+            Level::Expect => {
                 unreachable!("the expect level does not have a commandline flag")
             }
         }
@@ -254,16 +291,15 @@ impl Level {
 
     pub fn is_error(self) -> bool {
         match self {
-            Level::Allow | Level::Expect(_) | Level::Warn | Level::ForceWarn(_) => false,
+            Level::Allow | Level::Expect | Level::Warn | Level::ForceWarn => false,
             Level::Deny | Level::Forbid => true,
         }
     }
+}
 
-    pub fn get_expectation_id(&self) -> Option<LintExpectationId> {
-        match self {
-            Level::Expect(id) | Level::ForceWarn(Some(id)) => Some(*id),
-            _ => None,
-        }
+impl IntoDiagArg for Level {
+    fn into_diag_arg(self, _: &mut Option<std::path::PathBuf>) -> DiagArgValue {
+        DiagArgValue::Str(Cow::Borrowed(self.to_cmd_flag()))
     }
 }
 
@@ -321,8 +357,6 @@ pub struct Lint {
 /// Extra information for a future incompatibility lint.
 #[derive(Copy, Clone, Debug)]
 pub struct FutureIncompatibleInfo {
-    /// e.g., a URL for an issue/PR/RFC or error code
-    pub reference: &'static str,
     /// The reason for the lint used by diagnostics to provide
     /// the right help message
     pub reason: FutureIncompatibilityReason,
@@ -331,6 +365,29 @@ pub struct FutureIncompatibleInfo {
     /// Set to false for lints that already include a more detailed
     /// explanation.
     pub explain_reason: bool,
+    /// If set to `true`, this will make future incompatibility warnings show up in cargo's
+    /// reports.
+    ///
+    /// When a future incompatibility warning is first inroduced, set this to `false`
+    /// (or, rather, don't override the default). This allows crate developers an opportunity
+    /// to fix the warning before blasting all dependents with a warning they can't fix
+    /// (dependents have to wait for a new release of the affected crate to be published).
+    ///
+    /// After a lint has been in this state for a while, consider setting this to true, so it
+    /// warns for everyone. It is a good signal that it is ready if you can determine that all
+    /// or most affected crates on crates.io have been updated.
+    pub report_in_deps: bool,
+}
+
+#[derive(Copy, Clone, Debug)]
+pub struct EditionFcw {
+    pub edition: Edition,
+    pub page_slug: &'static str,
+}
+
+#[derive(Copy, Clone, Debug)]
+pub struct ReleaseFcw {
+    pub issue_number: usize,
 }
 
 /// The reason for future incompatibility
@@ -350,48 +407,26 @@ pub struct FutureIncompatibleInfo {
 pub enum FutureIncompatibilityReason {
     /// This will be an error in a future release for all editions
     ///
-    /// This will *not* show up in cargo's future breakage report.
-    /// The warning will hence only be seen in local crates, not in dependencies.
-    ///
     /// Choose this variant when you are first introducing a "future
     /// incompatible" warning that is intended to eventually be fixed in the
-    /// future. This allows crate developers an opportunity to fix the warning
-    /// before blasting all dependents with a warning they can't fix
-    /// (dependents have to wait for a new release of the affected crate to be
-    /// published).
+    /// future.
     ///
-    /// After a lint has been in this state for a while, consider graduating
-    /// it to [`FutureIncompatibilityReason::FutureReleaseErrorReportInDeps`].
-    FutureReleaseErrorDontReportInDeps,
-    /// This will be an error in a future release, and
-    /// Cargo should create a report even for dependencies
-    ///
-    /// This is the *only* reason that will make future incompatibility warnings show up in cargo's
-    /// reports. All other future incompatibility warnings are not visible when they occur in a
-    /// dependency.
-    ///
-    /// Choose this variant after the lint has been sitting in the
-    /// [`FutureIncompatibilityReason::FutureReleaseErrorDontReportInDeps`]
-    /// state for a while, and you feel like it is ready to graduate to
-    /// warning everyone. It is a good signal that it is ready if you can
-    /// determine that all or most affected crates on crates.io have been
-    /// updated.
+    /// After a lint has been in this state for a while and you feel like it is ready to graduate
+    /// to warning everyone, consider setting [`FutureIncompatibleInfo::report_in_deps`] to true.
+    /// (see its documentation for more guidance)
     ///
     /// After some period of time, lints with this variant can be turned into
     /// hard errors (and the lint removed). Preferably when there is some
     /// confidence that the number of impacted projects is very small (few
     /// should have a broken dependency in their dependency tree).
-    ///
-    /// [`EditionAndFutureReleaseError`]: FutureIncompatibilityReason::EditionAndFutureReleaseError
-    FutureReleaseErrorReportInDeps,
+    FutureReleaseError(ReleaseFcw),
     /// Code that changes meaning in some way in a
     /// future release.
     ///
     /// Choose this variant when the semantics of existing code is changing,
-    /// (as opposed to
-    /// [`FutureIncompatibilityReason::FutureReleaseErrorDontReportInDeps`],
+    /// (as opposed to [`FutureIncompatibilityReason::FutureReleaseError`],
     /// which is for when code is going to be rejected in the future).
-    FutureReleaseSemanticsChange,
+    FutureReleaseSemanticsChange(ReleaseFcw),
     /// Previously accepted code that will become an
     /// error in the provided edition
     ///
@@ -412,7 +447,7 @@ pub enum FutureIncompatibilityReason {
     /// See also [`FutureIncompatibilityReason::EditionSemanticsChange`] if
     /// you have code that is changing semantics across the edition (as
     /// opposed to being rejected).
-    EditionError(Edition),
+    EditionError(EditionFcw),
     /// Code that changes meaning in some way in
     /// the provided edition
     ///
@@ -420,18 +455,17 @@ pub enum FutureIncompatibilityReason {
     /// except for situations where the semantics change across an edition. It
     /// slightly changes the text of the diagnostic, but is otherwise the
     /// same.
-    EditionSemanticsChange(Edition),
+    EditionSemanticsChange(EditionFcw),
     /// This will be an error in the provided edition *and* in a future
     /// release.
     ///
-    /// This variant a combination of [`FutureReleaseErrorDontReportInDeps`]
-    /// and [`EditionError`]. This is useful in rare cases when we
-    /// want to have "preview" of a breaking change in an edition, but do a
-    /// breaking change later on all editions anyway.
+    /// This variant a combination of [`FutureReleaseError`] and [`EditionError`].
+    /// This is useful in rare cases when we want to have "preview" of a breaking
+    /// change in an edition, but do a breaking change later on all editions anyway.
     ///
     /// [`EditionError`]: FutureIncompatibilityReason::EditionError
-    /// [`FutureReleaseErrorDontReportInDeps`]: FutureIncompatibilityReason::FutureReleaseErrorDontReportInDeps
-    EditionAndFutureReleaseError(Edition),
+    /// [`FutureReleaseError`]: FutureIncompatibilityReason::FutureReleaseError
+    EditionAndFutureReleaseError(EditionFcw),
     /// This will change meaning in the provided edition *and* in a future
     /// release.
     ///
@@ -442,14 +476,29 @@ pub enum FutureIncompatibilityReason {
     ///
     /// [`EditionSemanticsChange`]: FutureIncompatibilityReason::EditionSemanticsChange
     /// [`FutureReleaseSemanticsChange`]: FutureIncompatibilityReason::FutureReleaseSemanticsChange
-    EditionAndFutureReleaseSemanticsChange(Edition),
+    EditionAndFutureReleaseSemanticsChange(EditionFcw),
     /// A custom reason.
     ///
     /// Choose this variant if the built-in text of the diagnostic of the
     /// other variants doesn't match your situation. This is behaviorally
     /// equivalent to
-    /// [`FutureIncompatibilityReason::FutureReleaseErrorDontReportInDeps`].
-    Custom(&'static str),
+    /// [`FutureIncompatibilityReason::FutureReleaseError`].
+    Custom(&'static str, ReleaseFcw),
+
+    /// Using the declare_lint macro a reason always needs to be specified.
+    /// So, this case can't actually be reached but a variant needs to exist for it.
+    /// Any code panics on seeing this variant. Do not use.
+    Unreachable,
+}
+
+impl FutureIncompatibleInfo {
+    pub const fn default_fields_for_macro() -> Self {
+        FutureIncompatibleInfo {
+            reason: FutureIncompatibilityReason::Unreachable,
+            explain_reason: true,
+            report_in_deps: false,
+        }
+    }
 }
 
 impl FutureIncompatibilityReason {
@@ -458,37 +507,50 @@ impl FutureIncompatibilityReason {
             Self::EditionError(e)
             | Self::EditionSemanticsChange(e)
             | Self::EditionAndFutureReleaseError(e)
-            | Self::EditionAndFutureReleaseSemanticsChange(e) => Some(e),
+            | Self::EditionAndFutureReleaseSemanticsChange(e) => Some(e.edition),
 
-            FutureIncompatibilityReason::FutureReleaseErrorDontReportInDeps
-            | FutureIncompatibilityReason::FutureReleaseErrorReportInDeps
-            | FutureIncompatibilityReason::FutureReleaseSemanticsChange
-            | FutureIncompatibilityReason::Custom(_) => None,
+            FutureIncompatibilityReason::FutureReleaseError(_)
+            | FutureIncompatibilityReason::FutureReleaseSemanticsChange(_)
+            | FutureIncompatibilityReason::Custom(_, _) => None,
+            Self::Unreachable => unreachable!(),
         }
     }
 
-    pub fn has_future_breakage(self) -> bool {
+    pub fn reference(&self) -> String {
         match self {
-            FutureIncompatibilityReason::FutureReleaseErrorReportInDeps => true,
-
-            FutureIncompatibilityReason::FutureReleaseErrorDontReportInDeps
-            | FutureIncompatibilityReason::FutureReleaseSemanticsChange
-            | FutureIncompatibilityReason::EditionError(_)
-            | FutureIncompatibilityReason::EditionSemanticsChange(_)
-            | FutureIncompatibilityReason::EditionAndFutureReleaseError(_)
-            | FutureIncompatibilityReason::EditionAndFutureReleaseSemanticsChange(_)
-            | FutureIncompatibilityReason::Custom(_) => false,
+            Self::FutureReleaseSemanticsChange(release_fcw)
+            | Self::FutureReleaseError(release_fcw)
+            | Self::Custom(_, release_fcw) => release_fcw.to_string(),
+            Self::EditionError(edition_fcw)
+            | Self::EditionSemanticsChange(edition_fcw)
+            | Self::EditionAndFutureReleaseError(edition_fcw)
+            | Self::EditionAndFutureReleaseSemanticsChange(edition_fcw) => edition_fcw.to_string(),
+            Self::Unreachable => unreachable!(),
         }
     }
 }
 
-impl FutureIncompatibleInfo {
-    pub const fn default_fields_for_macro() -> Self {
-        FutureIncompatibleInfo {
-            reference: "",
-            reason: FutureIncompatibilityReason::FutureReleaseErrorDontReportInDeps,
-            explain_reason: true,
-        }
+impl Display for ReleaseFcw {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let issue_number = self.issue_number;
+        write!(f, "issue #{issue_number} <https://github.com/rust-lang/rust/issues/{issue_number}>")
+    }
+}
+
+impl Display for EditionFcw {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "<https://doc.rust-lang.org/edition-guide/{}/{}.html>",
+            match self.edition {
+                Edition::Edition2015 => "rust-2015",
+                Edition::Edition2018 => "rust-2018",
+                Edition::Edition2021 => "rust-2021",
+                Edition::Edition2024 => "rust-2024",
+                Edition::EditionFuture => "future",
+            },
+            self.page_slug,
+        )
     }
 }
 
@@ -559,18 +621,18 @@ impl LintId {
     }
 }
 
-impl<HCX> HashStable<HCX> for LintId {
+impl<Hcx> HashStable<Hcx> for LintId {
     #[inline]
-    fn hash_stable(&self, hcx: &mut HCX, hasher: &mut StableHasher) {
+    fn hash_stable(&self, hcx: &mut Hcx, hasher: &mut StableHasher) {
         self.lint_name_raw().hash_stable(hcx, hasher);
     }
 }
 
-impl<HCX> ToStableHashKey<HCX> for LintId {
+impl<Hcx> ToStableHashKey<Hcx> for LintId {
     type KeyType = &'static str;
 
     #[inline]
-    fn to_stable_hash_key(&self, _: &HCX) -> &'static str {
+    fn to_stable_hash_key(&self, _: &mut Hcx) -> &'static str {
         self.lint_name_raw()
     }
 }
@@ -583,21 +645,6 @@ impl StableCompare for LintId {
     }
 }
 
-#[derive(Debug)]
-pub struct AmbiguityErrorDiag {
-    pub msg: String,
-    pub span: Span,
-    pub label_span: Span,
-    pub label_msg: String,
-    pub note_msg: String,
-    pub b1_span: Span,
-    pub b1_note_msg: String,
-    pub b1_help_msgs: Vec<String>,
-    pub b2_span: Span,
-    pub b2_note_msg: String,
-    pub b2_help_msgs: Vec<String>,
-}
-
 #[derive(Debug, Clone)]
 pub enum DeprecatedSinceKind {
     InEffect,
@@ -605,245 +652,127 @@ pub enum DeprecatedSinceKind {
     InVersion(String),
 }
 
-#[derive(Debug)]
-pub enum ElidedLifetimeResolution {
-    Static,
-    Param(Symbol, Span),
-}
-
-// This could be a closure, but then implementing derive trait
-// becomes hacky (and it gets allocated).
-#[derive(Debug)]
-pub enum BuiltinLintDiag {
-    AbsPathWithModule(Span),
-    ProcMacroDeriveResolutionFallback {
-        span: Span,
-        ns: Namespace,
-        ident: Ident,
+#[derive(Debug, HashStable_Generic)]
+pub enum AttributeLintKind {
+    UnusedDuplicate {
+        this: Span,
+        other: Span,
+        warning: bool,
     },
-    MacroExpandedMacroExportsAccessedByAbsolutePaths(Span),
-    ElidedLifetimesInPaths(usize, Span, bool, Span),
-    ElidedNamedLifetimes {
-        elided: (Span, MissingLifetimeKind),
-        resolution: ElidedLifetimeResolution,
+    IllFormedAttributeInput {
+        suggestions: Vec<String>,
+        docs: Option<&'static str>,
+        help: Option<String>,
     },
-    UnknownCrateTypes {
-        span: Span,
-        candidate: Option<Symbol>,
+    EmptyAttribute {
+        first_span: Span,
+        attr_path: String,
+        valid_without_list: bool,
     },
-    UnusedImports {
-        remove_whole_use: bool,
-        num_to_remove: usize,
-        remove_spans: Vec<Span>,
-        test_module_span: Option<Span>,
-        span_snippets: Vec<String>,
-    },
-    RedundantImport(Vec<(Span, bool)>, Ident),
-    DeprecatedMacro {
-        suggestion: Option<Symbol>,
-        suggestion_span: Span,
-        note: Option<Symbol>,
-        path: String,
-        since_kind: DeprecatedSinceKind,
-    },
-    MissingAbi(Span, ExternAbi),
-    UnusedDocComment(Span),
-    UnusedBuiltinAttribute {
-        attr_name: Symbol,
-        macro_name: String,
-        invoc_span: Span,
-    },
-    PatternsInFnsWithoutBody {
-        span: Span,
-        ident: Ident,
-        is_foreign: bool,
-    },
-    LegacyDeriveHelpers(Span),
-    OrPatternsBackCompat(Span, String),
-    ReservedPrefix(Span, String),
-    /// `'r#` in edition < 2021.
-    RawPrefix(Span),
-    /// `##` or `#"` is edition < 2024.
-    ReservedString(Span),
-    TrailingMacro(bool, Ident),
-    BreakWithLabelAndLoop(Span),
-    UnicodeTextFlow(Span, String),
-    UnexpectedCfgName((Symbol, Span), Option<(Symbol, Span)>),
-    UnexpectedCfgValue((Symbol, Span), Option<(Symbol, Span)>),
-    DeprecatedWhereclauseLocation(Span, Option<(Span, String)>),
-    MissingUnsafeOnExtern {
-        suggestion: Span,
-    },
-    SingleUseLifetime {
-        /// Span of the parameter which declares this lifetime.
-        param_span: Span,
-        /// Span of the code that should be removed when eliding this lifetime.
-        /// This span should include leading or trailing comma.
-        deletion_span: Option<Span>,
-        /// Span of the single use, or None if the lifetime is never used.
-        /// If true, the lifetime will be fully elided.
-        use_span: Option<(Span, bool)>,
-        ident: Ident,
-    },
-    NamedArgumentUsedPositionally {
-        /// Span where the named argument is used by position and will be replaced with the named
-        /// argument name
-        position_sp_to_replace: Option<Span>,
-        /// Span where the named argument is used by position and is used for lint messages
-        position_sp_for_msg: Option<Span>,
-        /// Span where the named argument's name is (so we know where to put the warning message)
-        named_arg_sp: Span,
-        /// String containing the named arguments name
-        named_arg_name: String,
-        /// Indicates if the named argument is used as a width/precision for formatting
-        is_formatting_arg: bool,
-    },
-    ByteSliceInPackedStructWithDerive {
-        // FIXME: enum of byte/string
-        ty: String,
-    },
-    UnusedExternCrate {
-        removal_span: Span,
-    },
-    ExternCrateNotIdiomatic {
-        vis_span: Span,
-        ident_span: Span,
-    },
-    AmbiguousGlobImports {
-        diag: AmbiguityErrorDiag,
-    },
-    AmbiguousGlobReexports {
-        /// The name for which collision(s) have occurred.
+    InvalidTarget {
         name: String,
-        /// The name space for which the collision(s) occurred in.
-        namespace: String,
-        /// Span where the name is first re-exported.
-        first_reexport_span: Span,
-        /// Span where the same name is also re-exported.
-        duplicate_reexport_span: Span,
+        target: &'static str,
+        applied: Vec<String>,
+        only: &'static str,
+        attr_span: Span,
     },
-    HiddenGlobReexports {
-        /// The name of the local binding which shadows the glob re-export.
+    InvalidStyle {
         name: String,
-        /// The namespace for which the shadowing occurred in.
-        namespace: String,
-        /// The glob reexport that is shadowed by the local binding.
-        glob_reexport_span: Span,
-        /// The local binding that shadows the glob reexport.
-        private_item_span: Span,
-    },
-    UnusedQualifications {
-        /// The span of the unnecessarily-qualified path to remove.
-        removal_span: Span,
+        is_used_as_inner: bool,
+        target: &'static str,
+        target_span: Span,
     },
     UnsafeAttrOutsideUnsafe {
         attribute_name_span: Span,
-        sugg_spans: (Span, Span),
+        sugg_spans: Option<(Span, Span)>,
     },
-    AssociatedConstElidedLifetime {
-        elided: bool,
+    UnexpectedCfgName((Symbol, Span), Option<(Symbol, Span)>),
+    UnexpectedCfgValue((Symbol, Span), Option<(Symbol, Span)>),
+    DuplicateDocAlias {
+        first_definition: Span,
+    },
+    DocAutoCfgExpectsHideOrShow,
+    DocAutoCfgHideShowUnexpectedItem {
+        attr_name: Symbol,
+    },
+    DocAutoCfgHideShowExpectsList {
+        attr_name: Symbol,
+    },
+    DocInvalid,
+    AmbiguousDeriveHelpers,
+    DocUnknownInclude {
         span: Span,
-        lifetimes_in_scope: MultiSpan,
+        inner: &'static str,
+        value: Symbol,
     },
-    RedundantImportVisibility {
+    DocUnknownSpotlight {
         span: Span,
-        max_vis: String,
-        import_vis: String,
     },
-    UnknownDiagnosticAttribute {
+    DocUnknownPasses {
+        name: Symbol,
         span: Span,
-        typo_name: Option<Symbol>,
     },
-    MacroUseDeprecated,
-    UnusedMacroUse,
-    PrivateExternCrateReexport {
-        source: Ident,
-        extern_crate_span: Span,
+    DocUnknownPlugins {
+        span: Span,
     },
-    UnusedLabel,
-    MacroIsPrivate(Ident),
-    UnusedMacroDefinition(Symbol),
-    MacroRuleNeverUsed(usize, Symbol),
-    UnstableFeature(DiagMessage),
-    AvoidUsingIntelSyntax,
-    AvoidUsingAttSyntax,
-    IncompleteInclude,
-    UnnameableTestItems,
-    DuplicateMacroAttribute,
-    CfgAttrNoAttributes,
-    MissingFragmentSpecifier,
-    MetaVariableStillRepeating(MacroRulesNormalizedIdent),
-    MetaVariableWrongOperator,
-    DuplicateMatcherBinding,
-    UnknownMacroVariable(MacroRulesNormalizedIdent),
-    UnusedCrateDependency {
-        extern_crate: Symbol,
-        local_crate: Symbol,
+    DocUnknownAny {
+        name: Symbol,
     },
-    WasmCAbi,
-    IllFormedAttributeInput {
-        suggestions: Vec<String>,
+    DocAutoCfgWrongLiteral,
+    DocTestTakesList,
+    DocTestUnknown {
+        name: Symbol,
     },
-    InnerAttributeUnstable {
-        is_macro: bool,
+    DocTestLiteral,
+    AttrCrateLevelOnly,
+    DoNotRecommendDoesNotExpectArgs,
+    CrateTypeUnknown {
+        span: Span,
+        suggested: Option<Symbol>,
     },
-    OutOfScopeMacroCalls {
-        path: String,
+    MalformedDoc,
+    ExpectedNoArgs,
+    ExpectedNameValue,
+    MalformedOnUnimplementedAttr {
+        span: Span,
     },
-    UnexpectedBuiltinCfg {
-        cfg: String,
-        cfg_name: Symbol,
-        controlled_by: &'static str,
+    MalformedOnUnknownAttr {
+        span: Span,
     },
+    MalformedOnConstAttr {
+        span: Span,
+    },
+    MalformedOnMoveAttr {
+        span: Span,
+    },
+    MalformedDiagnosticFormat {
+        warning: FormatWarning,
+    },
+    DiagnosticWrappedParserError {
+        description: String,
+        label: String,
+        span: Span,
+    },
+    IgnoredDiagnosticOption {
+        option_name: Symbol,
+        first_span: Span,
+        later_span: Span,
+    },
+    MissingOptionsForOnUnimplemented,
+    MissingOptionsForOnConst,
+    MissingOptionsForOnUnknown,
+    MissingOptionsForOnMove,
+    OnMoveMalformedFormatLiterals {
+        name: Symbol,
+    },
+    OnMoveMalformedAttrExpectedLiteralOrDelimiter,
 }
 
-/// Lints that are buffered up early on in the `Session` before the
-/// `LintLevels` is calculated.
-#[derive(Debug)]
-pub struct BufferedEarlyLint {
-    /// The span of code that we are linting on.
-    pub span: Option<MultiSpan>,
-
-    /// The `NodeId` of the AST node that generated the lint.
-    pub node_id: NodeId,
-
-    /// A lint Id that can be passed to
-    /// `rustc_lint::early::EarlyContextAndPass::check_id`.
-    pub lint_id: LintId,
-
-    /// Customization of the `Diag<'_>` for the lint.
-    pub diagnostic: BuiltinLintDiag,
-}
-
-#[derive(Default, Debug)]
-pub struct LintBuffer {
-    pub map: FxIndexMap<NodeId, Vec<BufferedEarlyLint>>,
-}
-
-impl LintBuffer {
-    pub fn add_early_lint(&mut self, early_lint: BufferedEarlyLint) {
-        self.map.entry(early_lint.node_id).or_default().push(early_lint);
-    }
-
-    pub fn take(&mut self, id: NodeId) -> Vec<BufferedEarlyLint> {
-        // FIXME(#120456) - is `swap_remove` correct?
-        self.map.swap_remove(&id).unwrap_or_default()
-    }
-
-    pub fn buffer_lint(
-        &mut self,
-        lint: &'static Lint,
-        node_id: NodeId,
-        span: impl Into<MultiSpan>,
-        diagnostic: BuiltinLintDiag,
-    ) {
-        self.add_early_lint(BufferedEarlyLint {
-            lint_id: LintId::of(lint),
-            node_id,
-            span: Some(span.into()),
-            diagnostic,
-        });
-    }
+#[derive(Debug, Clone, HashStable_Generic)]
+pub enum FormatWarning {
+    PositionalArgument { span: Span, help: String },
+    InvalidSpecifier { name: String, span: Span },
+    DisallowedPlaceholder { span: Span },
 }
 
 pub type RegisteredTools = FxIndexSet<Ident>;
@@ -928,7 +857,7 @@ macro_rules! declare_lint {
             desc: $desc,
             is_externally_loaded: false,
             $($v: true,)*
-            $(feature_gate: Some(rustc_span::symbol::sym::$gate),)?
+            $(feature_gate: Some(rustc_span::sym::$gate),)?
             $(future_incompatible: Some($crate::FutureIncompatibleInfo {
                 reason: $reason,
                 $($field: $val,)*
@@ -973,7 +902,7 @@ macro_rules! declare_tool_lint {
             report_in_external_macro: $external,
             future_incompatible: None,
             is_externally_loaded: true,
-            $(feature_gate: Some(rustc_span::symbol::sym::$gate),)?
+            $(feature_gate: Some(rustc_span::sym::$gate),)?
             crate_level_only: false,
             $(eval_always: $eval_always,)?
             ..$crate::Lint::default_fields_for_macro()
@@ -1010,5 +939,55 @@ macro_rules! declare_lint_pass {
     ($(#[$m:meta])* $name:ident => [$($lint:expr),* $(,)?]) => {
         $(#[$m])* #[derive(Copy, Clone)] pub struct $name;
         $crate::impl_lint_pass!($name => [$($lint),*]);
+    };
+}
+
+#[macro_export]
+macro_rules! fcw {
+    (FutureReleaseError # $issue_number: literal) => {
+       $crate:: FutureIncompatibilityReason::FutureReleaseError($crate::ReleaseFcw { issue_number: $issue_number })
+    };
+    (FutureReleaseSemanticsChange # $issue_number: literal) => {
+        $crate::FutureIncompatibilityReason::FutureReleaseSemanticsChange($crate::ReleaseFcw {
+            issue_number: $issue_number,
+        })
+    };
+    ($description: literal # $issue_number: literal) => {
+        $crate::FutureIncompatibilityReason::Custom($description, $crate::ReleaseFcw {
+            issue_number: $issue_number,
+        })
+    };
+    (EditionError $edition_name: tt $page_slug: literal) => {
+        $crate::FutureIncompatibilityReason::EditionError($crate::EditionFcw {
+            edition: fcw!(@edition $edition_name),
+            page_slug: $page_slug,
+        })
+    };
+    (EditionSemanticsChange $edition_name: tt $page_slug: literal) => {
+        $crate::FutureIncompatibilityReason::EditionSemanticsChange($crate::EditionFcw {
+            edition: fcw!(@edition $edition_name),
+            page_slug: $page_slug,
+        })
+    };
+    (EditionAndFutureReleaseSemanticsChange $edition_name: tt $page_slug: literal) => {
+        $crate::FutureIncompatibilityReason::EditionAndFutureReleaseSemanticsChange($crate::EditionFcw {
+            edition: fcw!(@edition $edition_name),
+            page_slug: $page_slug,
+        })
+    };
+    (EditionAndFutureReleaseError $edition_name: tt $page_slug: literal) => {
+        $crate::FutureIncompatibilityReason::EditionAndFutureReleaseError($crate::EditionFcw {
+            edition: fcw!(@edition $edition_name),
+            page_slug: $page_slug,
+        })
+    };
+    (@edition 2024) => {
+        rustc_span::edition::Edition::Edition2024
+    };
+    (@edition 2021) => {
+        rustc_span::edition::Edition::Edition2021
+    };
+    (@edition 2018) => {
+        rustc_span::edition::Edition::Edition2018
     };
 }

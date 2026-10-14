@@ -1,16 +1,16 @@
 use std::ops::Range;
 
-use pulldown_cmark::{
-    BrokenLink, BrokenLinkCallback, CowStr, Event, LinkType, OffsetIter, Parser, Tag,
-};
 use rustc_ast::NodeId;
-use rustc_errors::SuggestionStyle;
+use rustc_errors::{Diag, DiagCtxtHandle, Diagnostic, Level, SuggestionStyle};
 use rustc_hir::HirId;
 use rustc_hir::def::{DefKind, DocLinkResMap, Namespace, Res};
 use rustc_lint_defs::Applicability;
+use rustc_resolve::rustdoc::pulldown_cmark::{
+    BrokenLink, BrokenLinkCallback, CowStr, Event, LinkType, OffsetIter, Parser, Tag,
+};
 use rustc_resolve::rustdoc::{prepare_to_doc_link_resolution, source_span_for_markdown_range};
-use rustc_span::Symbol;
 use rustc_span::def_id::DefId;
+use rustc_span::{Span, Symbol};
 
 use crate::clean::Item;
 use crate::clean::utils::{find_nearest_parent_module, inherits_doc_hidden};
@@ -35,24 +35,24 @@ pub(crate) fn visit_item(cx: &DocContext<'_>, item: &Item, hir_id: HirId) {
     }
 }
 
-fn check_redundant_explicit_link_for_did<'md>(
+fn check_redundant_explicit_link_for_did(
     cx: &DocContext<'_>,
     item: &Item,
     did: DefId,
     hir_id: HirId,
-    doc: &'md str,
+    doc: &str,
 ) {
     let Some(local_item_id) = did.as_local() else {
         return;
     };
 
-    let is_hidden = !cx.render_options.document_hidden
+    let is_hidden = !cx.document_hidden()
         && (item.is_doc_hidden() || inherits_doc_hidden(cx.tcx, local_item_id, None));
     if is_hidden {
         return;
     }
-    let is_private = !cx.render_options.document_private
-        && !cx.cache.effective_visibilities.is_directly_public(cx.tcx, did);
+    let is_private =
+        !cx.document_private() && !cx.cache.effective_visibilities.is_directly_public(cx.tcx, did);
     if is_private {
         return;
     }
@@ -71,7 +71,7 @@ fn check_redundant_explicit_link_for_did<'md>(
         return;
     };
 
-    check_redundant_explicit_link(cx, item, hir_id, &doc, &resolutions);
+    check_redundant_explicit_link(cx, item, hir_id, doc, resolutions);
 }
 
 fn check_redundant_explicit_link<'md>(
@@ -90,60 +90,52 @@ fn check_redundant_explicit_link<'md>(
     .into_offset_iter();
 
     while let Some((event, link_range)) = offset_iter.next() {
-        match event {
-            Event::Start(Tag::Link { link_type, dest_url, .. }) => {
-                let link_data = collect_link_data(&mut offset_iter);
+        if let Event::Start(Tag::Link { link_type, dest_url, .. }) = event {
+            let link_data = collect_link_data(&mut offset_iter);
 
-                if let Some(resolvable_link) = link_data.resolvable_link.as_ref() {
-                    if &link_data.display_link.replace('`', "") != resolvable_link {
-                        // Skips if display link does not match to actual
-                        // resolvable link, usually happens if display link
-                        // has several segments, e.g.
-                        // [this is just an `Option`](Option)
-                        continue;
+            if let Some(resolvable_link) = link_data.resolvable_link.as_ref()
+                && &link_data.display_link.replace('`', "") != resolvable_link
+            {
+                // Skips if display link does not match to actual
+                // resolvable link, usually happens if display link
+                // has several segments, e.g.
+                // [this is just an `Option`](Option)
+                continue;
+            }
+
+            let explicit_link = dest_url.to_string();
+            let display_link = link_data.resolvable_link.clone()?;
+
+            if explicit_link.ends_with(&display_link) || display_link.ends_with(&explicit_link) {
+                match link_type {
+                    LinkType::Inline | LinkType::ReferenceUnknown => {
+                        check_inline_or_reference_unknown_redundancy(
+                            cx,
+                            item,
+                            hir_id,
+                            doc,
+                            resolutions,
+                            link_range,
+                            dest_url.to_string(),
+                            link_data,
+                            if link_type == LinkType::Inline { (b'(', b')') } else { (b'[', b']') },
+                        );
                     }
-                }
-
-                let explicit_link = dest_url.to_string();
-                let display_link = link_data.resolvable_link.clone()?;
-
-                if explicit_link.ends_with(&display_link) || display_link.ends_with(&explicit_link)
-                {
-                    match link_type {
-                        LinkType::Inline | LinkType::ReferenceUnknown => {
-                            check_inline_or_reference_unknown_redundancy(
-                                cx,
-                                item,
-                                hir_id,
-                                doc,
-                                resolutions,
-                                link_range,
-                                dest_url.to_string(),
-                                link_data,
-                                if link_type == LinkType::Inline {
-                                    (b'(', b')')
-                                } else {
-                                    (b'[', b']')
-                                },
-                            );
-                        }
-                        LinkType::Reference => {
-                            check_reference_redundancy(
-                                cx,
-                                item,
-                                hir_id,
-                                doc,
-                                resolutions,
-                                link_range,
-                                &dest_url,
-                                link_data,
-                            );
-                        }
-                        _ => {}
+                    LinkType::Reference => {
+                        check_reference_redundancy(
+                            cx,
+                            item,
+                            hir_id,
+                            doc,
+                            resolutions,
+                            link_range,
+                            &dest_url,
+                            link_data,
+                        );
                     }
+                    _ => {}
                 }
             }
-            _ => {}
         }
     }
 
@@ -162,6 +154,40 @@ fn check_inline_or_reference_unknown_redundancy(
     link_data: LinkData,
     (open, close): (u8, u8),
 ) -> Option<()> {
+    struct RedundantExplicitLinks {
+        explicit_span: Span,
+        display_span: Span,
+        link_span: Span,
+        display_link: String,
+    }
+
+    impl<'a> Diagnostic<'a, ()> for RedundantExplicitLinks {
+        fn into_diag(self, dcx: DiagCtxtHandle<'a>, level: Level) -> Diag<'a, ()> {
+            let Self { explicit_span, display_span, link_span, display_link } = self;
+
+            Diag::new(dcx, level, "redundant explicit link target")
+                .with_span_label(
+                    explicit_span,
+                    "explicit target is redundant",
+                )
+                .with_span_label(
+                    display_span,
+                    "because label contains path that resolves to same destination",
+                )
+                .with_note(
+                    "when a link's destination is not specified,\nthe label is used to resolve intra-doc links"
+                )
+                // FIXME (GuillaumeGomez): We cannot use `derive(Diagnostic)` because of this method.
+                .with_span_suggestion_with_style(
+                    link_span,
+                    "remove explicit link target",
+                    format!("[{}]", display_link),
+                    Applicability::MaybeIncorrect,
+                    SuggestionStyle::ShowAlways,
+                )
+        }
+    }
+
     let (resolvable_link, resolvable_link_range) =
         (&link_data.resolvable_link?, &link_data.resolvable_link_range?);
     let (dest_res, display_res) =
@@ -169,28 +195,48 @@ fn check_inline_or_reference_unknown_redundancy(
 
     if dest_res == display_res {
         let link_span =
-            source_span_for_markdown_range(cx.tcx, &doc, &link_range, &item.attrs.doc_strings)
-                .unwrap_or(item.attr_span(cx.tcx));
-        let explicit_span = source_span_for_markdown_range(
+            match source_span_for_markdown_range(cx.tcx, doc, &link_range, &item.attrs.doc_strings)
+            {
+                Some((sp, from_expansion)) => {
+                    if from_expansion {
+                        return None;
+                    }
+                    sp
+                }
+                None => item.attr_span(cx.tcx),
+            };
+        let (explicit_span, false) = source_span_for_markdown_range(
             cx.tcx,
-            &doc,
+            doc,
             &offset_explicit_range(doc, link_range, open, close),
             &item.attrs.doc_strings,
-        )?;
-        let display_span = source_span_for_markdown_range(
+        )?
+        else {
+            // This `span` comes from macro expansion so skipping it.
+            return None;
+        };
+        let (display_span, false) = source_span_for_markdown_range(
             cx.tcx,
-            &doc,
-            &resolvable_link_range,
+            doc,
+            resolvable_link_range,
             &item.attrs.doc_strings,
-        )?;
+        )?
+        else {
+            // This `span` comes from macro expansion so skipping it.
+            return None;
+        };
 
-        cx.tcx.node_span_lint(crate::lint::REDUNDANT_EXPLICIT_LINKS, hir_id, explicit_span, |lint| {
-            lint.primary_message("redundant explicit link target")
-                .span_label(explicit_span, "explicit target is redundant")
-                .span_label(display_span, "because label contains path that resolves to same destination")
-                .note("when a link's destination is not specified,\nthe label is used to resolve intra-doc links")
-                .span_suggestion_with_style(link_span, "remove explicit link target", format!("[{}]", link_data.display_link), Applicability::MaybeIncorrect, SuggestionStyle::ShowAlways);
-        });
+        cx.tcx.emit_node_span_lint(
+            crate::lint::REDUNDANT_EXPLICIT_LINKS,
+            hir_id,
+            explicit_span,
+            RedundantExplicitLinks {
+                explicit_span,
+                display_span,
+                link_span,
+                display_link: link_data.display_link,
+            },
+        );
     }
 
     None
@@ -207,42 +253,95 @@ fn check_reference_redundancy(
     dest: &CowStr<'_>,
     link_data: LinkData,
 ) -> Option<()> {
+    struct RedundantExplicitLinkTarget {
+        explicit_span: Span,
+        display_span: Span,
+        def_span: Span,
+        link_span: Span,
+        display_link: String,
+    }
+
+    impl<'a> Diagnostic<'a, ()> for RedundantExplicitLinkTarget {
+        fn into_diag(self, dcx: DiagCtxtHandle<'a>, level: Level) -> Diag<'a, ()> {
+            let Self { explicit_span, display_span, def_span, link_span, display_link } = self;
+
+            Diag::new(dcx, level, "redundant explicit link target")
+                .with_span_label(explicit_span, "explicit target is redundant")
+                .with_span_label(
+                    display_span,
+                    "because label contains path that resolves to same destination",
+                )
+                .with_span_note(def_span, "referenced explicit link target defined here")
+                .with_note(
+                    "when a link's destination is not specified,\nthe label is used to resolve intra-doc links"
+                )
+                // FIXME (GuillaumeGomez): We cannot use `derive(Diagnostic)` because of this method.
+                .with_span_suggestion_with_style(
+                    link_span,
+                    "remove explicit link target",
+                    format!("[{}]", display_link),
+                    Applicability::MaybeIncorrect,
+                    SuggestionStyle::ShowAlways,
+                )
+        }
+    }
+
     let (resolvable_link, resolvable_link_range) =
         (&link_data.resolvable_link?, &link_data.resolvable_link_range?);
     let (dest_res, display_res) =
-        (find_resolution(resolutions, &dest)?, find_resolution(resolutions, resolvable_link)?);
+        (find_resolution(resolutions, dest)?, find_resolution(resolutions, resolvable_link)?);
 
     if dest_res == display_res {
         let link_span =
-            source_span_for_markdown_range(cx.tcx, &doc, &link_range, &item.attrs.doc_strings)
-                .unwrap_or(item.attr_span(cx.tcx));
-        let explicit_span = source_span_for_markdown_range(
+            match source_span_for_markdown_range(cx.tcx, doc, &link_range, &item.attrs.doc_strings)
+            {
+                Some((sp, from_expansion)) => {
+                    if from_expansion {
+                        return None;
+                    }
+                    sp
+                }
+                None => item.attr_span(cx.tcx),
+            };
+        let (explicit_span, false) = source_span_for_markdown_range(
             cx.tcx,
-            &doc,
+            doc,
             &offset_explicit_range(doc, link_range.clone(), b'[', b']'),
             &item.attrs.doc_strings,
-        )?;
-        let display_span = source_span_for_markdown_range(
+        )?
+        else {
+            // This `span` comes from macro expansion so skipping it.
+            return None;
+        };
+        let (display_span, false) = source_span_for_markdown_range(
             cx.tcx,
-            &doc,
-            &resolvable_link_range,
+            doc,
+            resolvable_link_range,
             &item.attrs.doc_strings,
-        )?;
-        let def_span = source_span_for_markdown_range(
+        )?
+        else {
+            // This `span` comes from macro expansion so skipping it.
+            return None;
+        };
+        let (def_span, _) = source_span_for_markdown_range(
             cx.tcx,
-            &doc,
+            doc,
             &offset_reference_def_range(doc, dest, link_range),
             &item.attrs.doc_strings,
         )?;
 
-        cx.tcx.node_span_lint(crate::lint::REDUNDANT_EXPLICIT_LINKS, hir_id, explicit_span, |lint| {
-            lint.primary_message("redundant explicit link target")
-            .span_label(explicit_span, "explicit target is redundant")
-                .span_label(display_span, "because label contains path that resolves to same destination")
-                .span_note(def_span, "referenced explicit link target defined here")
-                .note("when a link's destination is not specified,\nthe label is used to resolve intra-doc links")
-                .span_suggestion_with_style(link_span, "remove explicit link target", format!("[{}]", link_data.display_link), Applicability::MaybeIncorrect, SuggestionStyle::ShowAlways);
-        });
+        cx.tcx.emit_node_span_lint(
+            crate::lint::REDUNDANT_EXPLICIT_LINKS,
+            hir_id,
+            explicit_span,
+            RedundantExplicitLinkTarget {
+                explicit_span,
+                display_span,
+                def_span,
+                link_span,
+                display_link: link_data.display_link,
+            },
+        );
     }
 
     None
@@ -263,7 +362,7 @@ fn collect_link_data<'input, F: BrokenLinkCallback<'input>>(
     let mut display_link = String::new();
     let mut is_resolvable = true;
 
-    while let Some((event, range)) = offset_iter.next() {
+    for (event, range) in offset_iter.by_ref() {
         match event {
             Event::Text(code) => {
                 let code = code.to_string();

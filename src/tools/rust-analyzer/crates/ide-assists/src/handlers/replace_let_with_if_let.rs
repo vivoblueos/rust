@@ -1,16 +1,14 @@
-use std::iter::once;
-
 use ide_db::ty_filter::TryEnum;
 use syntax::{
+    AstNode, T,
     ast::{
         self,
         edit::{AstNodeEdit, IndentLevel},
-        make,
+        syntax_factory::SyntaxFactory,
     },
-    AstNode, T,
 };
 
-use crate::{AssistContext, AssistId, AssistKind, Assists};
+use crate::{AssistContext, AssistId, Assists};
 
 // Assist: replace_let_with_if_let
 //
@@ -44,30 +42,57 @@ pub(crate) fn replace_let_with_if_let(acc: &mut Assists, ctx: &AssistContext<'_>
 
     let target = let_kw.text_range();
     acc.add(
-        AssistId("replace_let_with_if_let", AssistKind::RefactorRewrite),
+        AssistId::refactor_rewrite("replace_let_with_if_let"),
         "Replace let with if let",
         target,
-        |edit| {
+        |builder| {
+            let mut editor = builder.make_editor(let_stmt.syntax());
+            let make = SyntaxFactory::with_mappings();
             let ty = ctx.sema.type_of_expr(&init);
-            let happy_variant = ty
-                .and_then(|ty| TryEnum::from_ty(&ctx.sema, &ty.adjusted()))
-                .map(|it| it.happy_case());
-            let pat = match happy_variant {
-                None => original_pat,
-                Some(var_name) => {
-                    make::tuple_struct_pat(make::ext::ident_path(var_name), once(original_pat))
-                        .into()
+            let pat = if let_stmt.let_else().is_some() {
+                // Do not add the wrapper type that implements `Try`,
+                // since the statement already wraps the pattern.
+                original_pat
+            } else {
+                let happy_variant = ty
+                    .and_then(|ty| TryEnum::from_ty(&ctx.sema, &ty.adjusted()))
+                    .map(|it| it.happy_case());
+                match happy_variant {
+                    None => original_pat,
+                    Some(var_name) => {
+                        make.tuple_struct_pat(make.ident_path(var_name), [original_pat]).into()
+                    }
                 }
             };
+            let init_expr =
+                if let_expr_needs_paren(&init) { make.expr_paren(init).into() } else { init };
 
-            let block =
-                make::ext::empty_block_expr().indent(IndentLevel::from_node(let_stmt.syntax()));
-            let if_ = make::expr_if(make::expr_let(pat, init).into(), block, None);
-            let stmt = make::expr_stmt(if_);
+            let block = make.block_expr([], None);
+            let block = block.indent(IndentLevel::from_node(let_stmt.syntax()));
+            let if_expr = make.expr_if(
+                make.expr_let(pat, init_expr).into(),
+                block,
+                let_stmt
+                    .let_else()
+                    .and_then(|let_else| let_else.block_expr().map(ast::ElseBranch::from)),
+            );
+            let if_stmt = make.expr_stmt(if_expr.into());
 
-            edit.replace_ast(ast::Stmt::from(let_stmt), ast::Stmt::from(stmt));
+            editor.replace(let_stmt.syntax(), if_stmt.syntax());
+            editor.add_mappings(make.finish_with_mappings());
+            builder.add_file_edits(ctx.vfs_file_id(), editor);
         },
     )
+}
+
+fn let_expr_needs_paren(expr: &ast::Expr) -> bool {
+    let make = SyntaxFactory::without_mappings();
+    let fake_expr_let = make.expr_let(make.tuple_pat(None).into(), make.expr_unit());
+    let Some(fake_expr) = fake_expr_let.expr() else {
+        stdx::never!();
+        return false;
+    };
+    expr.needs_parens_in_place_of(fake_expr_let.syntax(), fake_expr.syntax())
 }
 
 #[cfg(test)]
@@ -75,6 +100,29 @@ mod tests {
     use crate::tests::check_assist;
 
     use super::*;
+
+    #[test]
+    fn replace_let_try_enum_ref() {
+        check_assist(
+            replace_let_with_if_let,
+            r"
+//- minicore: option
+fn main(action: Action) {
+    $0let x = compute();
+}
+
+fn compute() -> &'static Option<i32> { &None }
+            ",
+            r"
+fn main(action: Action) {
+    if let Some(x) = compute() {
+    }
+}
+
+fn compute() -> &'static Option<i32> { &None }
+            ",
+        )
+    }
 
     #[test]
     fn replace_let_unknown_enum() {
@@ -93,6 +141,63 @@ enum E<T> { X(T), Y(T) }
 fn main() {
     if let x = E::X(92) {
     }
+}
+            ",
+        )
+    }
+
+    #[test]
+    fn replace_let_logic_and() {
+        check_assist(
+            replace_let_with_if_let,
+            r"
+fn main() {
+    $0let x = true && false;
+}
+            ",
+            r"
+fn main() {
+    if let x = (true && false) {
+    }
+}
+            ",
+        )
+    }
+
+    #[test]
+    fn replace_let_logic_or() {
+        check_assist(
+            replace_let_with_if_let,
+            r"
+fn main() {
+    $0let x = true || false;
+}
+            ",
+            r"
+fn main() {
+    if let x = (true || false) {
+    }
+}
+            ",
+        )
+    }
+
+    #[test]
+    fn replace_let_else() {
+        check_assist(
+            replace_let_with_if_let,
+            r"
+//- minicore: option
+fn main() {
+    let a = Some(1);
+    $0let Some(_) = a else { unreachable!() };
+}
+            ",
+            r"
+fn main() {
+    let a = Some(1);
+    if let Some(_) = a {
+    } else { unreachable!() }
 }
             ",
         )

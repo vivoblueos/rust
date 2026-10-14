@@ -1,3 +1,4 @@
+use rustc_hir::def_id::DefId;
 use rustc_infer::infer::relate::{
     self, Relate, RelateResult, TypeRelation, structurally_relate_tys,
 };
@@ -36,6 +37,19 @@ impl<'tcx> TypeRelation<TyCtxt<'tcx>> for MatchAgainstFreshVars<'tcx> {
         self.tcx
     }
 
+    fn relate_ty_args(
+        &mut self,
+        a_ty: Ty<'tcx>,
+        _: Ty<'tcx>,
+        _: DefId,
+        a_args: ty::GenericArgsRef<'tcx>,
+        b_args: ty::GenericArgsRef<'tcx>,
+        _: impl FnOnce(ty::GenericArgsRef<'tcx>) -> Ty<'tcx>,
+    ) -> RelateResult<'tcx, Ty<'tcx>> {
+        relate::relate_args_invariantly(self, a_args, b_args)?;
+        Ok(a_ty)
+    }
+
     fn relate_with_variance<T: Relate<TyCtxt<'tcx>>>(
         &mut self,
         _: ty::Variance,
@@ -70,7 +84,7 @@ impl<'tcx> TypeRelation<TyCtxt<'tcx>> for MatchAgainstFreshVars<'tcx> {
             ) => Ok(a),
 
             (&ty::Infer(_), _) | (_, &ty::Infer(_)) => {
-                Err(TypeError::Sorts(ExpectedFound::new(true, a, b)))
+                Err(TypeError::Sorts(ExpectedFound::new(a, b)))
             }
 
             (&ty::Error(guar), _) | (_, &ty::Error(guar)) => Ok(Ty::new_error(self.cx(), guar)),
@@ -95,7 +109,7 @@ impl<'tcx> TypeRelation<TyCtxt<'tcx>> for MatchAgainstFreshVars<'tcx> {
             }
 
             (ty::ConstKind::Infer(_), _) | (_, ty::ConstKind::Infer(_)) => {
-                return Err(TypeError::ConstMismatch(ExpectedFound::new(true, a, b)));
+                return Err(TypeError::ConstMismatch(ExpectedFound::new(a, b)));
             }
 
             _ => {}

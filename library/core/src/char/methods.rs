@@ -4,6 +4,7 @@ use super::*;
 use crate::panic::const_panic;
 use crate::slice;
 use crate::str::from_utf8_unchecked_mut;
+use crate::ub_checks::assert_unsafe_precondition;
 use crate::unicode::printable::is_printable;
 use crate::unicode::{self, conversions};
 
@@ -71,6 +72,16 @@ impl char {
     #[stable(feature = "assoc_char_consts", since = "1.52.0")]
     pub const MAX: char = '\u{10FFFF}';
 
+    /// The maximum number of bytes required to [encode](char::encode_utf8) a `char` to
+    /// UTF-8 encoding.
+    #[stable(feature = "char_max_len_assoc", since = "1.93.0")]
+    pub const MAX_LEN_UTF8: usize = 4;
+
+    /// The maximum number of two-byte units required to [encode](char::encode_utf16) a `char`
+    /// to UTF-16 encoding.
+    #[stable(feature = "char_max_len_assoc", since = "1.93.0")]
+    pub const MAX_LEN_UTF16: usize = 2;
+
     /// `U+FFFD REPLACEMENT CHARACTER` (�) is used in Unicode to represent a
     /// decoding error.
     ///
@@ -92,7 +103,7 @@ impl char {
     #[stable(feature = "assoc_char_consts", since = "1.52.0")]
     pub const UNICODE_VERSION: (u8, u8, u8) = crate::unicode::UNICODE_VERSION;
 
-    /// Creates an iterator over the UTF-16 encoded code points in `iter`,
+    /// Creates an iterator over the native endian UTF-16 encoded code points in `iter`,
     /// returning unpaired surrogates as `Err`s.
     ///
     /// # Examples
@@ -327,7 +338,7 @@ impl char {
     /// '1'.is_digit(1);
     /// ```
     #[stable(feature = "rust1", since = "1.0.0")]
-    #[rustc_const_unstable(feature = "const_char_classify", issue = "132241")]
+    #[rustc_const_stable(feature = "const_char_classify", since = "1.87.0")]
     #[inline]
     pub const fn is_digit(self, radix: u32) -> bool {
         self.to_digit(radix).is_some()
@@ -384,6 +395,7 @@ impl char {
     /// ```
     #[stable(feature = "rust1", since = "1.0.0")]
     #[rustc_const_stable(feature = "const_char_convert", since = "1.67.0")]
+    #[rustc_diagnostic_item = "char_to_digit"]
     #[must_use = "this returns the result of the operation, \
                   without modifying the original"]
     #[inline]
@@ -394,17 +406,21 @@ impl char {
         );
         // check radix to remove letter handling code when radix is a known constant
         let value = if self > '9' && radix > 10 {
-            // convert ASCII letters to lowercase
-            let lower = self as u32 | 0x20;
-            // convert an ASCII letter to the corresponding value,
-            // non-letters convert to values > 36
-            lower.wrapping_sub('a' as u32) as u64 + 10
+            // mask to convert ASCII letters to uppercase
+            const TO_UPPERCASE_MASK: u32 = !0b0010_0000;
+            // Converts an ASCII letter to its corresponding integer value:
+            // A-Z => 10-35, a-z => 10-35. Other characters produce values >= 36.
+            //
+            // Add Overflow Safety:
+            // By applying the mask after the subtraction, the first addendum is
+            // constrained such that it never exceeds u32::MAX - 0x20.
+            ((self as u32).wrapping_sub('A' as u32) & TO_UPPERCASE_MASK) + 10
         } else {
             // convert digit to value, non-digits wrap to values > 36
-            (self as u32).wrapping_sub('0' as u32) as u64
+            (self as u32).wrapping_sub('0' as u32)
         };
         // FIXME(const-hack): once then_some is const fn, use it here
-        if value < radix as u64 { Some(value as u32) } else { None }
+        if value < radix { Some(value) } else { None }
     }
 
     /// Returns an iterator that yields the hexadecimal Unicode escape of a
@@ -700,7 +716,7 @@ impl char {
         unsafe { from_utf8_unchecked_mut(encode_utf8_raw(self as u32, dst)) }
     }
 
-    /// Encodes this character as UTF-16 into the provided `u16` buffer,
+    /// Encodes this character as native endian UTF-16 into the provided `u16` buffer,
     /// and then returns the subslice of the buffer that contains the encoded character.
     ///
     /// # Panics
@@ -729,7 +745,7 @@ impl char {
     /// '𝕊'.encode_utf16(&mut b);
     /// ```
     #[stable(feature = "unicode_encode_char", since = "1.15.0")]
-    #[rustc_const_stable(feature = "const_char_encode_utf16", since = "CURRENT_RUSTC_VERSION")]
+    #[rustc_const_stable(feature = "const_char_encode_utf16", since = "1.84.0")]
     #[inline]
     pub const fn encode_utf16(self, dst: &mut [u16]) -> &mut [u16] {
         encode_utf16_raw(self as u32, dst)
@@ -762,7 +778,72 @@ impl char {
     pub fn is_alphabetic(self) -> bool {
         match self {
             'a'..='z' | 'A'..='Z' => true,
-            c => c > '\x7f' && unicode::Alphabetic(c),
+            '\0'..='\u{A9}' => false,
+            _ => unicode::Alphabetic(self),
+        }
+    }
+
+    /// Returns `true` if this `char` has the `Cased` property.
+    /// A character is cased if and only if it is uppercase, lowercase, or titlecase.
+    ///
+    /// `Cased` is described in Chapter 4 (Character Properties) of the [Unicode Standard] and
+    /// specified in the [Unicode Character Database][ucd] [`DerivedCoreProperties.txt`].
+    ///
+    /// [Unicode Standard]: https://www.unicode.org/versions/latest/
+    /// [ucd]: https://www.unicode.org/reports/tr44/
+    /// [`DerivedCoreProperties.txt`]: https://www.unicode.org/Public/UCD/latest/ucd/DerivedCoreProperties.txt
+    ///
+    /// # Examples
+    ///
+    /// Basic usage:
+    ///
+    /// ```
+    /// #![feature(titlecase)]
+    /// assert!('A'.is_cased());
+    /// assert!('a'.is_cased());
+    /// assert!(!'京'.is_cased());
+    /// ```
+    #[must_use]
+    #[unstable(feature = "titlecase", issue = "153892")]
+    #[inline]
+    pub fn is_cased(self) -> bool {
+        match self {
+            'a'..='z' | 'A'..='Z' => true,
+            '\0'..='\u{A9}' => false,
+            _ => unicode::Cased(self),
+        }
+    }
+
+    /// Returns the case of this character:
+    /// [`Some(CharCase::Upper)`][`CharCase::Upper`] if [`self.is_uppercase()`][`char::is_uppercase`],
+    /// [`Some(CharCase::Lower)`][`CharCase::Lower`] if [`self.is_lowercase()`][`char::is_lowercase`],
+    /// [`Some(CharCase::Title)`][`CharCase::Title`] if [`self.is_titlecase()`][`char::is_titlecase`], and
+    /// `None` if [`!self.is_cased()`][`char::is_cased`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// #![feature(titlecase)]
+    /// use core::char::CharCase;
+    /// assert_eq!('a'.case(), Some(CharCase::Lower));
+    /// assert_eq!('δ'.case(), Some(CharCase::Lower));
+    /// assert_eq!('A'.case(), Some(CharCase::Upper));
+    /// assert_eq!('Δ'.case(), Some(CharCase::Upper));
+    /// assert_eq!('ǅ'.case(), Some(CharCase::Title));
+    /// assert_eq!('中'.case(), None);
+    /// ```
+    #[must_use]
+    #[unstable(feature = "titlecase", issue = "153892")]
+    #[inline]
+    pub fn case(self) -> Option<CharCase> {
+        match self {
+            'a'..='z' => Some(CharCase::Lower),
+            'A'..='Z' => Some(CharCase::Upper),
+            '\0'..='\u{A9}' => None,
+            _ if !unicode::Cased(self) => None,
+            _ if unicode::Lowercase(self) => Some(CharCase::Lower),
+            _ if unicode::Uppercase(self) => Some(CharCase::Upper),
+            _ => Some(CharCase::Title),
         }
     }
 
@@ -803,7 +884,42 @@ impl char {
     pub const fn is_lowercase(self) -> bool {
         match self {
             'a'..='z' => true,
-            c => c > '\x7f' && unicode::Lowercase(c),
+            '\0'..='\u{A9}' => false,
+            _ => unicode::Lowercase(self),
+        }
+    }
+
+    /// Returns `true` if this `char` has the general category for titlecase letters.
+    /// Conceptually, these characters consist of an uppercase portion followed by a lowercase portion.
+    ///
+    /// Titlecase letters (code points with the general category of `Lt`) are described in Chapter 4
+    /// (Character Properties) of the [Unicode Standard] and specified in the [Unicode Character
+    /// Database][ucd] [`UnicodeData.txt`].
+    ///
+    /// [Unicode Standard]: https://www.unicode.org/versions/latest/
+    /// [ucd]: https://www.unicode.org/reports/tr44/
+    /// [`UnicodeData.txt`]: https://www.unicode.org/Public/UCD/latest/ucd/UnicodeData.txt
+    ///
+    /// # Examples
+    ///
+    /// Basic usage:
+    ///
+    /// ```
+    /// #![feature(titlecase)]
+    /// assert!('ǅ'.is_titlecase());
+    /// assert!('ῼ'.is_titlecase());
+    /// assert!(!'D'.is_titlecase());
+    /// assert!(!'z'.is_titlecase());
+    /// assert!(!'中'.is_titlecase());
+    /// assert!(!' '.is_titlecase());
+    /// ```
+    #[must_use]
+    #[unstable(feature = "titlecase", issue = "153892")]
+    #[inline]
+    pub fn is_titlecase(self) -> bool {
+        match self {
+            '\0'..='\u{01C4}' => false,
+            _ => self.is_cased() && !self.is_lowercase() && !self.is_uppercase(),
         }
     }
 
@@ -844,7 +960,8 @@ impl char {
     pub const fn is_uppercase(self) -> bool {
         match self {
             'A'..='Z' => true,
-            c => c > '\x7f' && unicode::Uppercase(c),
+            '\0'..='\u{BF}' => false,
+            _ => unicode::Uppercase(self),
         }
     }
 
@@ -872,12 +989,13 @@ impl char {
     /// ```
     #[must_use]
     #[stable(feature = "rust1", since = "1.0.0")]
-    #[rustc_const_unstable(feature = "const_char_classify", issue = "132241")]
+    #[rustc_const_stable(feature = "const_char_classify", since = "1.87.0")]
     #[inline]
     pub const fn is_whitespace(self) -> bool {
         match self {
             ' ' | '\x09'..='\x0d' => true,
-            c => c > '\x7f' && unicode::White_Space(c),
+            '\0'..='\u{84}' => false,
+            _ => unicode::White_Space(self),
         }
     }
 
@@ -904,7 +1022,11 @@ impl char {
     #[stable(feature = "rust1", since = "1.0.0")]
     #[inline]
     pub fn is_alphanumeric(self) -> bool {
-        self.is_alphabetic() || self.is_numeric()
+        match self {
+            'a'..='z' | 'A'..='Z' | '0'..='9' => true,
+            '\0'..='\u{A9}' => false,
+            _ => unicode::Alphabetic(self) || unicode::N(self),
+        }
     }
 
     /// Returns `true` if this `char` has the general category for control codes.
@@ -930,7 +1052,11 @@ impl char {
     #[stable(feature = "rust1", since = "1.0.0")]
     #[inline]
     pub fn is_control(self) -> bool {
-        unicode::Cc(self)
+        // According to
+        // https://www.unicode.org/policies/stability_policy.html#Property_Value,
+        // the set of codepoints in `Cc` will never change.
+        // So we can just hard-code the patterns to match against instead of using a table.
+        matches!(self, '\0'..='\x1f' | '\x7f'..='\u{9f}')
     }
 
     /// Returns `true` if this `char` has the `Grapheme_Extend` property.
@@ -945,7 +1071,29 @@ impl char {
     #[must_use]
     #[inline]
     pub(crate) fn is_grapheme_extended(self) -> bool {
-        unicode::Grapheme_Extend(self)
+        self > '\u{02FF}' && unicode::Grapheme_Extend(self)
+    }
+
+    /// Returns `true` if this `char` has the `Case_Ignorable` property. This narrow-use property
+    /// is used to implement context-dependent casing for the Greek letter sigma (uppercase Σ),
+    /// which has two lowercase forms.
+    ///
+    /// `Case_Ignorable` is [described][D136] in Chapter 3 (Conformance) of the Unicode Core Specification,
+    /// and specified in the [Unicode Character Database][ucd] [`DerivedCoreProperties.txt`];
+    /// see those resources for more information.
+    ///
+    /// [D136]: https://www.unicode.org/versions/latest/core-spec/chapter-3/#G63116
+    /// [ucd]: https://www.unicode.org/reports/tr44/
+    /// [`DerivedCoreProperties.txt`]: https://www.unicode.org/Public/UCD/latest/ucd/DerivedCoreProperties.txt
+    #[must_use]
+    #[inline]
+    #[unstable(feature = "case_ignorable", issue = "154848")]
+    pub fn is_case_ignorable(self) -> bool {
+        if self.is_ascii() {
+            matches!(self, '\'' | '.' | ':' | '^' | '`')
+        } else {
+            unicode::Case_Ignorable(self)
+        }
     }
 
     /// Returns `true` if this `char` has one of the general categories for numbers.
@@ -987,7 +1135,8 @@ impl char {
     pub fn is_numeric(self) -> bool {
         match self {
             '0'..='9' => true,
-            c => c > '\x7f' && unicode::N(c),
+            '\0'..='\u{B1}' => false,
+            _ => unicode::N(self),
         }
     }
 
@@ -1050,7 +1199,7 @@ impl char {
     /// // convert into themselves.
     /// assert_eq!('山'.to_lowercase().to_string(), "山");
     /// ```
-    #[must_use = "this returns the lowercase character as a new iterator, \
+    #[must_use = "this returns the lowercased character as a new iterator, \
                   without modifying the original"]
     #[stable(feature = "rust1", since = "1.0.0")]
     #[inline]
@@ -1058,12 +1207,16 @@ impl char {
         ToLowercase(CaseMappingIter::new(conversions::to_lower(self)))
     }
 
-    /// Returns an iterator that yields the uppercase mapping of this `char` as one or more
+    /// Returns an iterator that yields the titlecase mapping of this `char` as one or more
     /// `char`s.
     ///
-    /// If this `char` does not have an uppercase mapping, the iterator yields the same `char`.
+    /// This is usually, but not always, equivalent to the uppercase mapping
+    /// returned by [`Self::to_uppercase`]. Prefer this method when seeking to capitalize
+    /// Only The First Letter of a word, but use [`Self::to_uppercase`] for ALL CAPS.
     ///
-    /// If this `char` has a one-to-one uppercase mapping given by the [Unicode Character
+    /// If this `char` does not have a titlecase mapping, the iterator yields the same `char`.
+    ///
+    /// If this `char` has a one-to-one titlecase mapping given by the [Unicode Character
     /// Database][ucd] [`UnicodeData.txt`], the iterator yields that `char`.
     ///
     /// [ucd]: https://www.unicode.org/reports/tr44/
@@ -1087,7 +1240,8 @@ impl char {
     /// As an iterator:
     ///
     /// ```
-    /// for c in 'ß'.to_uppercase() {
+    /// #![feature(titlecase)]
+    /// for c in 'ß'.to_titlecase() {
     ///     print!("{c}");
     /// }
     /// println!();
@@ -1096,22 +1250,126 @@ impl char {
     /// Using `println!` directly:
     ///
     /// ```
-    /// println!("{}", 'ß'.to_uppercase());
+    /// #![feature(titlecase)]
+    /// println!("{}", 'ß'.to_titlecase());
     /// ```
     ///
     /// Both are equivalent to:
     ///
     /// ```
-    /// println!("SS");
+    /// println!("Ss");
+    /// ```
+    ///
+    /// Using [`to_string`](../std/string/trait.ToString.html#tymethod.to_string):
+    ///
+    /// ```
+    /// #![feature(titlecase)]
+    /// assert_eq!('c'.to_titlecase().to_string(), "C");
+    /// assert_eq!('ǆ'.to_titlecase().to_string(), "ǅ");
+    /// assert_eq!('ῼ'.to_titlecase().to_string(), "ῼ");
+    ///
+    /// // Sometimes the result is more than one character:
+    /// assert_eq!('ß'.to_titlecase().to_string(), "Ss");
+    ///
+    /// // Characters that do not have separate cased forms
+    /// // convert into themselves.
+    /// assert_eq!('山'.to_titlecase().to_string(), "山");
+    /// ```
+    ///
+    /// # Note on locale
+    ///
+    /// In Turkish and Azeri, the equivalent of 'i' in Latin has five forms instead of two:
+    ///
+    /// * 'Dotless': I / ı, sometimes written ï
+    /// * 'Dotted': İ / i
+    ///
+    /// Note that the lowercase dotted 'i' is the same as the Latin. Therefore:
+    ///
+    /// ```
+    /// #![feature(titlecase)]
+    /// let upper_i = 'i'.to_titlecase().to_string();
+    /// ```
+    ///
+    /// The value of `upper_i` here relies on the language of the text: if we're
+    /// in `en-US`, it should be `"I"`, but if we're in `tr-TR` or `az-AZ`, it should
+    /// be `"İ"`. `to_titlecase()` does not take this into account, and so:
+    ///
+    /// ```
+    /// #![feature(titlecase)]
+    /// let upper_i = 'i'.to_titlecase().to_string();
+    ///
+    /// assert_eq!(upper_i, "I");
+    /// ```
+    ///
+    /// holds across languages.
+    #[must_use = "this returns the titlecased character as a new iterator, \
+                  without modifying the original"]
+    #[unstable(feature = "titlecase", issue = "153892")]
+    #[inline]
+    pub fn to_titlecase(self) -> ToTitlecase {
+        ToTitlecase(CaseMappingIter::new(conversions::to_title(self)))
+    }
+
+    /// Returns an iterator that yields the uppercase mapping of this `char` as one or more
+    /// `char`s.
+    ///
+    /// Prefer this method when converting a word into ALL CAPS, but consider [`Self::to_titlecase`]
+    /// instead if you seek to capitalize Only The First Letter.
+    ///
+    /// If this `char` does not have an uppercase mapping, the iterator yields the same `char`.
+    ///
+    /// If this `char` has a one-to-one uppercase mapping given by the [Unicode Character
+    /// Database][ucd] [`UnicodeData.txt`], the iterator yields that `char`.
+    ///
+    /// [ucd]: https://www.unicode.org/reports/tr44/
+    /// [`UnicodeData.txt`]: https://www.unicode.org/Public/UCD/latest/ucd/UnicodeData.txt
+    ///
+    /// If this `char` requires special considerations (e.g. multiple `char`s) the iterator yields
+    /// the `char`(s) given by [`SpecialCasing.txt`].
+    ///
+    /// [`SpecialCasing.txt`]: https://www.unicode.org/Public/UCD/latest/ucd/SpecialCasing.txt
+    ///
+    /// This operation performs an unconditional mapping without tailoring. That is, the conversion
+    /// is independent of context and language.
+    ///
+    /// In the [Unicode Standard], Chapter 4 (Character Properties) discusses case mapping in
+    /// general and Chapter 3 (Conformance) discusses the default algorithm for case conversion.
+    ///
+    /// [Unicode Standard]: https://www.unicode.org/versions/latest/
+    ///
+    /// # Examples
+    /// `'ﬅ'` (U+FB05) is a single Unicode code point (a ligature) that maps to "ST" in uppercase.
+    ///
+    /// As an iterator:
+    ///
+    /// ```
+    /// for c in 'ﬅ'.to_uppercase() {
+    ///     print!("{c}");
+    /// }
+    /// println!();
+    /// ```
+    ///
+    /// Using `println!` directly:
+    ///
+    /// ```
+    /// println!("{}", 'ﬅ'.to_uppercase());
+    /// ```
+    ///
+    /// Both are equivalent to:
+    ///
+    /// ```
+    /// println!("ST");
     /// ```
     ///
     /// Using [`to_string`](../std/string/trait.ToString.html#tymethod.to_string):
     ///
     /// ```
     /// assert_eq!('c'.to_uppercase().to_string(), "C");
+    /// assert_eq!('ǆ'.to_uppercase().to_string(), "Ǆ");
     ///
     /// // Sometimes the result is more than one character:
-    /// assert_eq!('ß'.to_uppercase().to_string(), "SS");
+    /// assert_eq!('ﬅ'.to_uppercase().to_string(), "ST");
+    /// assert_eq!('ῼ'.to_uppercase().to_string(), "ΩΙ");
     ///
     /// // Characters that do not have both uppercase and lowercase
     /// // convert into themselves.
@@ -1120,7 +1378,7 @@ impl char {
     ///
     /// # Note on locale
     ///
-    /// In Turkish, the equivalent of 'i' in Latin has five forms instead of two:
+    /// In Turkish and Azeri, the equivalent of 'i' in Latin has five forms instead of two:
     ///
     /// * 'Dotless': I / ı, sometimes written ï
     /// * 'Dotted': İ / i
@@ -1132,7 +1390,7 @@ impl char {
     /// ```
     ///
     /// The value of `upper_i` here relies on the language of the text: if we're
-    /// in `en-US`, it should be `"I"`, but if we're in `tr_TR`, it should
+    /// in `en-US`, it should be `"I"`, but if we're in `tr-TR` or `az-AZ`, it should
     /// be `"İ"`. `to_uppercase()` does not take this into account, and so:
     ///
     /// ```
@@ -1142,7 +1400,7 @@ impl char {
     /// ```
     ///
     /// holds across languages.
-    #[must_use = "this returns the uppercase character as a new iterator, \
+    #[must_use = "this returns the uppercased character as a new iterator, \
                   without modifying the original"]
     #[stable(feature = "rust1", since = "1.0.0")]
     #[inline]
@@ -1164,6 +1422,7 @@ impl char {
     #[must_use]
     #[stable(feature = "ascii_methods_on_intrinsics", since = "1.23.0")]
     #[rustc_const_stable(feature = "const_char_is_ascii", since = "1.32.0")]
+    #[rustc_diagnostic_item = "char_is_ascii"]
     #[inline]
     pub const fn is_ascii(&self) -> bool {
         *self as u32 <= 0x7F
@@ -1185,6 +1444,26 @@ impl char {
         } else {
             None
         }
+    }
+
+    /// Converts this char into an [ASCII character](`ascii::Char`), without
+    /// checking whether it is valid.
+    ///
+    /// # Safety
+    ///
+    /// This char must be within the ASCII range, or else this is UB.
+    #[must_use]
+    #[unstable(feature = "ascii_char", issue = "110998")]
+    #[inline]
+    pub const unsafe fn as_ascii_unchecked(&self) -> ascii::Char {
+        assert_unsafe_precondition!(
+            check_library_ub,
+            "as_ascii_unchecked requires that the char is valid ASCII",
+            (it: &char = self) => it.is_ascii()
+        );
+
+        // SAFETY: the caller promised that this char is ASCII.
+        unsafe { ascii::Char::from_u8_unchecked(*self as u8) }
     }
 
     /// Makes a copy of the value in its ASCII upper case equivalent.
@@ -1299,7 +1578,7 @@ impl char {
     ///
     /// [`to_ascii_uppercase()`]: #method.to_ascii_uppercase
     #[stable(feature = "ascii_methods_on_intrinsics", since = "1.23.0")]
-    #[rustc_const_stable(feature = "const_make_ascii", since = "CURRENT_RUSTC_VERSION")]
+    #[rustc_const_stable(feature = "const_make_ascii", since = "1.84.0")]
     #[inline]
     pub const fn make_ascii_uppercase(&mut self) {
         *self = self.to_ascii_uppercase();
@@ -1325,7 +1604,7 @@ impl char {
     ///
     /// [`to_ascii_lowercase()`]: #method.to_ascii_lowercase
     #[stable(feature = "ascii_methods_on_intrinsics", since = "1.23.0")]
-    #[rustc_const_stable(feature = "const_make_ascii", since = "CURRENT_RUSTC_VERSION")]
+    #[rustc_const_stable(feature = "const_make_ascii", since = "1.84.0")]
     #[inline]
     pub const fn make_ascii_lowercase(&mut self) {
         *self = self.to_ascii_lowercase();
@@ -1364,7 +1643,7 @@ impl char {
     #[rustc_const_stable(feature = "const_ascii_ctype_on_intrinsics", since = "1.47.0")]
     #[inline]
     pub const fn is_ascii_alphabetic(&self) -> bool {
-        matches!(*self, 'A'..='Z' | 'a'..='z')
+        matches!(*self, 'a'..='z' | 'A'..='Z')
     }
 
     /// Checks if the value is an ASCII uppercase character:
@@ -1787,45 +2066,81 @@ const fn len_utf16(code: u32) -> usize {
 /// Panics if the buffer is not large enough.
 /// A buffer of length four is large enough to encode any `char`.
 #[unstable(feature = "char_internals", reason = "exposed only for libstd", issue = "none")]
-#[cfg_attr(bootstrap, rustc_const_stable(feature = "const_char_encode_utf8", since = "1.83.0"))]
 #[doc(hidden)]
 #[inline]
 pub const fn encode_utf8_raw(code: u32, dst: &mut [u8]) -> &mut [u8] {
     let len = len_utf8(code);
-    match (len, &mut *dst) {
-        (1, [a, ..]) => {
-            *a = code as u8;
-        }
-        (2, [a, b, ..]) => {
-            *a = (code >> 6 & 0x1F) as u8 | TAG_TWO_B;
-            *b = (code & 0x3F) as u8 | TAG_CONT;
-        }
-        (3, [a, b, c, ..]) => {
-            *a = (code >> 12 & 0x0F) as u8 | TAG_THREE_B;
-            *b = (code >> 6 & 0x3F) as u8 | TAG_CONT;
-            *c = (code & 0x3F) as u8 | TAG_CONT;
-        }
-        (4, [a, b, c, d, ..]) => {
-            *a = (code >> 18 & 0x07) as u8 | TAG_FOUR_B;
-            *b = (code >> 12 & 0x3F) as u8 | TAG_CONT;
-            *c = (code >> 6 & 0x3F) as u8 | TAG_CONT;
-            *d = (code & 0x3F) as u8 | TAG_CONT;
-        }
-        _ => {
-            const_panic!(
-                "encode_utf8: buffer does not have enough bytes to encode code point",
-                "encode_utf8: need {len} bytes to encode U+{code:04X} but buffer has just {dst_len}",
-                code: u32 = code,
-                len: usize = len,
-                dst_len: usize = dst.len(),
-            )
-        }
-    };
+    if dst.len() < len {
+        const_panic!(
+            "encode_utf8: buffer does not have enough bytes to encode code point",
+            "encode_utf8: need {len} bytes to encode U+{code:04X} but buffer has just {dst_len}",
+            code: u32 = code,
+            len: usize = len,
+            dst_len: usize = dst.len(),
+        );
+    }
+
+    // SAFETY: `dst` is checked to be at least the length needed to encode the codepoint.
+    unsafe { encode_utf8_raw_unchecked(code, dst.as_mut_ptr()) };
+
     // SAFETY: `<&mut [u8]>::as_mut_ptr` is guaranteed to return a valid pointer and `len` has been tested to be within bounds.
     unsafe { slice::from_raw_parts_mut(dst.as_mut_ptr(), len) }
 }
 
-/// Encodes a raw `u32` value as UTF-16 into the provided `u16` buffer,
+/// Encodes a raw `u32` value as UTF-8 into the byte buffer pointed to by `dst`.
+///
+/// Unlike `char::encode_utf8`, this method also handles codepoints in the surrogate range.
+/// (Creating a `char` in the surrogate range is UB.)
+/// The result is valid [generalized UTF-8] but not valid UTF-8.
+///
+/// [generalized UTF-8]: https://simonsapin.github.io/wtf-8/#generalized-utf8
+///
+/// # Safety
+///
+/// The behavior is undefined if the buffer pointed to by `dst` is not
+/// large enough to hold the encoded codepoint. A buffer of length four
+/// is large enough to encode any `char`.
+///
+/// For a safe version of this function, see the [`encode_utf8_raw`] function.
+#[unstable(feature = "char_internals", reason = "exposed only for libstd", issue = "none")]
+#[doc(hidden)]
+#[inline]
+pub const unsafe fn encode_utf8_raw_unchecked(code: u32, dst: *mut u8) {
+    let len = len_utf8(code);
+    // SAFETY: The caller must guarantee that the buffer pointed to by `dst`
+    // is at least `len` bytes long.
+    unsafe {
+        if len == 1 {
+            *dst = code as u8;
+            return;
+        }
+
+        let last1 = (code >> 0 & 0x3F) as u8 | TAG_CONT;
+        let last2 = (code >> 6 & 0x3F) as u8 | TAG_CONT;
+        let last3 = (code >> 12 & 0x3F) as u8 | TAG_CONT;
+        let last4 = (code >> 18 & 0x3F) as u8 | TAG_FOUR_B;
+
+        if len == 2 {
+            *dst = last2 | TAG_TWO_B;
+            *dst.add(1) = last1;
+            return;
+        }
+
+        if len == 3 {
+            *dst = last3 | TAG_THREE_B;
+            *dst.add(1) = last2;
+            *dst.add(2) = last1;
+            return;
+        }
+
+        *dst = last4;
+        *dst.add(1) = last3;
+        *dst.add(2) = last2;
+        *dst.add(3) = last1;
+    }
+}
+
+/// Encodes a raw `u32` value as native endian UTF-16 into the provided `u16` buffer,
 /// and then returns the subslice of the buffer that contains the encoded character.
 ///
 /// Unlike `char::encode_utf16`, this method also handles codepoints in the surrogate range.
@@ -1836,10 +2151,6 @@ pub const fn encode_utf8_raw(code: u32, dst: &mut [u8]) -> &mut [u8] {
 /// Panics if the buffer is not large enough.
 /// A buffer of length 2 is large enough to encode any `char`.
 #[unstable(feature = "char_internals", reason = "exposed only for libstd", issue = "none")]
-#[cfg_attr(
-    bootstrap,
-    rustc_const_stable(feature = "const_char_encode_utf16", since = "CURRENT_RUSTC_VERSION")
-)]
 #[doc(hidden)]
 #[inline]
 pub const fn encode_utf16_raw(mut code: u32, dst: &mut [u16]) -> &mut [u16] {

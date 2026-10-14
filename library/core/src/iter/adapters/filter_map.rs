@@ -20,7 +20,7 @@ pub struct FilterMap<I, F> {
     f: F,
 }
 impl<I, F> FilterMap<I, F> {
-    pub(in crate::iter) fn new(iter: I, f: F) -> FilterMap<I, F> {
+    pub(in crate::iter) const fn new(iter: I, f: F) -> FilterMap<I, F> {
         FilterMap { iter, f }
     }
 }
@@ -81,9 +81,7 @@ where
                 if const { crate::mem::needs_drop::<T>() } {
                     // SAFETY: self.initialized is always <= N, which also is the length of the array.
                     unsafe {
-                        core::ptr::drop_in_place(MaybeUninit::slice_assume_init_mut(
-                            self.array.get_unchecked_mut(..self.initialized),
-                        ));
+                        self.array.get_unchecked_mut(..self.initialized).assume_init_drop();
                     }
                 }
             }

@@ -5,11 +5,11 @@ pub mod diagnostics;
 mod item;
 mod stack;
 
-use std::cell::RefCell;
 use std::fmt::Write;
+use std::sync::atomic::AtomicBool;
 use std::{cmp, mem};
 
-use rustc_abi::{BackendRepr, Size};
+use rustc_abi::Size;
 use rustc_data_structures::fx::FxHashSet;
 use rustc_middle::mir::{Mutability, RetagKind};
 use rustc_middle::ty::layout::HasTypingEnv;
@@ -21,7 +21,7 @@ pub use self::stack::Stack;
 use crate::borrow_tracker::stacked_borrows::diagnostics::{
     AllocHistory, DiagnosticCx, DiagnosticCxBuilder,
 };
-use crate::borrow_tracker::{GlobalStateInner, ProtectorKind};
+use crate::borrow_tracker::{AccessKind, GlobalStateInner, ProtectorKind};
 use crate::concurrency::data_race::{NaReadType, NaWriteType};
 use crate::*;
 
@@ -31,7 +31,7 @@ pub type AllocState = Stacks;
 #[derive(Clone, Debug)]
 pub struct Stacks {
     // Even reading memory can have effects on the stack, so we need a `RefCell` here.
-    stacks: RangeMap<Stack>,
+    stacks: DedupRangeMap<Stack>,
     /// Stores past operations on this allocation
     history: AllocHistory,
     /// The set of tags that have been exposed inside this allocation.
@@ -71,7 +71,9 @@ impl NewPermission {
                         access: None,
                         protector: None,
                     }
-                } else if pointee.is_unpin(*cx.tcx, cx.typing_env()) {
+                } else if pointee.is_unpin(*cx.tcx, cx.typing_env())
+                    && pointee.is_unsafe_unpin(*cx.tcx, cx.typing_env())
+                {
                     // A regular full mutable reference. On `FnEntry` this is `noalias` and `dereferenceable`.
                     NewPermission::Uniform {
                         perm: Permission::Unique,
@@ -129,7 +131,9 @@ impl NewPermission {
     fn from_box_ty<'tcx>(ty: Ty<'tcx>, kind: RetagKind, cx: &crate::MiriInterpCx<'tcx>) -> Self {
         // `ty` is not the `Box` but the field of the Box with this pointer (due to allocator handling).
         let pointee = ty.builtin_deref(true).unwrap();
-        if pointee.is_unpin(*cx.tcx, cx.typing_env()) {
+        if pointee.is_unpin(*cx.tcx, cx.typing_env())
+            && pointee.is_unsafe_unpin(*cx.tcx, cx.typing_env())
+        {
             // A regular box. On `FnEntry` this is `noalias`, but not `dereferenceable` (hence only
             // a weak protector).
             NewPermission::Uniform {
@@ -469,7 +473,7 @@ impl<'tcx> Stacks {
         let stack = Stack::new(item);
 
         Stacks {
-            stacks: RangeMap::new(size, stack),
+            stacks: DedupRangeMap::new(size, stack),
             history: AllocHistory::new(id, item, machine),
             exposed_tags: FxHashSet::default(),
         }
@@ -595,7 +599,7 @@ trait EvalContextPrivExt<'tcx, 'ecx>: crate::MiriInterpCxExt<'tcx> {
     ) -> InterpResult<'tcx, Option<Provenance>> {
         let this = self.eval_context_mut();
         // Ensure we bail out if the pointer goes out-of-bounds (see miri#1050).
-        this.check_ptr_access(place.ptr(), size, CheckInAllocMsg::InboundsTest)?;
+        this.check_ptr_access(place.ptr(), size, CheckInAllocMsg::Dereferenceable)?;
 
         // It is crucial that this gets called on all code paths, to ensure we track tag creation.
         let log_creation = |this: &MiriInterpCx<'tcx>,
@@ -651,7 +655,7 @@ trait EvalContextPrivExt<'tcx, 'ecx>: crate::MiriInterpCxExt<'tcx> {
                         dcx.log_protector();
                     }
                 },
-                AllocKind::Function | AllocKind::VTable | AllocKind::Dead => {
+                AllocKind::Function | AllocKind::VTable | AllocKind::TypeId | AllocKind::Dead | AllocKind::VaList => {
                     // No stacked borrows on these allocations.
                 }
             }
@@ -675,16 +679,22 @@ trait EvalContextPrivExt<'tcx, 'ecx>: crate::MiriInterpCxExt<'tcx> {
             if let Ok((alloc_id, base_offset, orig_tag)) = this.ptr_try_get_alloc_id(place.ptr(), 0)
             {
                 log_creation(this, Some((alloc_id, base_offset, orig_tag)))?;
-                // Still give it the new provenance, it got retagged after all.
+                // Still give it the new provenance, it got retagged after all. If this was a
+                // wildcard pointer, this will fix the AllocId and make future accesses with this
+                // reference to other allocations UB, but that's fine: due to subobject provenance,
+                // *all* future accesses with this reference should be UB!
                 return interp_ok(Some(Provenance::Concrete { alloc_id, tag: new_tag }));
             } else {
                 // This pointer doesn't come with an AllocId. :shrug:
                 log_creation(this, None)?;
-                // Provenance unchanged.
+                // Provenance unchanged. Ideally we'd make this pointer UB to use like above,
+                // but there's no easy way to do that.
                 return interp_ok(place.ptr().provenance);
             }
         }
 
+        // The pointer *must* have a valid AllocId to continue, so we want to resolve this to
+        // a concrete ID even for wildcard pointers.
         let (alloc_id, base_offset, orig_tag) = this.ptr_get_alloc_id(place.ptr(), 0)?;
         log_creation(this, Some((alloc_id, base_offset, orig_tag)))?;
 
@@ -741,8 +751,9 @@ trait EvalContextPrivExt<'tcx, 'ecx>: crate::MiriInterpCxExt<'tcx> {
                 if let Some(access) = access {
                     assert_eq!(access, AccessKind::Write);
                     // Make sure the data race model also knows about this.
-                    if let Some(data_race) = alloc_extra.data_race.as_mut() {
-                        data_race.write(
+                    // FIXME(genmc): Ensure this is still done in GenMC mode. Check for other places where GenMC may need to be informed.
+                    if let Some(data_race) = alloc_extra.data_race.as_vclocks_mut() {
+                        data_race.write_non_atomic(
                             alloc_id,
                             range,
                             NaWriteType::Retag,
@@ -790,8 +801,8 @@ trait EvalContextPrivExt<'tcx, 'ecx>: crate::MiriInterpCxExt<'tcx> {
                     if let Some(access) = access {
                         assert_eq!(access, AccessKind::Read);
                         // Make sure the data race model also knows about this.
-                        if let Some(data_race) = alloc_extra.data_race.as_ref() {
-                            data_race.read(
+                        if let Some(data_race) = alloc_extra.data_race.as_vclocks_ref() {
+                            data_race.read_non_atomic(
                                 alloc_id,
                                 range,
                                 NaReadType::Retag,
@@ -815,25 +826,16 @@ trait EvalContextPrivExt<'tcx, 'ecx>: crate::MiriInterpCxExt<'tcx> {
         info: RetagInfo, // diagnostics info about this retag
     ) -> InterpResult<'tcx, MPlaceTy<'tcx>> {
         let this = self.eval_context_mut();
-        let size = this.size_and_align_of_mplace(place)?.map(|(size, _)| size);
+        let size = this.size_and_align_of_val(place)?.map(|(size, _)| size);
         // FIXME: If we cannot determine the size (because the unsized tail is an `extern type`),
         // bail out -- we cannot reasonably figure out which memory range to reborrow.
         // See https://github.com/rust-lang/unsafe-code-guidelines/issues/276.
-        let size = match size {
-            Some(size) => size,
-            None => {
-                // The first time this happens, show a warning.
-                thread_local! { static WARNING_SHOWN: RefCell<bool> = const { RefCell::new(false) }; }
-                WARNING_SHOWN.with_borrow_mut(|shown| {
-                    if *shown {
-                        return;
-                    }
-                    // Not yet shown. Show it!
-                    *shown = true;
-                    this.emit_diagnostic(NonHaltingDiagnostic::ExternTypeReborrow);
-                });
-                return interp_ok(place.clone());
+        let Some(size) = size else {
+            static DEDUP: AtomicBool = AtomicBool::new(false);
+            if !DEDUP.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                this.emit_diagnostic(NonHaltingDiagnostic::ExternTypeReborrow);
             }
+            return interp_ok(place.clone());
         };
 
         // Compute new borrow.
@@ -857,7 +859,7 @@ trait EvalContextPrivExt<'tcx, 'ecx>: crate::MiriInterpCxExt<'tcx> {
         info: RetagInfo, // diagnostics info about this retag
     ) -> InterpResult<'tcx, ImmTy<'tcx>> {
         let this = self.eval_context_mut();
-        let place = this.ref_to_mplace(val)?;
+        let place = this.imm_ptr_to_mplace(val)?;
         let new_place = this.sb_retag_place(&place, new_perm, info)?;
         interp_ok(ImmTy::from_immediate(new_place.to_ref(this), val.layout))
     }
@@ -873,7 +875,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         let this = self.eval_context_mut();
         let new_perm = NewPermission::from_ref_ty(val.layout.ty, kind, this);
         let cause = match kind {
-            RetagKind::TwoPhase { .. } => RetagCause::TwoPhase,
+            RetagKind::TwoPhase => RetagCause::TwoPhase,
             RetagKind::FnEntry => unreachable!(),
             RetagKind::Raw | RetagKind::Default => RetagCause::Normal,
         };
@@ -886,14 +888,12 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         place: &PlaceTy<'tcx>,
     ) -> InterpResult<'tcx> {
         let this = self.eval_context_mut();
-        let retag_fields = this.machine.borrow_tracker.as_mut().unwrap().get_mut().retag_fields;
         let retag_cause = match kind {
-            RetagKind::TwoPhase { .. } => unreachable!(), // can only happen in `retag_ptr_value`
+            RetagKind::TwoPhase => unreachable!(), // can only happen in `retag_ptr_value`
             RetagKind::FnEntry => RetagCause::FnEntry,
             RetagKind::Default | RetagKind::Raw => RetagCause::Normal,
         };
-        let mut visitor =
-            RetagVisitor { ecx: this, kind, retag_cause, retag_fields, in_field: false };
+        let mut visitor = RetagVisitor { ecx: this, kind, retag_cause, in_field: false };
         return visitor.visit_value(place);
 
         // The actual visitor.
@@ -901,7 +901,6 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
             ecx: &'ecx mut MiriInterpCx<'tcx>,
             kind: RetagKind,
             retag_cause: RetagCause,
-            retag_fields: RetagFields,
             in_field: bool,
         }
         impl<'ecx, 'tcx> RetagVisitor<'ecx, 'tcx> {
@@ -912,11 +911,13 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                 new_perm: NewPermission,
             ) -> InterpResult<'tcx> {
                 let val = self.ecx.read_immediate(&self.ecx.place_to_op(place)?)?;
-                let val = self.ecx.sb_retag_reference(&val, new_perm, RetagInfo {
-                    cause: self.retag_cause,
-                    in_field: self.in_field,
-                })?;
+                let val = self.ecx.sb_retag_reference(
+                    &val,
+                    new_perm,
+                    RetagInfo { cause: self.retag_cause, in_field: self.in_field },
+                )?;
                 self.ecx.write_immediate(*val, place)?;
+
                 interp_ok(())
             }
         }
@@ -964,25 +965,14 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                         // even if field retagging is not enabled. *shrug*)
                         self.walk_value(place)?;
                     }
+                    ty::Adt(adt, _) if adt.is_maybe_dangling() => {
+                        // Skip traversing for everything inside of `MaybeDangling`
+                    }
                     _ => {
-                        // Not a reference/pointer/box. Only recurse if configured appropriately.
-                        let recurse = match self.retag_fields {
-                            RetagFields::No => false,
-                            RetagFields::Yes => true,
-                            RetagFields::OnlyScalar => {
-                                // Matching `ArgAbi::new` at the time of writing, only fields of
-                                // `Scalar` and `ScalarPair` ABI are considered.
-                                matches!(
-                                    place.layout.backend_repr,
-                                    BackendRepr::Scalar(..) | BackendRepr::ScalarPair(..)
-                                )
-                            }
-                        };
-                        if recurse {
-                            let in_field = mem::replace(&mut self.in_field, true); // remember and restore old value
-                            self.walk_value(place)?;
-                            self.in_field = in_field;
-                        }
+                        // Not a reference/pointer/box. Recurse.
+                        let in_field = mem::replace(&mut self.in_field, true); // remember and restore old value
+                        self.walk_value(place)?;
+                        self.in_field = in_field;
                     }
                 }
 
@@ -1004,15 +994,16 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
             access: Some(AccessKind::Write),
             protector: Some(ProtectorKind::StrongProtector),
         };
-        this.sb_retag_place(place, new_perm, RetagInfo {
-            cause: RetagCause::InPlaceFnPassing,
-            in_field: false,
-        })
+        this.sb_retag_place(
+            place,
+            new_perm,
+            RetagInfo { cause: RetagCause::InPlaceFnPassing, in_field: false },
+        )
     }
 
     /// Mark the given tag as exposed. It was found on a pointer with the given AllocId.
-    fn sb_expose_tag(&mut self, alloc_id: AllocId, tag: BorTag) -> InterpResult<'tcx> {
-        let this = self.eval_context_mut();
+    fn sb_expose_tag(&self, alloc_id: AllocId, tag: BorTag) -> InterpResult<'tcx> {
+        let this = self.eval_context_ref();
 
         // Function pointers and dead objects don't have an alloc_extra so we ignore them.
         // This is okay because accessing them is UB anyway, no need for any Stacked Borrows checks.
@@ -1027,7 +1018,11 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                 trace!("Stacked Borrows tag {tag:?} exposed in {alloc_id:?}");
                 alloc_extra.borrow_tracker_sb().borrow_mut().exposed_tags.insert(tag);
             }
-            AllocKind::Function | AllocKind::VTable | AllocKind::Dead => {
+            AllocKind::Function
+            | AllocKind::VTable
+            | AllocKind::TypeId
+            | AllocKind::Dead
+            | AllocKind::VaList => {
                 // No stacked borrows on these allocations.
             }
         }

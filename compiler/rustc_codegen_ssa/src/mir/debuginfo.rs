@@ -10,8 +10,7 @@ use rustc_middle::ty::layout::{LayoutOf, TyAndLayout};
 use rustc_middle::ty::{Instance, Ty};
 use rustc_middle::{bug, mir, ty};
 use rustc_session::config::DebugInfo;
-use rustc_span::symbol::{Symbol, kw};
-use rustc_span::{BytePos, Span, hygiene};
+use rustc_span::{BytePos, Span, Symbol, hygiene, sym};
 
 use super::operand::{OperandRef, OperandValue};
 use super::place::{PlaceRef, PlaceValue};
@@ -20,9 +19,7 @@ use crate::traits::*;
 
 pub struct FunctionDebugContext<'tcx, S, L> {
     /// Maps from source code to the corresponding debug info scope.
-    /// May be None if the backend is not capable of representing the scope for
-    /// some reason.
-    pub scopes: IndexVec<mir::SourceScope, Option<DebugScope<S, L>>>,
+    pub scopes: IndexVec<mir::SourceScope, DebugScope<S, L>>,
 
     /// Maps from an inlined function to its debug info declaration.
     pub inlined_function_scopes: FxHashMap<Instance<'tcx>, S>,
@@ -233,7 +230,7 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
         &self,
         source_info: mir::SourceInfo,
     ) -> Option<(Bx::DIScope, Option<Bx::DILocation>, Span)> {
-        let scope = &self.debug_context.as_ref()?.scopes[source_info.scope]?;
+        let scope = &self.debug_context.as_ref()?.scopes[source_info.scope];
         let span = hygiene::walk_chain_collapsed(source_info.span, self.mir.span);
         Some((scope.adjust_dbg_scope_for_span(self.cx, span), scope.inlined_at, span))
     }
@@ -254,6 +251,53 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
         }
         operand.val.store(bx, spill_slot);
         spill_slot
+    }
+
+    // Indicates that local is set to a new value. The `layout` and `projection` are used to
+    // calculate the offset.
+    pub(crate) fn debug_new_val_to_local(
+        &self,
+        bx: &mut Bx,
+        local: mir::Local,
+        base: PlaceRef<'tcx, Bx::Value>,
+        projection: &[mir::PlaceElem<'tcx>],
+    ) {
+        let full_debug_info = bx.sess().opts.debuginfo == DebugInfo::Full;
+        if !full_debug_info {
+            return;
+        }
+
+        let vars = match &self.per_local_var_debug_info {
+            Some(per_local) => &per_local[local],
+            None => return,
+        };
+
+        let DebugInfoOffset { direct_offset, indirect_offsets, result: _ } =
+            calculate_debuginfo_offset(bx, projection, base.layout);
+        for var in vars.iter() {
+            let Some(dbg_var) = var.dbg_var else {
+                continue;
+            };
+            let Some(dbg_loc) = self.dbg_loc(var.source_info) else {
+                continue;
+            };
+            bx.dbg_var_value(
+                dbg_var,
+                dbg_loc,
+                base.val.llval,
+                direct_offset,
+                &indirect_offsets,
+                &var.fragment,
+            );
+        }
+    }
+
+    pub(crate) fn debug_poison_to_local(&self, bx: &mut Bx, local: mir::Local) {
+        let ty = self.monomorphize(self.mir.local_decls[local].ty);
+        let layout = bx.cx().layout_of(ty);
+        let to_backend_ty = bx.cx().immediate_backend_type(layout);
+        let place_ref = PlaceRef::new_sized(bx.cx().const_poison(to_backend_ty), layout);
+        self.debug_new_val_to_local(bx, local, place_ref, &[]);
     }
 
     /// Apply debuginfo and/or name, after creating the `alloca` for a local,
@@ -286,7 +330,7 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
                 // (after #67586 gets fixed).
                 None
             } else {
-                let name = kw::Empty;
+                let name = sym::empty;
                 let decl = &self.mir.local_decls[local];
                 let dbg_var = if full_debug_info {
                     self.adjusted_span_and_dbg_scope(decl.source_info).map(
@@ -320,8 +364,8 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
         let name = if bx.sess().fewer_names() {
             None
         } else {
-            Some(match whole_local_var.or(fallback_var.clone()) {
-                Some(var) if var.name != kw::Empty => var.name.to_string(),
+            Some(match whole_local_var.or_else(|| fallback_var.clone()) {
+                Some(var) if var.name != sym::empty => var.name.to_string(),
                 _ => format!("{local:?}"),
             })
         };
@@ -359,9 +403,47 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
             LocalRef::Operand(operand) => {
                 // Don't spill operands onto the stack in naked functions.
                 // See: https://github.com/rust-lang/rust/issues/42779
-                let attrs = bx.tcx().codegen_fn_attrs(self.instance.def_id());
+                let attrs = bx.tcx().codegen_instance_attrs(self.instance.def);
                 if attrs.flags.contains(CodegenFnAttrFlags::NAKED) {
                     return;
+                }
+
+                // Don't spill `<vscale x N x i1>` for `N != 16`:
+                //
+                // SVE predicates are only one bit for each byte in an SVE vector (which makes
+                // sense, the predicate only needs to keep track of whether a lane is
+                // enabled/disabled). i.e. a `<vscale x 16 x i8>` vector has a `<vscale x 16 x i1>`
+                // predicate type. `<vscale x 16 x i1>` corresponds to two bytes of storage,
+                // multiplied by the `vscale`, with one bit for each of the sixteen lanes.
+                //
+                // For a vector with fewer elements, such as `svint32_t`/`<vscale x 4 x i32>`,
+                // while only a `<vscale x 4 x i1>` predicate type would be strictly necessary,
+                // relevant intrinsics still take a `svbool_t`/`<vscale x 16 x i1>` - this is
+                // because a `<vscale x 4 x i1>` is only half of a byte (for `vscale=1`), and with
+                // memory being byte-addressable, it's unclear how to store that.
+                //
+                // Due to this, LLVM ultimately decided not to support stores of `<vscale x N x i1>`
+                // for `N != 16`. As for `vscale=1` and `N` fewer than sixteen, partial bytes would
+                // need to be stored (except for `N=8`, but that also isn't supported). `N` can
+                // never be greater than sixteen as that ends up larger than the 128-bit increment
+                // size.
+                //
+                // Internally, with an intrinsic operating on a `svint32_t`/`<vscale x 4 x i32>`
+                // (for example), the intrinsic takes the `svbool_t`/`<vscale x 16 x i1>` predicate
+                // and casts it to a `svbool4_t`/`<vscale x 4 x i1>`. Therefore, it's important that
+                // the `<vscale x 4 x i1>` never spills because that'll cause errors during
+                // instruction selection. Spilling to the stack to create debuginfo for these
+                // intermediate values must be avoided and doing so won't affect the
+                // debugging experience anyway.
+                if operand.layout.ty.is_scalable_vector()
+                    && bx.sess().target.arch == rustc_target::spec::Arch::AArch64
+                {
+                    let (count, element_ty, _) =
+                        operand.layout.ty.scalable_vector_parts(bx.tcx()).unwrap();
+                    // i.e. `<vscale x N x i1>` when `N != 16`
+                    if element_ty.is_bool() && count != 16 {
+                        return;
+                    }
                 }
 
                 Self::spill_operand_to_stack(*operand, name, bx)
@@ -427,7 +509,7 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
                 alloca.val.llval,
                 Size::ZERO,
                 &[Size::ZERO],
-                var.fragment,
+                &var.fragment,
             );
         } else {
             bx.dbg_var_addr(
@@ -436,7 +518,7 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
                 base.val.llval,
                 direct_offset,
                 &indirect_offsets,
-                var.fragment,
+                &var.fragment,
             );
         }
     }
@@ -458,7 +540,7 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
                 let base = FunctionCx::spill_operand_to_stack(operand, Some(name), bx);
                 bx.clear_dbg_loc();
 
-                bx.dbg_var_addr(dbg_var, dbg_loc, base.val.llval, Size::ZERO, &[], fragment);
+                bx.dbg_var_addr(dbg_var, dbg_loc, base.val.llval, Size::ZERO, &[], &fragment);
             }
         }
     }

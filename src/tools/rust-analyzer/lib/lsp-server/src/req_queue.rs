@@ -1,7 +1,5 @@
 use std::collections::HashMap;
 
-use serde::Serialize;
-
 use crate::{ErrorCode, Request, RequestId, Response, ResponseError};
 
 /// Manages the set of pending requests, both incoming and outgoing.
@@ -17,6 +15,12 @@ impl<I, O> Default for ReqQueue<I, O> {
             incoming: Incoming { pending: HashMap::default() },
             outgoing: Outgoing { next_id: 0, pending: HashMap::default() },
         }
+    }
+}
+
+impl<I, O> ReqQueue<I, O> {
+    pub fn has_pending(&self) -> bool {
+        self.incoming.has_pending() || self.outgoing.has_pending()
     }
 }
 
@@ -53,10 +57,14 @@ impl<I> Incoming<I> {
     pub fn is_completed(&self, id: &RequestId) -> bool {
         !self.pending.contains_key(id)
     }
+
+    pub fn has_pending(&self) -> bool {
+        !self.pending.is_empty()
+    }
 }
 
 impl<O> Outgoing<O> {
-    pub fn register<P: Serialize>(&mut self, method: String, params: P, data: O) -> Request {
+    pub fn register<P: serde::Serialize>(&mut self, method: String, params: P, data: O) -> Request {
         let id = RequestId::from(self.next_id);
         self.pending.insert(id.clone(), data);
         self.next_id += 1;
@@ -65,5 +73,9 @@ impl<O> Outgoing<O> {
 
     pub fn complete(&mut self, id: RequestId) -> Option<O> {
         self.pending.remove(&id)
+    }
+
+    pub fn has_pending(&self) -> bool {
+        !self.pending.is_empty()
     }
 }

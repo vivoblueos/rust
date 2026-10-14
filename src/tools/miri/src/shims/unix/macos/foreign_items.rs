@@ -1,12 +1,22 @@
-use rustc_abi::ExternAbi;
+use rustc_abi::CanonAbi;
+use rustc_middle::ty::Ty;
 use rustc_span::Symbol;
+use rustc_target::callconv::FnAbi;
 
-use super::sync::EvalContextExt as _;
+use super::sync::{EvalContextExt as _, MacOsFutexTimeout};
 use crate::shims::unix::*;
 use crate::*;
 
-pub fn is_dyn_sym(_name: &str) -> bool {
-    false
+pub fn is_dyn_sym(name: &str) -> bool {
+    match name {
+        // These only became available with macOS 11.0, so std looks them up dynamically.
+        "os_sync_wait_on_address"
+        | "os_sync_wait_on_address_with_deadline"
+        | "os_sync_wait_on_address_with_timeout"
+        | "os_sync_wake_by_address_any"
+        | "os_sync_wake_by_address_all" => true,
+        _ => false,
+    }
 }
 
 impl<'tcx> EvalContextExt<'tcx> for crate::MiriInterpCx<'tcx> {}
@@ -14,7 +24,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
     fn emulate_foreign_item_inner(
         &mut self,
         link_name: Symbol,
-        abi: ExternAbi,
+        abi: &FnAbi<'tcx, Ty<'tcx>>,
         args: &[OpTy<'tcx>],
         dest: &MPlaceTy<'tcx>,
     ) -> InterpResult<'tcx, EmulateItemResult> {
@@ -25,58 +35,62 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         match link_name.as_str() {
             // errno
             "__error" => {
-                let [] = this.check_shim(abi, ExternAbi::C { unwind: false }, link_name, args)?;
+                let [] = this.check_shim_sig_lenient(abi, CanonAbi::C, link_name, args)?;
                 let errno_place = this.last_error_place()?;
                 this.write_scalar(errno_place.to_ref(this).to_scalar(), dest)?;
             }
 
             // File related shims
             "close$NOCANCEL" => {
-                let [result] =
-                    this.check_shim(abi, ExternAbi::C { unwind: false }, link_name, args)?;
+                let [result] = this.check_shim_sig_lenient(abi, CanonAbi::C, link_name, args)?;
                 let result = this.close(result)?;
                 this.write_scalar(result, dest)?;
             }
-            "stat" | "stat64" | "stat$INODE64" => {
-                let [path, buf] =
-                    this.check_shim(abi, ExternAbi::C { unwind: false }, link_name, args)?;
-                let result = this.macos_fbsd_stat(path, buf)?;
+            "stat" | "stat$INODE64" => {
+                // FIXME: This does not have a direct test (#3179).
+                let [path, buf] = this.check_shim_sig_lenient(abi, CanonAbi::C, link_name, args)?;
+                let result = this.stat(path, buf)?;
                 this.write_scalar(result, dest)?;
             }
-            "lstat" | "lstat64" | "lstat$INODE64" => {
-                let [path, buf] =
-                    this.check_shim(abi, ExternAbi::C { unwind: false }, link_name, args)?;
-                let result = this.macos_fbsd_lstat(path, buf)?;
+            "lstat" | "lstat$INODE64" => {
+                // FIXME: This does not have a direct test (#3179).
+                let [path, buf] = this.check_shim_sig_lenient(abi, CanonAbi::C, link_name, args)?;
+                let result = this.lstat(path, buf)?;
                 this.write_scalar(result, dest)?;
             }
-            "fstat" | "fstat64" | "fstat$INODE64" => {
-                let [fd, buf] =
-                    this.check_shim(abi, ExternAbi::C { unwind: false }, link_name, args)?;
-                let result = this.macos_fbsd_fstat(fd, buf)?;
+            "fstat$INODE64" => {
+                let [fd, buf] = this.check_shim_sig_lenient(abi, CanonAbi::C, link_name, args)?;
+                let result = this.fstat(fd, buf)?;
                 this.write_scalar(result, dest)?;
             }
             "opendir$INODE64" => {
-                let [name] =
-                    this.check_shim(abi, ExternAbi::C { unwind: false }, link_name, args)?;
+                let [name] = this.check_shim_sig_lenient(abi, CanonAbi::C, link_name, args)?;
                 let result = this.opendir(name)?;
                 this.write_scalar(result, dest)?;
             }
             "readdir_r" | "readdir_r$INODE64" => {
                 let [dirp, entry, result] =
-                    this.check_shim(abi, ExternAbi::C { unwind: false }, link_name, args)?;
-                let result = this.macos_fbsd_readdir_r(dirp, entry, result)?;
+                    this.check_shim_sig_lenient(abi, CanonAbi::C, link_name, args)?;
+                let result = this.macos_readdir_r(dirp, entry, result)?;
                 this.write_scalar(result, dest)?;
             }
             "realpath$DARWIN_EXTSN" => {
                 let [path, resolved_path] =
-                    this.check_shim(abi, ExternAbi::C { unwind: false }, link_name, args)?;
+                    this.check_shim_sig_lenient(abi, CanonAbi::C, link_name, args)?;
                 let result = this.realpath(path, resolved_path)?;
+                this.write_scalar(result, dest)?;
+            }
+            "ioctl" => {
+                let ([fd_num, cmd], varargs) =
+                    this.check_shim_sig_variadic_lenient(abi, CanonAbi::C, link_name, args)?;
+                let result = this.ioctl(fd_num, cmd, varargs)?;
                 this.write_scalar(result, dest)?;
             }
 
             // Environment related shims
             "_NSGetEnviron" => {
-                let [] = this.check_shim(abi, ExternAbi::C { unwind: false }, link_name, args)?;
+                // FIXME: This does not have a direct test (#3179).
+                let [] = this.check_shim_sig_lenient(abi, CanonAbi::C, link_name, args)?;
                 let environ = this.machine.env_vars.unix().environ();
                 this.write_pointer(environ, dest)?;
             }
@@ -84,7 +98,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
             // Random data generation
             "CCRandomGenerateBytes" => {
                 let [bytes, count] =
-                    this.check_shim(abi, ExternAbi::C { unwind: false }, link_name, args)?;
+                    this.check_shim_sig_lenient(abi, CanonAbi::C, link_name, args)?;
                 let bytes = this.read_pointer(bytes)?;
                 let count = this.read_target_usize(count)?;
                 let success = this.eval_libc_i32("kCCSuccess");
@@ -94,34 +108,44 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
 
             // Time related shims
             "mach_absolute_time" => {
-                let [] = this.check_shim(abi, ExternAbi::C { unwind: false }, link_name, args)?;
+                let [] = this.check_shim_sig_lenient(abi, CanonAbi::C, link_name, args)?;
                 let result = this.mach_absolute_time()?;
                 this.write_scalar(result, dest)?;
             }
 
             "mach_timebase_info" => {
-                let [info] =
-                    this.check_shim(abi, ExternAbi::C { unwind: false }, link_name, args)?;
+                // FIXME: This does not have a direct test (#3179).
+                let [info] = this.check_shim_sig_lenient(abi, CanonAbi::C, link_name, args)?;
                 let result = this.mach_timebase_info(info)?;
+                this.write_scalar(result, dest)?;
+            }
+
+            "mach_wait_until" => {
+                // FIXME: This does not have a direct test (#3179).
+                let [deadline] = this.check_shim_sig_lenient(abi, CanonAbi::C, link_name, args)?;
+                let result = this.mach_wait_until(deadline)?;
                 this.write_scalar(result, dest)?;
             }
 
             // Access to command-line arguments
             "_NSGetArgc" => {
-                let [] = this.check_shim(abi, ExternAbi::C { unwind: false }, link_name, args)?;
+                // FIXME: This does not have a direct test (#3179).
+                let [] = this.check_shim_sig_lenient(abi, CanonAbi::C, link_name, args)?;
                 this.write_pointer(this.machine.argc.expect("machine must be initialized"), dest)?;
             }
             "_NSGetArgv" => {
-                let [] = this.check_shim(abi, ExternAbi::C { unwind: false }, link_name, args)?;
+                // FIXME: This does not have a direct test (#3179).
+                let [] = this.check_shim_sig_lenient(abi, CanonAbi::C, link_name, args)?;
                 this.write_pointer(this.machine.argv.expect("machine must be initialized"), dest)?;
             }
             "_NSGetExecutablePath" => {
+                // FIXME: This does not have a direct test (#3179).
                 let [buf, bufsize] =
-                    this.check_shim(abi, ExternAbi::C { unwind: false }, link_name, args)?;
+                    this.check_shim_sig_lenient(abi, CanonAbi::C, link_name, args)?;
                 this.check_no_isolation("`_NSGetExecutablePath`")?;
 
                 let buf_ptr = this.read_pointer(buf)?;
-                let bufsize = this.deref_pointer(bufsize)?;
+                let bufsize = this.deref_pointer_as(bufsize, this.machine.layouts.u32)?;
 
                 // Using the host current_exe is a bit off, but consistent with Linux
                 // (where stdlib reads /proc/self/exe).
@@ -143,25 +167,30 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
             // Thread-local storage
             "_tlv_atexit" => {
                 let [dtor, data] =
-                    this.check_shim(abi, ExternAbi::C { unwind: false }, link_name, args)?;
+                    this.check_shim_sig_lenient(abi, CanonAbi::C, link_name, args)?;
                 let dtor = this.read_pointer(dtor)?;
                 let dtor = this.get_ptr_fn(dtor)?.as_instance()?;
                 let data = this.read_scalar(data)?;
                 let active_thread = this.active_thread();
-                this.machine.tls.add_macos_thread_dtor(active_thread, dtor, data)?;
+                this.machine.tls.add_macos_thread_dtor(
+                    active_thread,
+                    dtor,
+                    data,
+                    this.machine.current_user_relevant_span(),
+                )?;
             }
 
             // Querying system information
             "pthread_get_stackaddr_np" => {
-                let [thread] =
-                    this.check_shim(abi, ExternAbi::C { unwind: false }, link_name, args)?;
+                // FIXME: This does not have a direct test (#3179).
+                let [thread] = this.check_shim_sig_lenient(abi, CanonAbi::C, link_name, args)?;
                 this.read_target_usize(thread)?;
                 let stack_addr = Scalar::from_uint(this.machine.stack_addr, this.pointer_size());
                 this.write_scalar(stack_addr, dest)?;
             }
             "pthread_get_stacksize_np" => {
-                let [thread] =
-                    this.check_shim(abi, ExternAbi::C { unwind: false }, link_name, args)?;
+                // FIXME: This does not have a direct test (#3179).
+                let [thread] = this.check_shim_sig_lenient(abi, CanonAbi::C, link_name, args)?;
                 this.read_target_usize(thread)?;
                 let stack_size = Scalar::from_uint(this.machine.stack_size, this.pointer_size());
                 this.write_scalar(stack_size, dest)?;
@@ -169,8 +198,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
 
             // Threading
             "pthread_setname_np" => {
-                let [name] =
-                    this.check_shim(abi, ExternAbi::C { unwind: false }, link_name, args)?;
+                let [name] = this.check_shim_sig_lenient(abi, CanonAbi::C, link_name, args)?;
 
                 // The real implementation has logic in two places:
                 // * in userland at https://github.com/apple-oss-distributions/libpthread/blob/c032e0b076700a0a47db75528a282b8d3a06531a/src/pthread.c#L1178-L1200,
@@ -185,7 +213,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                 let res = match this.pthread_setname_np(
                     thread,
                     this.read_scalar(name)?,
-                    this.eval_libc("MAXTHREADNAMESIZE").to_target_usize(this)?.try_into().unwrap(),
+                    this.eval_libc("MAXTHREADNAMESIZE").to_target_usize(this)?,
                     /* truncate */ false,
                 )? {
                     ThreadNameResult::Ok => Scalar::from_u32(0),
@@ -198,7 +226,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
             }
             "pthread_getname_np" => {
                 let [thread, name, len] =
-                    this.check_shim(abi, ExternAbi::C { unwind: false }, link_name, args)?;
+                    this.check_shim_sig_lenient(abi, CanonAbi::C, link_name, args)?;
 
                 // The function's behavior isn't portable between platforms.
                 // In case of macOS, a truncated name (due to a too small buffer)
@@ -221,36 +249,122 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                 };
                 this.write_scalar(res, dest)?;
             }
+            "pthread_threadid_np" => {
+                let [thread, tid_ptr] =
+                    this.check_shim_sig_lenient(abi, CanonAbi::C, link_name, args)?;
+                let res = this.apple_pthread_threadip_np(thread, tid_ptr)?;
+                this.write_scalar(res, dest)?;
+            }
 
+            // Synchronization primitives
+            "os_sync_wait_on_address" => {
+                let [addr_op, value_op, size_op, flags_op] =
+                    this.check_shim_sig_lenient(abi, CanonAbi::C, link_name, args)?;
+                this.os_sync_wait_on_address(
+                    addr_op,
+                    value_op,
+                    size_op,
+                    flags_op,
+                    MacOsFutexTimeout::None,
+                    dest,
+                )?;
+            }
+            "os_sync_wait_on_address_with_deadline" => {
+                let [addr_op, value_op, size_op, flags_op, clock_op, timeout_op] =
+                    this.check_shim_sig_lenient(abi, CanonAbi::C, link_name, args)?;
+                this.os_sync_wait_on_address(
+                    addr_op,
+                    value_op,
+                    size_op,
+                    flags_op,
+                    MacOsFutexTimeout::Absolute { clock_op, timeout_op },
+                    dest,
+                )?;
+            }
+            "os_sync_wait_on_address_with_timeout" => {
+                let [addr_op, value_op, size_op, flags_op, clock_op, timeout_op] =
+                    this.check_shim_sig_lenient(abi, CanonAbi::C, link_name, args)?;
+                this.os_sync_wait_on_address(
+                    addr_op,
+                    value_op,
+                    size_op,
+                    flags_op,
+                    MacOsFutexTimeout::Relative { clock_op, timeout_op },
+                    dest,
+                )?;
+            }
+            "os_sync_wake_by_address_any" => {
+                let [addr_op, size_op, flags_op] =
+                    this.check_shim_sig_lenient(abi, CanonAbi::C, link_name, args)?;
+                this.os_sync_wake_by_address(
+                    addr_op, size_op, flags_op, /* all */ false, dest,
+                )?;
+            }
+            "os_sync_wake_by_address_all" => {
+                let [addr_op, size_op, flags_op] =
+                    this.check_shim_sig_lenient(abi, CanonAbi::C, link_name, args)?;
+                this.os_sync_wake_by_address(
+                    addr_op, size_op, flags_op, /* all */ true, dest,
+                )?;
+            }
             "os_unfair_lock_lock" => {
-                let [lock_op] =
-                    this.check_shim(abi, ExternAbi::C { unwind: false }, link_name, args)?;
+                let [lock_op] = this.check_shim_sig_lenient(abi, CanonAbi::C, link_name, args)?;
                 this.os_unfair_lock_lock(lock_op)?;
             }
             "os_unfair_lock_trylock" => {
-                let [lock_op] =
-                    this.check_shim(abi, ExternAbi::C { unwind: false }, link_name, args)?;
+                let [lock_op] = this.check_shim_sig_lenient(abi, CanonAbi::C, link_name, args)?;
                 this.os_unfair_lock_trylock(lock_op, dest)?;
             }
             "os_unfair_lock_unlock" => {
-                let [lock_op] =
-                    this.check_shim(abi, ExternAbi::C { unwind: false }, link_name, args)?;
+                let [lock_op] = this.check_shim_sig_lenient(abi, CanonAbi::C, link_name, args)?;
                 this.os_unfair_lock_unlock(lock_op)?;
             }
             "os_unfair_lock_assert_owner" => {
-                let [lock_op] =
-                    this.check_shim(abi, ExternAbi::C { unwind: false }, link_name, args)?;
+                let [lock_op] = this.check_shim_sig_lenient(abi, CanonAbi::C, link_name, args)?;
                 this.os_unfair_lock_assert_owner(lock_op)?;
             }
             "os_unfair_lock_assert_not_owner" => {
-                let [lock_op] =
-                    this.check_shim(abi, ExternAbi::C { unwind: false }, link_name, args)?;
+                let [lock_op] = this.check_shim_sig_lenient(abi, CanonAbi::C, link_name, args)?;
                 this.os_unfair_lock_assert_not_owner(lock_op)?;
+            }
+
+            "pthread_cond_timedwait_relative_np" => {
+                let [cond, mutex, reltime] =
+                    this.check_shim_sig_lenient(abi, CanonAbi::C, link_name, args)?;
+                this.pthread_cond_timedwait(
+                    cond, mutex, reltime, dest, /* macos_relative_np */ true,
+                )?;
             }
 
             _ => return interp_ok(EmulateItemResult::NotSupported),
         };
 
         interp_ok(EmulateItemResult::NeedsReturn)
+    }
+
+    fn ioctl(
+        &mut self,
+        fd_num: &OpTy<'tcx>,
+        cmd: &OpTy<'tcx>,
+        _varargs: &[OpTy<'tcx>],
+    ) -> InterpResult<'tcx, Scalar> {
+        let this = self.eval_context_mut();
+
+        let fioclex = this.eval_libc_u64("FIOCLEX");
+
+        let fd_num = this.read_scalar(fd_num)?.to_i32()?;
+        let cmd = this.read_scalar(cmd)?.to_u64()?;
+
+        if cmd == fioclex {
+            // Since we don't support `exec`, this is a NOP. However, we want to
+            // return EBADF if the FD is invalid.
+            if this.machine.fds.is_fd_num(fd_num) {
+                interp_ok(Scalar::from_i32(0))
+            } else {
+                this.set_last_error_and_return_i32(LibcError("EBADF"))
+            }
+        } else {
+            throw_unsup_format!("ioctl: unsupported command {cmd:#x}");
+        }
     }
 }

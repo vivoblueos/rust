@@ -7,17 +7,14 @@ fn main() {
     let target_vendor =
         env::var("CARGO_CFG_TARGET_VENDOR").expect("CARGO_CFG_TARGET_VENDOR was not set");
     let target_env = env::var("CARGO_CFG_TARGET_ENV").expect("CARGO_CFG_TARGET_ENV was not set");
-    let target_abi = env::var("CARGO_CFG_TARGET_ABI").expect("CARGO_CFG_TARGET_ABI was not set");
-    let target_pointer_width: u32 = env::var("CARGO_CFG_TARGET_POINTER_WIDTH")
-        .expect("CARGO_CFG_TARGET_POINTER_WIDTH was not set")
-        .parse()
-        .unwrap();
-    let is_miri = env::var_os("CARGO_CFG_MIRI").is_some();
 
     println!("cargo:rustc-check-cfg=cfg(netbsd10)");
     if target_os == "netbsd" && env::var("RUSTC_STD_NETBSD10").is_ok() {
         println!("cargo:rustc-cfg=netbsd10");
     }
+
+    // Needed for `#![doc(auto_cfg(hide(no_global_oom_handling)))]` attribute.
+    println!("cargo::rustc-check-cfg=cfg(no_global_oom_handling)");
 
     println!("cargo:rustc-check-cfg=cfg(restricted_std)");
     if target_os == "linux"
@@ -36,7 +33,9 @@ fn main() {
         || target_os == "windows"
         || target_os == "fuchsia"
         || (target_vendor == "fortanix" && target_env == "sgx")
+        || target_os == "motor"
         || target_os == "hermit"
+        || target_os == "trusty"
         || target_os == "l4re"
         || target_os == "redox"
         || target_os == "haiku"
@@ -56,6 +55,8 @@ fn main() {
         || target_os == "zkvm"
         || target_os == "rtems"
         || target_os == "nuttx"
+        || target_os == "cygwin"
+        || target_os == "vexos"
         || target_os == "blueos"
 
         // See src/bootstrap/src/core/build_steps/synthetic_targets.rs
@@ -80,109 +81,27 @@ fn main() {
 
     println!("cargo:rustc-env=STD_ENV_ARCH={}", env::var("CARGO_CFG_TARGET_ARCH").unwrap());
 
-    // Emit these on platforms that have no known ABI bugs, LLVM selection bugs, lowering bugs,
-    // missing symbols, or other problems, to determine when tests get run.
-    // If more broken platforms are found, please update the tracking issue at
-    // <https://github.com/rust-lang/rust/issues/116909>
-    //
-    // Some of these match arms are redundant; the goal is to separate reasons that the type is
-    // unreliable, even when multiple reasons might fail the same platform.
-    println!("cargo:rustc-check-cfg=cfg(reliable_f16)");
-    println!("cargo:rustc-check-cfg=cfg(reliable_f128)");
+    println!("cargo:rustc-check-cfg=cfg(vxworks_lt_25_09)");
 
-    // This is a step beyond only having the types and basic functions available. Math functions
-    // aren't consistently available or correct.
-    println!("cargo:rustc-check-cfg=cfg(reliable_f16_math)");
-    println!("cargo:rustc-check-cfg=cfg(reliable_f128_math)");
-
-    let has_reliable_f16 = match (target_arch.as_str(), target_os.as_str()) {
-        // We can always enable these in Miri as that is not affected by codegen bugs.
-        _ if is_miri => true,
-        // Selection failure <https://github.com/llvm/llvm-project/issues/50374>
-        ("s390x", _) => false,
-        // Unsupported <https://github.com/llvm/llvm-project/issues/94434>
-        ("arm64ec", _) => false,
-        // MinGW ABI bugs <https://gcc.gnu.org/bugzilla/show_bug.cgi?id=115054>
-        ("x86_64", "windows") if target_env == "gnu" && target_abi != "llvm" => false,
-        // Infinite recursion <https://github.com/llvm/llvm-project/issues/97981>
-        ("csky", _) => false,
-        ("hexagon", _) => false,
-        ("loongarch64", _) => false,
-        ("mips" | "mips64" | "mips32r6" | "mips64r6", _) => false,
-        ("powerpc" | "powerpc64", _) => false,
-        ("sparc" | "sparc64", _) => false,
-        ("wasm32" | "wasm64", _) => false,
-        // `f16` support only requires that symbols converting to and from `f32` are available. We
-        // provide these in `compiler-builtins`, so `f16` should be available on all platforms that
-        // do not have other ABI issues or LLVM crashes.
-        _ => true,
-    };
-
-    let has_reliable_f128 = match (target_arch.as_str(), target_os.as_str()) {
-        // We can always enable these in Miri as that is not affected by codegen bugs.
-        _ if is_miri => true,
-        // Unsupported <https://github.com/llvm/llvm-project/issues/94434>
-        ("arm64ec", _) => false,
-        // Selection bug <https://github.com/llvm/llvm-project/issues/96432>
-        ("mips64" | "mips64r6", _) => false,
-        // Selection bug <https://github.com/llvm/llvm-project/issues/95471>
-        ("nvptx64", _) => false,
-        // ABI bugs <https://github.com/rust-lang/rust/issues/125109> et al. (full
-        // list at <https://github.com/rust-lang/rust/issues/116909>)
-        ("powerpc" | "powerpc64", _) => false,
-        // ABI unsupported  <https://github.com/llvm/llvm-project/issues/41838>
-        ("sparc", _) => false,
-        // Stack alignment bug <https://github.com/llvm/llvm-project/issues/77401>. NB: tests may
-        // not fail if our compiler-builtins is linked.
-        ("x86", _) => false,
-        // MinGW ABI bugs <https://gcc.gnu.org/bugzilla/show_bug.cgi?id=115054>
-        ("x86_64", "windows") if target_env == "gnu" && target_abi != "llvm" => false,
-        // There are no known problems on other platforms, so the only requirement is that symbols
-        // are available. `compiler-builtins` provides all symbols required for core `f128`
-        // support, so this should work for everything else.
-        _ => true,
-    };
-
-    // Configure platforms that have reliable basics but may have unreliable math.
-
-    // LLVM is currently adding missing routines, <https://github.com/llvm/llvm-project/issues/93566>
-    let has_reliable_f16_math = has_reliable_f16
-        && match (target_arch.as_str(), target_os.as_str()) {
-            // FIXME: Disabled on Miri as the intrinsics are not implemented yet.
-            _ if is_miri => false,
-            // x86 has a crash for `powi`: <https://github.com/llvm/llvm-project/issues/105747>
-            ("x86" | "x86_64", _) => false,
-            // Assume that working `f16` means working `f16` math for most platforms, since
-            // operations just go through `f32`.
-            _ => true,
-        };
-
-    let has_reliable_f128_math = has_reliable_f128
-        && match (target_arch.as_str(), target_os.as_str()) {
-            // FIXME: Disabled on Miri as the intrinsics are not implemented yet.
-            _ if is_miri => false,
-            // LLVM lowers `fp128` math to `long double` symbols even on platforms where
-            // `long double` is not IEEE binary128. See
-            // <https://github.com/llvm/llvm-project/issues/44744>.
-            //
-            // This rules out anything that doesn't have `long double` = `binary128`; <= 32 bits
-            // (ld is `f64`), anything other than Linux (Windows and MacOS use `f64`), and `x86`
-            // (ld is 80-bit extended precision).
-            ("x86_64", _) => false,
-            (_, "linux") if target_pointer_width == 64 => true,
-            _ => false,
-        };
-
-    if has_reliable_f16 {
-        println!("cargo:rustc-cfg=reliable_f16");
+    if target_os == "vxworks" {
+        match vxworks_version_code() {
+            Some((major, minor)) if (major, minor) < (25, 9) => {
+                println!("cargo:rustc-cfg=vxworks_lt_25_09");
+            }
+            _ => {}
+        }
     }
-    if has_reliable_f128 {
-        println!("cargo:rustc-cfg=reliable_f128");
-    }
-    if has_reliable_f16_math {
-        println!("cargo:rustc-cfg=reliable_f16_math");
-    }
-    if has_reliable_f128_math {
-        println!("cargo:rustc-cfg=reliable_f128_math");
-    }
+}
+
+/// Retrieve the VxWorks release version from the environment variable set by the VxWorks build
+/// environment, in `(minor, patch)` form.
+fn vxworks_version_code() -> Option<(u32, u32)> {
+    let version = env::var("WIND_RELEASE_ID").ok()?;
+
+    let mut pieces = version.trim().split(['.']);
+
+    let major: u32 = pieces.next().and_then(|x| x.parse().ok()).unwrap_or(0);
+    let minor: u32 = pieces.next().and_then(|x| x.parse().ok()).unwrap_or(0);
+
+    Some((major, minor))
 }

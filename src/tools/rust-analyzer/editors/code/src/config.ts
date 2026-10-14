@@ -2,43 +2,94 @@ import * as Is from "vscode-languageclient/lib/common/utils/is";
 import * as os from "os";
 import * as path from "path";
 import * as vscode from "vscode";
-import { expectNotUndefined, log, unwrapUndefinable } from "./util";
+import { expectNotUndefined, log, normalizeDriveLetter, unwrapUndefinable } from "./util";
 import type { Env } from "./util";
-import type { Disposable } from "vscode";
+import { cloneDeep, get, pickBy, set } from "lodash";
 
 export type RunnableEnvCfgItem = {
     mask?: string;
-    env: Record<string, string>;
+    env: { [key: string]: { toString(): string } | null };
     platform?: string | string[];
 };
-export type RunnableEnvCfg = Record<string, string> | RunnableEnvCfgItem[];
+
+export type ConfigurationTree = { [key: string]: ConfigurationValue };
+export type ConfigurationValue =
+    | undefined
+    | null
+    | boolean
+    | number
+    | string
+    | ConfigurationValue[]
+    | ConfigurationTree;
+
+type ShowStatusBar = "always" | "never" | { documentSelector: vscode.DocumentSelector };
 
 export class Config {
     readonly extensionId = "rust-lang.rust-analyzer";
-    configureLang: vscode.Disposable | undefined;
 
-    readonly rootSection = "rust-analyzer";
-    private readonly requiresServerReloadOpts = [
-        "cargo",
-        "procMacro",
-        "serverPath",
-        "server",
-        "files",
-        "cfg",
-    ].map((opt) => `${this.rootSection}.${opt}`);
+    configureLang: vscode.Disposable | undefined;
+    workspaceState: vscode.Memento;
+
+    private readonly rootSection = "rust-analyzer";
+    private readonly requiresServerReloadOpts = ["server", "files", "showSyntaxTree"].map(
+        (opt) => `${this.rootSection}.${opt}`,
+    );
 
     private readonly requiresWindowReloadOpts = ["testExplorer"].map(
         (opt) => `${this.rootSection}.${opt}`,
     );
 
-    constructor(disposables: Disposable[]) {
-        vscode.workspace.onDidChangeConfiguration(this.onDidChangeConfiguration, this, disposables);
+    constructor(ctx: vscode.ExtensionContext) {
+        this.workspaceState = ctx.workspaceState;
+        vscode.workspace.onDidChangeConfiguration(
+            this.onDidChangeConfiguration,
+            this,
+            ctx.subscriptions,
+        );
         this.refreshLogging();
         this.configureLanguage();
     }
 
     dispose() {
         this.configureLang?.dispose();
+    }
+
+    private readonly extensionConfigurationStateKey = "extensionConfigurations";
+
+    /// Returns the rust-analyzer-specific workspace configuration, incl. any
+    /// configuration items overridden by (present) extensions.
+    get extensionConfigurations(): Record<string, Record<string, unknown>> {
+        return pickBy(
+            this.workspaceState.get<Record<string, ConfigurationTree>>(
+                "extensionConfigurations",
+                {},
+            ),
+            // ignore configurations from disabled/removed extensions
+            (_, extensionId) => vscode.extensions.getExtension(extensionId) !== undefined,
+        );
+    }
+
+    async addExtensionConfiguration(
+        extensionId: string,
+        configuration: Record<string, unknown>,
+    ): Promise<void> {
+        const oldConfiguration = this.cfg;
+
+        const extCfgs = this.extensionConfigurations;
+        extCfgs[extensionId] = configuration;
+        await this.workspaceState.update(this.extensionConfigurationStateKey, extCfgs);
+
+        const newConfiguration = this.cfg;
+        const prefix = `${this.rootSection}.`;
+        await this.onDidChangeConfiguration({
+            affectsConfiguration(section: string, _scope?: vscode.ConfigurationScope): boolean {
+                return (
+                    section.startsWith(prefix) &&
+                    get(oldConfiguration, section.slice(prefix.length)) !==
+                        get(newConfiguration, section.slice(prefix.length))
+                );
+            },
+        });
     }
 
     private refreshLogging() {
@@ -138,13 +189,13 @@ export class Config {
                 {
                     // Parent doc single-line comment
                     // e.g. //!|
-                    beforeText: /^\s*\/{2}\!.*$/,
+                    beforeText: /^\s*\/{2}!.*$/,
                     action: { indentAction, appendText: "//! " },
                 },
                 {
                     // Begins an auto-closed multi-line comment (standard or parent doc)
                     // e.g. /** | */ or /*! | */
-                    beforeText: /^\s*\/\*(\*|\!)(?!\/)([^\*]|\*(?!\/))*$/,
+                    beforeText: /^\s*\/\*(\*|!)(?!\/)([^*]|\*(?!\/))*$/,
                     afterText: /^\s*\*\/$/,
                     action: {
                         indentAction: vscode.IndentAction.IndentOutdent,
@@ -154,19 +205,19 @@ export class Config {
                 {
                     // Begins a multi-line comment (standard or parent doc)
                     // e.g. /** ...| or /*! ...|
-                    beforeText: /^\s*\/\*(\*|\!)(?!\/)([^\*]|\*(?!\/))*$/,
+                    beforeText: /^\s*\/\*(\*|!)(?!\/)([^*]|\*(?!\/))*$/,
                     action: { indentAction, appendText: " * " },
                 },
                 {
                     // Continues a multi-line comment
                     // e.g.  * ...|
-                    beforeText: /^(\ \ )*\ \*(\ ([^\*]|\*(?!\/))*)?$/,
+                    beforeText: /^( {2})* \*( ([^*]|\*(?!\/))*)?$/,
                     action: { indentAction, appendText: "* " },
                 },
                 {
                     // Dedents after closing a multi-line comment
                     // e.g.  */|
-                    beforeText: /^(\ \ )*\ \*\/\s*$/,
+                    beforeText: /^( {2})* \*\/\s*$/,
                     action: { indentAction, removeText: 1 },
                 },
             ];
@@ -180,8 +231,34 @@ export class Config {
     // We don't do runtime config validation here for simplicity. More on stackoverflow:
     // https://stackoverflow.com/questions/60135780/what-is-the-best-way-to-type-check-the-configuration-for-vscode-extension
 
-    private get cfg(): vscode.WorkspaceConfiguration {
+    // Returns the raw configuration for rust-analyzer as returned by vscode. This
+    // should only be used when modifications to the user/workspace configuration
+    // are required.
+    private get rawCfg(): vscode.WorkspaceConfiguration {
         return vscode.workspace.getConfiguration(this.rootSection);
+    }
+
+    // Returns the final configuration to use, with extension configuration overrides merged in.
+    public get cfg(): ConfigurationTree {
+        const finalConfig = cloneDeep<ConfigurationTree>(this.rawCfg);
+        for (const [extensionId, items] of Object.entries(this.extensionConfigurations)) {
+            for (const [k, v] of Object.entries(items)) {
+                const i = this.rawCfg.inspect(k);
+                if (
+                    i?.workspaceValue !== undefined ||
+                    i?.workspaceFolderValue !== undefined ||
+                    i?.globalValue !== undefined
+                ) {
+                    log.trace(
+                        `Ignoring configuration override for ${k} from extension ${extensionId}`,
+                    );
+                    continue;
+                }
+                log.trace(`Extension ${extensionId} overrides configuration ${k} to `, v);
+                set(finalConfig, k, v);
+            }
+        }
+        return finalConfig;
     }
 
     /**
@@ -191,7 +268,6 @@ export class Config {
      * ```ts
      * const nullableNum = vscode
      *  .workspace
-     *  .getConfiguration
      *  .getConfiguration("rust-analyzer")
      *  .get<number | null>(path)!;
      *
@@ -201,30 +277,33 @@ export class Config {
      * So this getter handles this quirk by not requiring the caller to use postfix `!`
      */
     private get<T>(path: string): T | undefined {
-        return prepareVSCodeConfig(this.cfg.get<T>(path));
+        return prepareVSCodeConfig(get(this.cfg, path)) as T;
     }
 
     get serverPath() {
-        return this.get<null | string>("server.path") ?? this.get<null | string>("serverPath");
+        return this.get<null | string>("server.path");
     }
 
     get serverExtraEnv(): Env {
         const extraEnv =
-            this.get<{ [key: string]: string | number } | null>("server.extraEnv") ?? {};
+            this.get<{ [key: string]: { toString(): string } | null } | null>("server.extraEnv") ??
+            {};
         return substituteVariablesInEnv(
             Object.fromEntries(
                 Object.entries(extraEnv).map(([k, v]) => [
                     k,
-                    typeof v !== "string" ? v.toString() : v,
+                    typeof v === "string" ? v : v?.toString(),
                 ]),
             ),
         );
     }
+
     get checkOnSave() {
         return this.get<boolean>("checkOnSave") ?? false;
     }
+
     async toggleCheckOnSave() {
-        const config = this.cfg.inspect<boolean>("checkOnSave") ?? { key: "checkOnSave" };
+        const config = this.rawCfg.inspect<boolean>("checkOnSave") ?? { key: "checkOnSave" };
         let overrideInLanguage;
         let target;
         let value;
@@ -250,7 +329,12 @@ export class Config {
             overrideInLanguage = config.defaultLanguageValue;
             value = config.defaultValue || config.defaultLanguageValue;
         }
-        await this.cfg.update("checkOnSave", !(value || false), target || null, overrideInLanguage);
+        await this.rawCfg.update(
+            "checkOnSave",
+            !(value || false),
+            target || null,
+            overrideInLanguage,
+        );
     }
 
     get problemMatcher(): string[] {
@@ -261,22 +345,42 @@ export class Config {
         return this.get<boolean | undefined>("testExplorer");
     }
 
-    get runnablesExtraEnv() {
-        const item = this.get<any>("runnables.extraEnv") ?? this.get<any>("runnableEnv");
-        if (!item) return item;
-        const fixRecord = (r: Record<string, any>) => {
-            for (const key in r) {
-                if (typeof r[key] !== "string") {
-                    r[key] = String(r[key]);
+    runnablesExtraEnv(label: string): Env {
+        const serverEnv = this.serverExtraEnv;
+        let extraEnv =
+            this.get<
+                RunnableEnvCfgItem[] | { [key: string]: { toString(): string } | null } | null
+            >("runnables.extraEnv") ?? {};
+        if (!extraEnv) return serverEnv;
+
+        const platform = process.platform;
+        const checkPlatform = (it: RunnableEnvCfgItem) => {
+            if (it.platform) {
+                const platforms = Array.isArray(it.platform) ? it.platform : [it.platform];
+                return platforms.indexOf(platform) >= 0;
+            }
+            return true;
+        };
+
+        if (extraEnv instanceof Array) {
+            const env = {};
+            for (const it of extraEnv) {
+                const masked = !it.mask || new RegExp(it.mask).test(label);
+                if (masked && checkPlatform(it)) {
+                    Object.assign(env, it.env);
                 }
             }
-        };
-        if (item instanceof Array) {
-            item.forEach((x) => fixRecord(x.env));
-        } else {
-            fixRecord(item);
+            extraEnv = env;
         }
-        return item;
+        const runnableExtraEnv = substituteVariablesInEnv(
+            Object.fromEntries(
+                Object.entries(extraEnv).map(([k, v]) => [
+                    k,
+                    typeof v === "string" ? v : v?.toString(),
+                ]),
+            ),
+        );
+        return { ...runnableExtraEnv, ...serverEnv };
     }
 
     get restartServerOnConfigChange() {
@@ -299,7 +403,6 @@ export class Config {
         return {
             engine: this.get<string>("debug.engine"),
             engineSettings: this.get<object>("debug.engineSettings") ?? {},
-            openDebugPane: this.get<boolean>("debug.openDebugPane"),
             buildBeforeRestart: this.get<boolean>("debug.buildBeforeRestart"),
             sourceFileMap: sourceFileMap,
         };
@@ -315,6 +418,7 @@ export class Config {
             gotoTypeDef: this.get<boolean>("hover.actions.gotoTypeDef.enable"),
         };
     }
+
     get previewRustcOutput() {
         return this.get<boolean>("diagnostics.previewRustcOutput");
     }
@@ -327,35 +431,52 @@ export class Config {
         return this.get<boolean>("showDependenciesExplorer");
     }
 
+    get showSyntaxTree() {
+        return this.get<boolean>("showSyntaxTree");
+    }
+
     get statusBarClickAction() {
         return this.get<string>("statusBar.clickAction");
+    }
+
+    get statusBarShowStatusBar() {
+        return this.get<ShowStatusBar>("statusBar.showStatusBar");
     }
 
     get initializeStopped() {
         return this.get<boolean>("initializeStopped");
     }
+
+    get askBeforeUpdateTest() {
+        return this.get<boolean>("runnables.askBeforeUpdateTest");
+    }
+
+    async setAskBeforeUpdateTest(value: boolean) {
+        await this.rawCfg.update("runnables.askBeforeUpdateTest", value, true);
+    }
 }
 
-export function prepareVSCodeConfig<T>(resp: T): T {
+export function prepareVSCodeConfig(resp: ConfigurationValue): ConfigurationValue {
     if (Is.string(resp)) {
-        return substituteVSCodeVariableInString(resp) as T;
-    } else if (resp && Is.array<any>(resp)) {
+        return substituteVSCodeVariableInString(resp);
+    } else if (resp && Is.array(resp)) {
         return resp.map((val) => {
             return prepareVSCodeConfig(val);
-        }) as T;
+        });
     } else if (resp && typeof resp === "object") {
-        const res: { [key: string]: any } = {};
+        const res: ConfigurationTree = {};
         for (const key in resp) {
             const val = resp[key];
             res[key] = prepareVSCodeConfig(val);
         }
-        return res as T;
+        return res;
     }
     return resp;
 }
 
 // FIXME: Merge this with `substituteVSCodeVariables` above
 export function substituteVariablesInEnv(env: Env): Env {
+    const depRe = new RegExp(/\${(?<depName>.+?)}/g);
     const missingDeps = new Set<string>();
     // vscode uses `env:ENV_NAME` for env vars resolution, and it's easier
     // to follow the same convention for our dependency tracking
@@ -363,15 +484,16 @@ export function substituteVariablesInEnv(env: Env): Env {
     const envWithDeps = Object.fromEntries(
         Object.entries(env).map(([key, value]) => {
             const deps = new Set<string>();
-            const depRe = new RegExp(/\${(?<depName>.+?)}/g);
-            let match = undefined;
-            while ((match = depRe.exec(value))) {
-                const depName = unwrapUndefinable(match.groups?.["depName"]);
-                deps.add(depName);
-                // `depName` at this point can have a form of `expression` or
-                // `prefix:expression`
-                if (!definedEnvKeys.has(depName)) {
-                    missingDeps.add(depName);
+            if (value) {
+                let match;
+                while ((match = depRe.exec(value))) {
+                    const depName = unwrapUndefinable(match.groups?.["depName"]);
+                    deps.add(depName);
+                    // `depName` at this point can have a form of `expression` or
+                    // `prefix:expression`
+                    if (!definedEnvKeys.has(depName)) {
+                        missingDeps.add(depName);
+                    }
                 }
             }
             return [`env:${key}`, { deps: [...deps], value }];
@@ -412,11 +534,10 @@ export function substituteVariablesInEnv(env: Env): Env {
     do {
         leftToResolveSize = toResolve.size;
         for (const key of toResolve) {
-            const item = unwrapUndefinable(envWithDeps[key]);
-            if (item.deps.every((dep) => resolved.has(dep))) {
-                item.value = item.value.replace(/\${(?<depName>.+?)}/g, (_wholeMatch, depName) => {
-                    const item = unwrapUndefinable(envWithDeps[depName]);
-                    return item.value;
+            const item = envWithDeps[key];
+            if (item && item.deps.every((dep) => resolved.has(dep))) {
+                item.value = item.value?.replace(/\${(?<depName>.+?)}/g, (_wholeMatch, depName) => {
+                    return envWithDeps[depName]?.value ?? "";
                 });
                 resolved.add(key);
                 toResolve.delete(key);
@@ -450,14 +571,13 @@ function computeVscodeVar(varName: string): string | null {
         // TODO: support for remote workspaces?
         const fsPath: string =
             folder === undefined
-                ? // no workspace opened
-                  ""
+                ? "" // no workspace opened
                 : // could use currently opened document to detect the correct
                   // workspace. However, that would be determined by the document
                   // user has opened on Editor startup. Could lead to
                   // unpredictable workspace selection in practice.
                   // It's better to pick the first one
-                  folder.uri.fsPath;
+                  normalizeDriveLetter(folder.uri.fsPath);
         return fsPath;
     };
     // https://code.visualstudio.com/docs/editor/variables-reference

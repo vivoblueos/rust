@@ -1,12 +1,13 @@
 //! Facilitates the management and generation of tarballs.
 //!
 //! Tarballs efficiently hold Rust compiler build artifacts and
-//! capture a snapshot of each boostrap stage.
+//! capture a snapshot of each bootstrap stage.
 //! In uplifting, a tarball from Stage N captures essential components
 //! to assemble Stage N + 1 compiler.
 
 use std::path::{Path, PathBuf};
 
+use crate::FileType;
 use crate::core::build_steps::dist::distdir;
 use crate::core::builder::{Builder, Kind};
 use crate::core::config::BUILDER_CONFIG_FILENAME;
@@ -22,10 +23,12 @@ pub(crate) enum OverlayKind {
     Clippy,
     Miri,
     Rustfmt,
-    Rls,
     RustAnalyzer,
     RustcCodegenCranelift,
+    RustcCodegenGcc,
+    Gcc,
     LlvmBitcodeLinker,
+    Enzyme,
 }
 
 impl OverlayKind {
@@ -35,6 +38,7 @@ impl OverlayKind {
             OverlayKind::Llvm => {
                 &["src/llvm-project/llvm/LICENSE.TXT", "src/llvm-project/llvm/README.txt"]
             }
+            OverlayKind::Enzyme => &["src/tools/enzyme/LICENSE", "src/tools/enzyme/Readme.md"],
             OverlayKind::Cargo => &[
                 "src/tools/cargo/README.md",
                 "src/tools/cargo/LICENSE-MIT",
@@ -56,7 +60,6 @@ impl OverlayKind {
                 "src/tools/rustfmt/LICENSE-APACHE",
                 "src/tools/rustfmt/LICENSE-MIT",
             ],
-            OverlayKind::Rls => &["src/tools/rls/README.md", "LICENSE-APACHE", "LICENSE-MIT"],
             OverlayKind::RustAnalyzer => &[
                 "src/tools/rust-analyzer/README.md",
                 "src/tools/rust-analyzer/LICENSE-APACHE",
@@ -67,11 +70,24 @@ impl OverlayKind {
                 "compiler/rustc_codegen_cranelift/LICENSE-APACHE",
                 "compiler/rustc_codegen_cranelift/LICENSE-MIT",
             ],
+            OverlayKind::RustcCodegenGcc => &[
+                "compiler/rustc_codegen_gcc/Readme.md",
+                "compiler/rustc_codegen_gcc/LICENSE-APACHE",
+                "compiler/rustc_codegen_gcc/LICENSE-MIT",
+            ],
             OverlayKind::LlvmBitcodeLinker => &[
                 "COPYRIGHT",
                 "LICENSE-APACHE",
                 "LICENSE-MIT",
                 "src/tools/llvm-bitcode-linker/README.md",
+            ],
+            OverlayKind::Gcc => &[
+                "src/gcc/README",
+                "src/gcc/COPYING",
+                "src/gcc/COPYING.LIB",
+                "src/gcc/COPYING.RUNTIME",
+                "src/gcc/COPYING3",
+                "src/gcc/COPYING3.LIB",
             ],
         }
     }
@@ -90,12 +106,14 @@ impl OverlayKind {
             OverlayKind::Rustfmt => {
                 builder.rustfmt_info.version(builder, &builder.release_num("rustfmt"))
             }
-            OverlayKind::Rls => builder.release(&builder.release_num("rls")),
             OverlayKind::RustAnalyzer => builder
                 .rust_analyzer_info
                 .version(builder, &builder.release_num("rust-analyzer/crates/rust-analyzer")),
             OverlayKind::RustcCodegenCranelift => builder.rust_version(),
+            OverlayKind::RustcCodegenGcc => builder.rust_version(),
             OverlayKind::LlvmBitcodeLinker => builder.rust_version(),
+            OverlayKind::Gcc => builder.rust_version(),
+            OverlayKind::Enzyme => builder.rust_version(),
         }
     }
 }
@@ -185,7 +203,12 @@ impl<'a> Tarball<'a> {
         &self.image_dir
     }
 
-    pub(crate) fn add_file(&self, src: impl AsRef<Path>, destdir: impl AsRef<Path>, perms: u32) {
+    pub(crate) fn add_file(
+        &self,
+        src: impl AsRef<Path>,
+        destdir: impl AsRef<Path>,
+        file_type: FileType,
+    ) {
         // create_dir_all fails to create `foo/bar/.`, so when the destination is "." this simply
         // uses the base directory as the destination directory.
         let destdir = if destdir.as_ref() == Path::new(".") {
@@ -195,7 +218,7 @@ impl<'a> Tarball<'a> {
         };
 
         t!(std::fs::create_dir_all(&destdir));
-        self.builder.install(src.as_ref(), &destdir, perms);
+        self.builder.install(src.as_ref(), &destdir, file_type);
     }
 
     pub(crate) fn add_renamed_file(
@@ -203,15 +226,16 @@ impl<'a> Tarball<'a> {
         src: impl AsRef<Path>,
         destdir: impl AsRef<Path>,
         new_name: &str,
+        file_type: FileType,
     ) {
         let destdir = self.image_dir.join(destdir.as_ref());
         t!(std::fs::create_dir_all(&destdir));
-        self.builder.copy_link(src.as_ref(), &destdir.join(new_name));
+        self.builder.copy_link(src.as_ref(), &destdir.join(new_name), file_type);
     }
 
     pub(crate) fn add_legal_and_readme_to(&self, destdir: impl AsRef<Path>) {
         for file in self.overlay.legal_and_readme() {
-            self.add_file(self.builder.src.join(file), destdir.as_ref(), 0o644);
+            self.add_file(self.builder.src.join(file), destdir.as_ref(), FileType::Regular);
         }
     }
 
@@ -321,11 +345,20 @@ impl<'a> Tarball<'a> {
 
         // Add config file if present.
         if let Some(config) = &self.builder.config.config {
-            self.add_renamed_file(config, &self.overlay_dir, BUILDER_CONFIG_FILENAME);
+            self.add_renamed_file(
+                config,
+                &self.overlay_dir,
+                BUILDER_CONFIG_FILENAME,
+                FileType::Regular,
+            );
         }
 
         for file in self.overlay.legal_and_readme() {
-            self.builder.install(&self.builder.src.join(file), &self.overlay_dir, 0o644);
+            self.builder.install(
+                &self.builder.src.join(file),
+                &self.overlay_dir,
+                FileType::Regular,
+            );
         }
 
         let mut cmd = self.builder.tool_cmd(crate::core::build_steps::tool::Tool::RustInstaller);
@@ -343,7 +376,7 @@ impl<'a> Tarball<'a> {
 
         // For `x install` tarball files aren't needed, so we can speed up the process by not producing them.
         let compression_profile = if self.builder.kind == Kind::Install {
-            self.builder.verbose(|| {
+            self.builder.do_if_verbose(|| {
                 println!("Forcing dist.compression-profile = 'no-op' for `x install`.")
             });
             // "no-op" indicates that the rust-installer won't produce compressed tarball sources.

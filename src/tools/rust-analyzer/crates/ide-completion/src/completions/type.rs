@@ -1,18 +1,18 @@
 //! Completion of names from the current scope in type position.
 
 use hir::{HirDisplay, ScopeDef};
-use syntax::{ast, AstNode};
+use syntax::{AstNode, ast};
 
 use crate::{
+    CompletionContext, Completions,
     context::{PathCompletionCtx, Qualified, TypeAscriptionTarget, TypeLocation},
     render::render_type_inference,
-    CompletionContext, Completions,
 };
 
 pub(crate) fn complete_type_path(
     acc: &mut Completions,
     ctx: &CompletionContext<'_>,
-    path_ctx @ PathCompletionCtx { qualified, .. }: &PathCompletionCtx,
+    path_ctx @ PathCompletionCtx { qualified, .. }: &PathCompletionCtx<'_>,
     location: &TypeLocation,
 ) {
     let _p = tracing::info_span!("complete_type_path").entered();
@@ -23,7 +23,9 @@ pub(crate) fn complete_type_path(
             ScopeDef::GenericParam(LifetimeParam(_)) => location.complete_lifetimes(),
             ScopeDef::Label(_) => false,
             // no values in type places
-            ScopeDef::ModuleDef(Function(_) | Variant(_) | Static(_)) | ScopeDef::Local(_) => false,
+            ScopeDef::ModuleDef(Function(_) | EnumVariant(_) | Static(_)) | ScopeDef::Local(_) => {
+                false
+            }
             // unless its a constant in a generic arg list position
             ScopeDef::ModuleDef(Const(_)) | ScopeDef::GenericParam(ConstParam(_)) => {
                 location.complete_consts()
@@ -37,9 +39,7 @@ pub(crate) fn complete_type_path(
                 true
             }
             // Type things are fine
-            ScopeDef::ModuleDef(
-                BuiltinType(_) | Adt(_) | Module(_) | Trait(_) | TraitAlias(_) | TypeAlias(_),
-            )
+            ScopeDef::ModuleDef(BuiltinType(_) | Adt(_) | Module(_) | Trait(_) | TypeAlias(_))
             | ScopeDef::AdtSelfType(_)
             | ScopeDef::Unknown
             | ScopeDef::GenericParam(TypeParam(_)) => location.complete_types(),
@@ -69,7 +69,7 @@ pub(crate) fn complete_type_path(
             });
 
             // Iterate assoc types separately
-            ty.iterate_assoc_items(ctx.db, ctx.krate, |item| {
+            ty.iterate_assoc_items(ctx.db, |item| {
                 if let hir::AssocItem::TypeAlias(ty) = item {
                     acc.add_type_alias(ctx, ty)
                 }
@@ -79,9 +79,8 @@ pub(crate) fn complete_type_path(
         Qualified::With { resolution: None, .. } => {}
         Qualified::With { resolution: Some(resolution), .. } => {
             // Add associated types on type parameters and `Self`.
-            ctx.scope.assoc_type_shorthand_candidates(resolution, |_, alias| {
+            ctx.scope.assoc_type_shorthand_candidates(resolution, |alias| {
                 acc.add_type_alias(ctx, alias);
-                None::<()>
             });
 
             match resolution {
@@ -113,7 +112,7 @@ pub(crate) fn complete_type_path(
                     });
 
                     // Iterate assoc types separately
-                    ty.iterate_assoc_items(ctx.db, ctx.krate, |item| {
+                    ty.iterate_assoc_items(ctx.db, |item| {
                         if let hir::AssocItem::TypeAlias(ty) = item {
                             acc.add_type_alias(ctx, ty)
                         }
@@ -207,7 +206,8 @@ pub(crate) fn complete_type_path(
                 _ => {}
             };
 
-            acc.add_nameref_keywords_with_colon(ctx);
+            acc.add_nameref_keywords_with_type_like(ctx, path_ctx);
+            acc.add_type_keywords(ctx, path_ctx);
             ctx.process_all_names(&mut |name, def, doc_aliases| {
                 if scope_def_applicable(def) {
                     acc.add_path_resolution(ctx, path_ctx, name, def, doc_aliases);
@@ -220,7 +220,7 @@ pub(crate) fn complete_type_path(
 pub(crate) fn complete_ascribed_type(
     acc: &mut Completions,
     ctx: &CompletionContext<'_>,
-    path_ctx: &PathCompletionCtx,
+    path_ctx: &PathCompletionCtx<'_>,
     ascription: &TypeAscriptionTarget,
 ) -> Option<()> {
     if !path_ctx.is_trivial_path() {
@@ -230,14 +230,14 @@ pub(crate) fn complete_ascribed_type(
         TypeAscriptionTarget::Let(pat) | TypeAscriptionTarget::FnParam(pat) => {
             ctx.sema.type_of_pat(pat.as_ref()?)
         }
-        TypeAscriptionTarget::Const(exp) | TypeAscriptionTarget::RetType(exp) => {
+        TypeAscriptionTarget::Const(exp) | TypeAscriptionTarget::RetType { body: exp, .. } => {
             ctx.sema.type_of_expr(exp.as_ref()?)
         }
     }?
     .adjusted();
     if !ty.is_unknown() {
         let ty_string = ty.display_source_code(ctx.db, ctx.module.into(), true).ok()?;
-        acc.add(render_type_inference(ty_string, ctx));
+        acc.add(render_type_inference(ty_string, ctx, path_ctx));
     }
     None
 }

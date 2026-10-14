@@ -1,8 +1,7 @@
-use rustc_ast::{self as ast, EnumDef, MetaItem};
+use rustc_ast::{self as ast, EnumDef, MetaItem, Safety};
 use rustc_expand::base::{Annotatable, ExtCtxt};
 use rustc_session::config::FmtDebug;
-use rustc_span::Span;
-use rustc_span::symbol::{Ident, Symbol, sym};
+use rustc_span::{Ident, Span, Symbol, sym};
 use thin_vec::{ThinVec, thin_vec};
 
 use crate::deriving::generic::ty::*;
@@ -31,7 +30,7 @@ pub(crate) fn expand_deriving_debug(
             name: sym::fmt,
             generics: Bounds::empty(),
             explicit_self: true,
-            nonself_args: vec![(fmtr, sym::f)],
+            nonself_args: vec![(fmtr, sym::character('f'))],
             ret_ty: Path(path_std!(fmt::Result)),
             attributes: thin_vec![cx.attr_word(sym::inline, span)],
             fieldless_variants_strategy:
@@ -42,6 +41,9 @@ pub(crate) fn expand_deriving_debug(
         }],
         associated_types: Vec::new(),
         is_const,
+        is_staged_api_crate: cx.ecfg.features.staged_api(),
+        safety: Safety::Default,
+        document: true,
     };
     trait_def.expand(cx, mitem, item, push)
 }
@@ -57,7 +59,7 @@ fn show_substructure(cx: &ExtCtxt<'_>, span: Span, substr: &Substructure<'_>) ->
 
     let (ident, vdata, fields) = match substr.fields {
         Struct(vdata, fields) => (substr.type_ident, *vdata, fields),
-        EnumMatching(_, v, fields) => (v.ident, &v.data, fields),
+        EnumMatching(v, fields) => (v.ident, &v.data, fields),
         AllFieldlessEnum(enum_def) => return show_fieldless_enum(cx, span, enum_def, substr),
         EnumDiscr(..) | StaticStruct(..) | StaticEnum(..) => {
             cx.dcx().span_bug(span, "nonsensical .fields in `#[derive(Debug)]`")
@@ -94,7 +96,7 @@ fn show_substructure(cx: &ExtCtxt<'_>, span: Span, substr: &Substructure<'_>) ->
         field: &FieldInfo,
         index: usize,
         len: usize,
-    ) -> ast::ptr::P<ast::Expr> {
+    ) -> Box<ast::Expr> {
         if index < len - 1 {
             field.self_expr.clone()
         } else {

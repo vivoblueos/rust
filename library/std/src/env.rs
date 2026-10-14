@@ -10,14 +10,13 @@
 
 #![stable(feature = "env", since = "1.0.0")]
 
-#[cfg(test)]
-mod tests;
-
 use crate::error::Error;
 use crate::ffi::{OsStr, OsString};
+use crate::num::NonZero;
+use crate::ops::Try;
 use crate::path::{Path, PathBuf};
-use crate::sys::os as os_imp;
-use crate::{fmt, io, sys};
+use crate::sys::{env as env_imp, paths as paths_imp};
+use crate::{array, fmt, io, sys};
 
 /// Returns the current working directory as a [`PathBuf`].
 ///
@@ -52,7 +51,7 @@ use crate::{fmt, io, sys};
 #[doc(alias = "GetCurrentDirectory")]
 #[stable(feature = "env", since = "1.0.0")]
 pub fn current_dir() -> io::Result<PathBuf> {
-    os_imp::getcwd()
+    paths_imp::getcwd()
 }
 
 /// Changes the current working directory to the specified path.
@@ -79,7 +78,7 @@ pub fn current_dir() -> io::Result<PathBuf> {
 #[doc(alias = "chdir", alias = "SetCurrentDirectory", alias = "SetCurrentDirectoryW")]
 #[stable(feature = "env", since = "1.0.0")]
 pub fn set_current_dir<P: AsRef<Path>>(path: P) -> io::Result<()> {
-    os_imp::chdir(path.as_ref())
+    paths_imp::chdir(path.as_ref())
 }
 
 /// An iterator over a snapshot of the environment variables of this process.
@@ -99,7 +98,7 @@ pub struct Vars {
 /// [`env::vars_os()`]: vars_os
 #[stable(feature = "env", since = "1.0.0")]
 pub struct VarsOs {
-    inner: os_imp::Env,
+    inner: env_imp::Env,
 }
 
 /// Returns an iterator of (variable, value) pairs of strings, for all the
@@ -153,7 +152,7 @@ pub fn vars() -> Vars {
 #[must_use]
 #[stable(feature = "env", since = "1.0.0")]
 pub fn vars_os() -> VarsOs {
-    VarsOs { inner: os_imp::env() }
+    VarsOs { inner: env_imp::env() }
 }
 
 #[stable(feature = "env", since = "1.0.0")]
@@ -171,7 +170,7 @@ impl Iterator for Vars {
 impl fmt::Debug for Vars {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let Self { inner: VarsOs { inner } } = self;
-        f.debug_struct("Vars").field("inner", &inner.str_debug()).finish()
+        f.debug_struct("Vars").field("inner", inner).finish()
     }
 }
 
@@ -204,6 +203,9 @@ impl fmt::Debug for VarsOs {
 ///
 /// Returns [`VarError::NotUnicode`] if the variable's value is not valid
 /// Unicode. If this is not desired, consider using [`var_os`].
+///
+/// Use [`env!`] or [`option_env!`] instead if you want to check environment
+/// variables at compile time.
 ///
 /// # Examples
 ///
@@ -259,7 +261,7 @@ pub fn var_os<K: AsRef<OsStr>>(key: K) -> Option<OsString> {
 }
 
 fn _var_os(key: &OsStr) -> Option<OsString> {
-    os_imp::getenv(key)
+    env_imp::getenv(key)
 }
 
 /// The error type for operations interacting with environment variables.
@@ -294,15 +296,7 @@ impl fmt::Display for VarError {
 }
 
 #[stable(feature = "env", since = "1.0.0")]
-impl Error for VarError {
-    #[allow(deprecated)]
-    fn description(&self) -> &str {
-        match *self {
-            VarError::NotPresent => "environment variable not found",
-            VarError::NotUnicode(..) => "environment variable was not valid unicode",
-        }
-    }
-}
+impl Error for VarError {}
 
 /// Sets the environment variable `key` to the value `value` for the currently running
 /// process.
@@ -333,10 +327,13 @@ impl Error for VarError {
 ///
 /// Discussion of this unsafety on Unix may be found in:
 ///
-///  - [Austin Group Bugzilla](https://austingroupbugs.net/view.php?id=188)
+///  - [Austin Group Bugzilla (for POSIX)](https://austingroupbugs.net/view.php?id=188)
 ///  - [GNU C library Bugzilla](https://sourceware.org/bugzilla/show_bug.cgi?id=15607#c2)
 ///
+/// To pass an environment variable to a child process, you can instead use [`Command::env`].
+///
 /// [`std::net::ToSocketAddrs`]: crate::net::ToSocketAddrs
+/// [`Command::env`]: crate::process::Command::env
 ///
 /// # Panics
 ///
@@ -360,7 +357,7 @@ impl Error for VarError {
 #[stable(feature = "env", since = "1.0.0")]
 pub unsafe fn set_var<K: AsRef<OsStr>, V: AsRef<OsStr>>(key: K, value: V) {
     let (key, value) = (key.as_ref(), value.as_ref());
-    unsafe { os_imp::setenv(key, value) }.unwrap_or_else(|e| {
+    unsafe { env_imp::setenv(key, value) }.unwrap_or_else(|e| {
         panic!("failed to set environment variable `{key:?}` to `{value:?}`: {e}")
     })
 }
@@ -396,7 +393,12 @@ pub unsafe fn set_var<K: AsRef<OsStr>, V: AsRef<OsStr>>(key: K, value: V) {
 ///  - [Austin Group Bugzilla](https://austingroupbugs.net/view.php?id=188)
 ///  - [GNU C library Bugzilla](https://sourceware.org/bugzilla/show_bug.cgi?id=15607#c2)
 ///
+/// To prevent a child process from inheriting an environment variable, you can
+/// instead use [`Command::env_remove`] or [`Command::env_clear`].
+///
 /// [`std::net::ToSocketAddrs`]: crate::net::ToSocketAddrs
+/// [`Command::env_remove`]: crate::process::Command::env_remove
+/// [`Command::env_clear`]: crate::process::Command::env_clear
 ///
 /// # Panics
 ///
@@ -426,7 +428,7 @@ pub unsafe fn set_var<K: AsRef<OsStr>, V: AsRef<OsStr>>(key: K, value: V) {
 #[stable(feature = "env", since = "1.0.0")]
 pub unsafe fn remove_var<K: AsRef<OsStr>>(key: K) {
     let key = key.as_ref();
-    unsafe { os_imp::unsetenv(key) }
+    unsafe { env_imp::unsetenv(key) }
         .unwrap_or_else(|e| panic!("failed to remove environment variable `{key:?}`: {e}"))
 }
 
@@ -442,7 +444,7 @@ pub unsafe fn remove_var<K: AsRef<OsStr>>(key: K) {
 #[must_use = "iterators are lazy and do nothing unless consumed"]
 #[stable(feature = "env", since = "1.0.0")]
 pub struct SplitPaths<'a> {
-    inner: os_imp::SplitPaths<'a>,
+    inner: paths_imp::SplitPaths<'a>,
 }
 
 /// Parses input according to platform conventions for the `PATH`
@@ -478,7 +480,7 @@ pub struct SplitPaths<'a> {
 /// ```
 #[stable(feature = "env", since = "1.0.0")]
 pub fn split_paths<T: AsRef<OsStr> + ?Sized>(unparsed: &T) -> SplitPaths<'_> {
-    SplitPaths { inner: os_imp::split_paths(unparsed.as_ref()) }
+    SplitPaths { inner: paths_imp::split_paths(unparsed.as_ref()) }
 }
 
 #[stable(feature = "env", since = "1.0.0")]
@@ -506,7 +508,7 @@ impl fmt::Debug for SplitPaths<'_> {
 #[derive(Debug)]
 #[stable(feature = "env", since = "1.0.0")]
 pub struct JoinPathsError {
-    inner: os_imp::JoinPathsError,
+    inner: paths_imp::JoinPathsError,
 }
 
 /// Joins a collection of [`Path`]s appropriately for the `PATH`
@@ -516,8 +518,8 @@ pub struct JoinPathsError {
 ///
 /// Returns an [`Err`] (containing an error message) if one of the input
 /// [`Path`]s contains an invalid character for constructing the `PATH`
-/// variable (a double quote on Windows or a colon on Unix), or if the system
-/// does not have a `PATH`-like variable (e.g. UEFI or WASI).
+/// variable (a double quote on Windows or a colon on Unix or semicolon on
+/// UEFI), or if the system does not have a `PATH`-like variable (e.g. WASI).
 ///
 /// # Examples
 ///
@@ -563,7 +565,7 @@ pub struct JoinPathsError {
 ///         let mut paths = env::split_paths(&path).collect::<Vec<_>>();
 ///         paths.push(PathBuf::from("/home/xyz/bin"));
 ///         let new_path = env::join_paths(paths)?;
-///         env::set_var("PATH", &new_path);
+///         unsafe { env::set_var("PATH", &new_path); }
 ///     }
 ///
 ///     Ok(())
@@ -577,7 +579,7 @@ where
     I: IntoIterator<Item = T>,
     T: AsRef<OsStr>,
 {
-    os_imp::join_paths(paths.into_iter()).map_err(|e| JoinPathsError { inner: e })
+    paths_imp::join_paths(paths.into_iter()).map_err(|e| JoinPathsError { inner: e })
 }
 
 #[stable(feature = "env", since = "1.0.0")]
@@ -597,10 +599,17 @@ impl Error for JoinPathsError {
 
 /// Returns the path of the current user's home directory if known.
 ///
+/// This may return `None` if getting the directory fails or if the platform does not have user home directories.
+///
+/// For storing user data and configuration it is often preferable to use more specific directories.
+/// For example, [XDG Base Directories] on Unix or the `LOCALAPPDATA` and `APPDATA` environment variables on Windows.
+///
+/// [XDG Base Directories]: https://specifications.freedesktop.org/basedir-spec/latest/
+///
 /// # Unix
 ///
 /// - Returns the value of the 'HOME' environment variable if it is set
-///   (including to an empty string).
+///   (and not an empty string).
 /// - Otherwise, it tries to determine the home directory by invoking the `getpwuid_r` function
 ///   using the UID of the current user. An empty home directory field returned from the
 ///   `getpwuid_r` function is considered to be a valid value.
@@ -608,20 +617,16 @@ impl Error for JoinPathsError {
 ///
 /// # Windows
 ///
-/// - Returns the value of the 'HOME' environment variable if it is set
-///   (including to an empty string).
-/// - Otherwise, returns the value of the 'USERPROFILE' environment variable if it is set
-///   (including to an empty string).
-/// - If both do not exist, [`GetUserProfileDirectory`][msdn] is used to return the path.
+/// - Returns the value of the 'USERPROFILE' environment variable if it is set, and is not an empty string.
+/// - Otherwise, [`GetUserProfileDirectory`][msdn] is used to return the path. This may change in the future.
 ///
 /// [msdn]: https://docs.microsoft.com/en-us/windows/win32/api/userenv/nf-userenv-getuserprofiledirectorya
 ///
-/// # Deprecation
+/// In UWP (Universal Windows Platform) targets this function is unimplemented and always returns `None`.
 ///
-/// This function is deprecated because the behavior on Windows is not correct.
-/// The 'HOME' environment variable is not standard on Windows, and may not produce
-/// desired results; for instance, under Cygwin or Mingw it will return `/home/you`
-/// when it should return `C:\Users\you`.
+/// Before Rust 1.85.0, this function used to return the value of the 'HOME' environment variable
+/// on Windows, which in Cygwin or Mingw environments could return non-standard paths like `/home/you`
+/// instead of `C:\Users\you`.
 ///
 /// # Examples
 ///
@@ -633,15 +638,10 @@ impl Error for JoinPathsError {
 ///     None => println!("Impossible to get your home dir!"),
 /// }
 /// ```
-#[deprecated(
-    since = "1.29.0",
-    note = "This function's behavior may be unexpected on Windows. \
-            Consider using a crate from crates.io instead."
-)]
 #[must_use]
 #[stable(feature = "env", since = "1.0.0")]
 pub fn home_dir() -> Option<PathBuf> {
-    os_imp::home_dir()
+    paths_imp::home_dir()
 }
 
 /// Returns the path of a temporary directory.
@@ -653,19 +653,41 @@ pub fn home_dir() -> Option<PathBuf> {
 /// may result in "insecure temporary file" security vulnerabilities. Consider
 /// using a crate that securely creates temporary files or directories.
 ///
+/// Note that the returned value may be a symbolic link, not a directory.
+///
 /// # Platform-specific behavior
 ///
 /// On Unix, returns the value of the `TMPDIR` environment variable if it is
-/// set, otherwise for non-Android it returns `/tmp`. On Android, since there
-/// is no global temporary folder (it is usually allocated per-app), it returns
-/// `/data/local/tmp`.
+/// set, otherwise the value is OS-specific:
+/// - On Android, there is no global temporary folder (it is usually allocated
+///   per-app), it will return the application's cache dir if the program runs
+///   in application's namespace and system version is Android 13 (or above), or
+///   `/data/local/tmp` otherwise.
+/// - On Darwin-based OSes (macOS, iOS, etc) it returns the directory provided
+///   by `confstr(_CS_DARWIN_USER_TEMP_DIR, ...)`, as recommended by [Apple's
+///   security guidelines][appledoc].
+/// - On all other unix-based OSes, it returns `/tmp`.
+///
 /// On Windows, the behavior is equivalent to that of [`GetTempPath2`][GetTempPath2] /
 /// [`GetTempPath`][GetTempPath], which this function uses internally.
+/// Specifically, for non-SYSTEM processes, the function checks for the
+/// following environment variables in order and returns the first path found:
+///
+/// 1. The path specified by the `TMP` environment variable.
+/// 2. The path specified by the `TEMP` environment variable.
+/// 3. The path specified by the `USERPROFILE` environment variable.
+/// 4. The Windows directory.
+///
+/// When called from a process running as SYSTEM,
+/// [`GetTempPath2`][GetTempPath2] returns `C:\Windows\SystemTemp`
+/// regardless of environment variables.
+///
 /// Note that, this [may change in the future][changes].
 ///
 /// [changes]: io#platform-specific-behavior
 /// [GetTempPath2]: https://docs.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-gettemppath2a
 /// [GetTempPath]: https://docs.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-gettemppatha
+/// [appledoc]: https://developer.apple.com/library/archive/documentation/Security/Conceptual/SecureCodingGuide/Articles/RaceConditions.html#//apple_ref/doc/uid/TP40002585-SW10
 ///
 /// ```no_run
 /// use std::env;
@@ -679,7 +701,7 @@ pub fn home_dir() -> Option<PathBuf> {
 #[doc(alias = "GetTempPath", alias = "GetTempPath2")]
 #[stable(feature = "env", since = "1.0.0")]
 pub fn temp_dir() -> PathBuf {
-    os_imp::temp_dir()
+    paths_imp::temp_dir()
 }
 
 /// Returns the full filesystem path of the current running executable.
@@ -701,28 +723,21 @@ pub fn temp_dir() -> PathBuf {
 ///
 /// # Security
 ///
-/// The output of this function should not be trusted for anything
-/// that might have security implications. Basically, if users can run
-/// the executable, they can change the output arbitrarily.
+/// The output of this function must be treated with care to avoid security
+/// vulnerabilities, particularly in processes that run with privileges higher
+/// than the user, such as setuid or setgid programs.
 ///
-/// As an example, you can easily introduce a race condition. It goes
-/// like this:
+/// For example, on some Unix platforms, the result is calculated by
+/// searching `$PATH` for an executable matching `argv[0]`, but both the
+/// environment and arguments can be be set arbitrarily by the user who
+/// invokes the program.
 ///
-/// 1. You get the path to the current executable using `current_exe()`, and
-///    store it in a variable.
-/// 2. Time passes. A malicious actor removes the current executable, and
-///    replaces it with a malicious one.
-/// 3. You then use the stored path to re-execute the current
-///    executable.
+/// On Linux, if `fs.secure_hardlinks` is not set, an attacker who can
+/// create hardlinks to the executable may be able to cause this function
+/// to return an attacker-controlled path, which they later replace with
+/// a different program.
 ///
-/// You expected to safely execute the current executable, but you're
-/// instead executing something completely different. The code you
-/// just executed run with your privileges.
-///
-/// This sort of behavior has been known to [lead to privilege escalation] when
-/// used incorrectly.
-///
-/// [lead to privilege escalation]: https://securityvulns.com/Wdocument183.html
+/// This list of illustrative example attacks is not exhaustive.
 ///
 /// # Examples
 ///
@@ -737,7 +752,7 @@ pub fn temp_dir() -> PathBuf {
 /// ```
 #[stable(feature = "env", since = "1.0.0")]
 pub fn current_exe() -> io::Result<PathBuf> {
-    os_imp::current_exe()
+    paths_imp::current_exe()
 }
 
 /// An iterator over the arguments of a process, yielding a [`String`] value for
@@ -855,19 +870,36 @@ impl !Sync for Args {}
 #[stable(feature = "env", since = "1.0.0")]
 impl Iterator for Args {
     type Item = String;
+
     fn next(&mut self) -> Option<String> {
         self.inner.next().map(|s| s.into_string().unwrap())
     }
+
+    #[inline]
     fn size_hint(&self) -> (usize, Option<usize>) {
         self.inner.size_hint()
     }
+
+    // Methods which skip args cannot simply delegate to the inner iterator,
+    // because `env::args` states that we will "panic during iteration if any
+    // argument to the process is not valid Unicode".
+    //
+    // This offers two possible interpretations:
+    // - a skipped argument is never encountered "during iteration"
+    // - even a skipped argument is encountered "during iteration"
+    //
+    // As a panic can be observed, we err towards validating even skipped
+    // arguments for now, though this is not explicitly promised by the API.
 }
 
 #[stable(feature = "env", since = "1.0.0")]
 impl ExactSizeIterator for Args {
+    #[inline]
     fn len(&self) -> usize {
         self.inner.len()
     }
+
+    #[inline]
     fn is_empty(&self) -> bool {
         self.inner.is_empty()
     }
@@ -897,19 +929,65 @@ impl !Sync for ArgsOs {}
 #[stable(feature = "env", since = "1.0.0")]
 impl Iterator for ArgsOs {
     type Item = OsString;
+
+    #[inline]
     fn next(&mut self) -> Option<OsString> {
         self.inner.next()
     }
+
+    #[inline]
+    fn next_chunk<const N: usize>(
+        &mut self,
+    ) -> Result<[OsString; N], array::IntoIter<OsString, N>> {
+        self.inner.next_chunk()
+    }
+
+    #[inline]
     fn size_hint(&self) -> (usize, Option<usize>) {
         self.inner.size_hint()
+    }
+
+    #[inline]
+    fn count(self) -> usize {
+        self.inner.len()
+    }
+
+    #[inline]
+    fn last(self) -> Option<OsString> {
+        self.inner.last()
+    }
+
+    #[inline]
+    fn advance_by(&mut self, n: usize) -> Result<(), NonZero<usize>> {
+        self.inner.advance_by(n)
+    }
+
+    #[inline]
+    fn try_fold<B, F, R>(&mut self, init: B, f: F) -> R
+    where
+        F: FnMut(B, Self::Item) -> R,
+        R: Try<Output = B>,
+    {
+        self.inner.try_fold(init, f)
+    }
+
+    #[inline]
+    fn fold<B, F>(self, init: B, f: F) -> B
+    where
+        F: FnMut(B, Self::Item) -> B,
+    {
+        self.inner.fold(init, f)
     }
 }
 
 #[stable(feature = "env", since = "1.0.0")]
 impl ExactSizeIterator for ArgsOs {
+    #[inline]
     fn len(&self) -> usize {
         self.inner.len()
     }
+
+    #[inline]
     fn is_empty(&self) -> bool {
         self.inner.is_empty()
     }
@@ -917,8 +995,14 @@ impl ExactSizeIterator for ArgsOs {
 
 #[stable(feature = "env_iterators", since = "1.12.0")]
 impl DoubleEndedIterator for ArgsOs {
+    #[inline]
     fn next_back(&mut self) -> Option<OsString> {
         self.inner.next_back()
+    }
+
+    #[inline]
+    fn advance_back_by(&mut self, n: usize) -> Result<(), NonZero<usize>> {
+        self.inner.advance_back_by(n)
     }
 }
 
@@ -933,7 +1017,7 @@ impl fmt::Debug for ArgsOs {
 /// Constants associated with the current target
 #[stable(feature = "env", since = "1.0.0")]
 pub mod consts {
-    use crate::sys::env::os;
+    use crate::sys::env_consts::os;
 
     /// A string describing the architecture of the CPU that is currently in use.
     /// An example value may be: `"x86"`, `"arm"` or `"riscv64"`.
@@ -958,6 +1042,7 @@ pub mod consts {
     /// * `"sparc"`
     /// * `"sparc64"`
     /// * `"hexagon"`
+    /// * `"loongarch32"`
     /// * `"loongarch64"`
     ///
     /// </details>
@@ -1016,7 +1101,8 @@ pub mod consts {
     /// * `"nto"`
     /// * `"redox"`
     /// * `"solaris"`
-    /// * `"solid_asp3`
+    /// * `"solid_asp3"`
+    /// * `"vexos"`
     /// * `"vita"`
     /// * `"vxworks"`
     /// * `"xous"`
@@ -1067,6 +1153,7 @@ pub mod consts {
     ///
     /// <details><summary>Full list of possible values</summary>
     ///
+    /// * `"bin"`
     /// * `"exe"`
     /// * `"efi"`
     /// * `"js"`

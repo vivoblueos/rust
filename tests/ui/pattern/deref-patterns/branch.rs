@@ -1,8 +1,9 @@
+//@ revisions: explicit implicit
 //@ run-pass
 // Test the execution of deref patterns.
 #![feature(deref_patterns)]
-#![allow(incomplete_features)]
 
+#[cfg(explicit)]
 fn branch(vec: Vec<u32>) -> u32 {
     match vec {
         deref!([]) => 0,
@@ -12,10 +13,30 @@ fn branch(vec: Vec<u32>) -> u32 {
     }
 }
 
+#[cfg(implicit)]
+fn branch(vec: Vec<u32>) -> u32 {
+    match vec {
+        [] => 0,
+        [1, _, 3] => 1,
+        [2, ..] => 2,
+        _ => 1000,
+    }
+}
+
+#[cfg(explicit)]
 fn nested(vec: Vec<Vec<u32>>) -> u32 {
     match vec {
         deref!([deref!([]), ..]) => 1,
         deref!([deref!([0, ..]), deref!([1, ..])]) => 2,
+        _ => 1000,
+    }
+}
+
+#[cfg(implicit)]
+fn nested(vec: Vec<Vec<u32>>) -> u32 {
+    match vec {
+        [[], ..] => 1,
+        [[0, ..], [1, ..]] => 2,
         _ => 1000,
     }
 }

@@ -24,12 +24,8 @@ impl<'tcx, OP> TypeVisitor<TyCtxt<'tcx>> for FreeRegionsVisitor<'tcx, OP>
 where
     OP: FnMut(ty::Region<'tcx>),
 {
-    fn visit_binder<T: TypeVisitable<TyCtxt<'tcx>>>(&mut self, t: &ty::Binder<'tcx, T>) {
-        t.super_visit_with(self);
-    }
-
     fn visit_region(&mut self, r: ty::Region<'tcx>) {
-        match *r {
+        match r.kind() {
             // ignore bound regions, keep visiting
             ty::ReBound(_, _) => {}
             _ => (self.op)(r),
@@ -48,7 +44,7 @@ where
             return ty.super_visit_with(self);
         }
 
-        match ty.kind() {
+        match *ty.kind() {
             // We can prove that an alias is live two ways:
             // 1. All the components are live.
             //
@@ -59,11 +55,11 @@ where
             // either `'static` or a unique outlives region, and if one is
             // found, we just need to prove that that region is still live.
             // If one is not found, then we continue to walk through the alias.
-            ty::Alias(kind, ty::AliasTy { def_id, args, .. }) => {
+            ty::Alias(ty::AliasTy { kind, args, .. }) => {
                 let tcx = self.tcx;
                 let param_env = self.param_env;
                 let outlives_bounds: Vec<_> = tcx
-                    .item_bounds(def_id)
+                    .item_bounds(kind.def_id())
                     .iter_instantiated(tcx, args)
                     .chain(param_env.caller_bounds())
                     .filter_map(|clause| {
@@ -95,11 +91,9 @@ where
                     assert!(r.type_flags().intersects(ty::TypeFlags::HAS_FREE_REGIONS));
                     r.visit_with(self);
                 } else {
-                    // Skip lifetime parameters that are not captures.
-                    let variances = match kind {
-                        ty::Opaque => Some(self.tcx.variances_of(*def_id)),
-                        _ => None,
-                    };
+                    // Skip lifetime parameters that are not captured, since they do
+                    // not need to be live.
+                    let variances = tcx.opt_alias_variances(kind, kind.def_id());
 
                     for (idx, s) in args.iter().enumerate() {
                         if variances.map(|variances| variances[idx]) != Some(ty::Bivariant) {

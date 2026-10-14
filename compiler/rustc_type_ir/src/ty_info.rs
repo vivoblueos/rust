@@ -6,6 +6,7 @@ use std::ops::Deref;
 use rustc_data_structures::fingerprint::Fingerprint;
 #[cfg(feature = "nightly")]
 use rustc_data_structures::stable_hasher::{HashStable, StableHasher};
+use rustc_type_ir_macros::GenericTypeVisitable;
 
 use crate::{DebruijnIndex, TypeFlags};
 
@@ -16,7 +17,7 @@ use crate::{DebruijnIndex, TypeFlags};
 /// StableHash::ZERO for the hash, in which case the hash gets computed each time.
 /// This is useful if you have values that you intern but never (can?) use for stable
 /// hashing.
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, GenericTypeVisitable)]
 pub struct WithCachedTypeInfo<T> {
     pub internee: T,
 
@@ -96,8 +97,8 @@ impl<T: Hash> Hash for WithCachedTypeInfo<T> {
 }
 
 #[cfg(feature = "nightly")]
-impl<T: HashStable<CTX>, CTX> HashStable<CTX> for WithCachedTypeInfo<T> {
-    fn hash_stable(&self, hcx: &mut CTX, hasher: &mut StableHasher) {
+impl<T: HashStable<Hcx>, Hcx> HashStable<Hcx> for WithCachedTypeInfo<T> {
+    fn hash_stable(&self, hcx: &mut Hcx, hasher: &mut StableHasher) {
         if self.stable_hash == Fingerprint::ZERO || cfg!(debug_assertions) {
             // No cached hash available. This can only mean that incremental is disabled.
             // We don't cache stable hashes in non-incremental mode, because they are used

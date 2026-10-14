@@ -1,5 +1,7 @@
-use rustc_abi::ExternAbi;
+use rustc_abi::CanonAbi;
+use rustc_middle::ty::Ty;
 use rustc_span::Symbol;
+use rustc_target::callconv::FnAbi;
 
 use super::{conditional_dot_product, mpsadbw, packusdw, round_all, round_first, test_bits_masked};
 use crate::*;
@@ -9,7 +11,7 @@ pub(super) trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
     fn emulate_x86_sse41_intrinsic(
         &mut self,
         link_name: Symbol,
-        abi: ExternAbi,
+        abi: &FnAbi<'tcx, Ty<'tcx>>,
         args: &[OpTy<'tcx>],
         dest: &MPlaceTy<'tcx>,
     ) -> InterpResult<'tcx, EmulateItemResult> {
@@ -27,7 +29,7 @@ pub(super) trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
             // `i` is zeroed.
             "insertps" => {
                 let [left, right, imm] =
-                    this.check_shim(abi, ExternAbi::C { unwind: false }, link_name, args)?;
+                    this.check_shim_sig_lenient(abi, CanonAbi::C, link_name, args)?;
 
                 let (left, left_len) = this.project_to_simd(left)?;
                 let (right, right_len) = this.project_to_simd(right)?;
@@ -63,7 +65,7 @@ pub(super) trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
             // the result to a 16-bit unsigned integer vector with saturation.
             "packusdw" => {
                 let [left, right] =
-                    this.check_shim(abi, ExternAbi::C { unwind: false }, link_name, args)?;
+                    this.check_shim_sig_lenient(abi, CanonAbi::C, link_name, args)?;
 
                 packusdw(this, left, right, dest)?;
             }
@@ -74,7 +76,7 @@ pub(super) trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
             // 4 bits of `imm`.
             "dpps" | "dppd" => {
                 let [left, right, imm] =
-                    this.check_shim(abi, ExternAbi::C { unwind: false }, link_name, args)?;
+                    this.check_shim_sig_lenient(abi, CanonAbi::C, link_name, args)?;
 
                 conditional_dot_product(this, left, right, imm, dest)?;
             }
@@ -83,7 +85,7 @@ pub(super) trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
             // and copies the remaining elements from `left`.
             "round.ss" => {
                 let [left, right, rounding] =
-                    this.check_shim(abi, ExternAbi::C { unwind: false }, link_name, args)?;
+                    this.check_shim_sig_lenient(abi, CanonAbi::C, link_name, args)?;
 
                 round_first::<rustc_apfloat::ieee::Single>(this, left, right, rounding, dest)?;
             }
@@ -91,7 +93,7 @@ pub(super) trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
             // functions. Rounds the elements of `op` according to `rounding`.
             "round.ps" => {
                 let [op, rounding] =
-                    this.check_shim(abi, ExternAbi::C { unwind: false }, link_name, args)?;
+                    this.check_shim_sig_lenient(abi, CanonAbi::C, link_name, args)?;
 
                 round_all::<rustc_apfloat::ieee::Single>(this, op, rounding, dest)?;
             }
@@ -100,7 +102,7 @@ pub(super) trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
             // and copies the remaining elements from `left`.
             "round.sd" => {
                 let [left, right, rounding] =
-                    this.check_shim(abi, ExternAbi::C { unwind: false }, link_name, args)?;
+                    this.check_shim_sig_lenient(abi, CanonAbi::C, link_name, args)?;
 
                 round_first::<rustc_apfloat::ieee::Double>(this, left, right, rounding, dest)?;
             }
@@ -108,15 +110,15 @@ pub(super) trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
             // functions. Rounds the elements of `op` according to `rounding`.
             "round.pd" => {
                 let [op, rounding] =
-                    this.check_shim(abi, ExternAbi::C { unwind: false }, link_name, args)?;
+                    this.check_shim_sig_lenient(abi, CanonAbi::C, link_name, args)?;
 
                 round_all::<rustc_apfloat::ieee::Double>(this, op, rounding, dest)?;
             }
             // Used to implement the _mm_minpos_epu16 function.
-            // Find the minimum unsinged 16-bit integer in `op` and
+            // Find the minimum unsigned 16-bit integer in `op` and
             // returns its value and position.
             "phminposuw" => {
-                let [op] = this.check_shim(abi, ExternAbi::C { unwind: false }, link_name, args)?;
+                let [op] = this.check_shim_sig_lenient(abi, CanonAbi::C, link_name, args)?;
 
                 let (op, op_len) = this.project_to_simd(op)?;
                 let (dest, dest_len) = this.project_to_simd(dest)?;
@@ -151,25 +153,17 @@ pub(super) trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
             // https://www.intel.com/content/www/us/en/docs/intrinsics-guide/index.html#text=_mm_mpsadbw_epu8
             "mpsadbw" => {
                 let [left, right, imm] =
-                    this.check_shim(abi, ExternAbi::C { unwind: false }, link_name, args)?;
+                    this.check_shim_sig_lenient(abi, CanonAbi::C, link_name, args)?;
 
                 mpsadbw(this, left, right, imm, dest)?;
             }
-            // Used to implement the _mm_testz_si128, _mm_testc_si128
-            // and _mm_testnzc_si128 functions.
-            // Tests `(op & mask) == 0`, `(op & mask) == mask` or
-            // `(op & mask) != 0 && (op & mask) != mask`
-            "ptestz" | "ptestc" | "ptestnzc" => {
-                let [op, mask] =
-                    this.check_shim(abi, ExternAbi::C { unwind: false }, link_name, args)?;
+            // Used to implement the _mm_testnzc_si128 function.
+            // Tests `(op & mask) != 0 && (op & mask) != mask`
+            "ptestnzc" => {
+                let [op, mask] = this.check_shim_sig_lenient(abi, CanonAbi::C, link_name, args)?;
 
                 let (all_zero, masked_set) = test_bits_masked(this, op, mask)?;
-                let res = match unprefixed_name {
-                    "ptestz" => all_zero,
-                    "ptestc" => masked_set,
-                    "ptestnzc" => !all_zero && !masked_set,
-                    _ => unreachable!(),
-                };
+                let res = !all_zero && !masked_set;
 
                 this.write_scalar(Scalar::from_i32(res.into()), dest)?;
             }

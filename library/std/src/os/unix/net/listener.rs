@@ -1,9 +1,8 @@
 use super::{SocketAddr, UnixStream, sockaddr_un};
 use crate::os::unix::io::{AsFd, AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use crate::path::Path;
-use crate::sys::cvt;
 use crate::sys::net::Socket;
-use crate::sys_common::{AsInner, FromInner, IntoInner};
+use crate::sys::{AsInner, FromInner, IntoInner, cvt};
 use crate::{fmt, io, mem};
 
 /// A structure representing a Unix domain socket server.
@@ -71,7 +70,7 @@ impl UnixListener {
     #[stable(feature = "unix_socket", since = "1.10.0")]
     pub fn bind<P: AsRef<Path>>(path: P) -> io::Result<UnixListener> {
         unsafe {
-            let inner = Socket::new_raw(libc::AF_UNIX, libc::SOCK_STREAM)?;
+            let inner = Socket::new(libc::AF_UNIX, libc::SOCK_STREAM)?;
             let (addr, len) = sockaddr_un(path.as_ref())?;
             #[cfg(any(
                 target_os = "windows",
@@ -136,7 +135,7 @@ impl UnixListener {
     #[stable(feature = "unix_socket_abstract", since = "1.70.0")]
     pub fn bind_addr(socket_addr: &SocketAddr) -> io::Result<UnixListener> {
         unsafe {
-            let inner = Socket::new_raw(libc::AF_UNIX, libc::SOCK_STREAM)?;
+            let inner = Socket::new(libc::AF_UNIX, libc::SOCK_STREAM)?;
             #[cfg(target_os = "linux")]
             const backlog: core::ffi::c_int = -1;
             #[cfg(not(target_os = "linux"))]
@@ -177,7 +176,7 @@ impl UnixListener {
     #[stable(feature = "unix_socket", since = "1.10.0")]
     pub fn accept(&self) -> io::Result<(UnixStream, SocketAddr)> {
         let mut storage: libc::sockaddr_un = unsafe { mem::zeroed() };
-        let mut len = mem::size_of_val(&storage) as libc::socklen_t;
+        let mut len = size_of_val(&storage) as libc::socklen_t;
         let sock = self.0.accept((&raw mut storage) as *mut _, &mut len)?;
         let addr = SocketAddr::from_parts(storage, len)?;
         Ok((UnixStream(sock), addr))

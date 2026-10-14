@@ -7,12 +7,13 @@
 //@ revisions:rpass1 rpass2 rpass3
 //@ no-prefer-dynamic
 //@ compile-flags: -Z query-dep-graph
+//@ ignore-backends: gcc
 
 #![feature(rustc_attrs)]
 
 extern crate a;
 
-#[rustc_clean(except="typeck,optimized_mir", cfg="rpass2")]
+#[rustc_clean(except="typeck_root,optimized_mir", cfg="rpass2")]
 #[rustc_clean(cfg="rpass3")]
 pub fn use_X() -> u32 {
     let x: a::X = 22;

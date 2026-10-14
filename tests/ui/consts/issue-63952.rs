@@ -1,6 +1,6 @@
 // Regression test for #63952, shouldn't hang.
 //@ stderr-per-bitwidth
-
+//@ ignore-parallel-frontend different alloc ids
 #[repr(C)]
 #[derive(Copy, Clone)]
 struct SliceRepr {
@@ -14,7 +14,7 @@ union SliceTransmute {
 }
 
 // bad slice: length too big to even exist anywhere
-const SLICE_WAY_TOO_LONG: &[u8] = unsafe { //~ ERROR: it is undefined behavior to use this value
+const SLICE_WAY_TOO_LONG: &[u8] = unsafe { //~ ERROR: slice is bigger than largest supported object
     SliceTransmute {
         repr: SliceRepr {
             ptr: &42,

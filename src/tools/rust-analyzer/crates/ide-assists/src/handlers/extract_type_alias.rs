@@ -1,11 +1,15 @@
 use either::Either;
+use hir::HirDisplay;
 use ide_db::syntax_helpers::node_ext::walk_ty;
 use syntax::{
-    ast::{self, edit::IndentLevel, make, AstNode, HasGenericArgs, HasGenericParams, HasName},
+    ast::{
+        self, AstNode, HasGenericArgs, HasGenericParams, HasName, edit::IndentLevel,
+        syntax_factory::SyntaxFactory,
+    },
     syntax_editor,
 };
 
-use crate::{AssistContext, AssistId, AssistKind, Assists};
+use crate::{AssistContext, AssistId, Assists};
 
 // Assist: extract_type_alias
 //
@@ -39,12 +43,23 @@ pub(crate) fn extract_type_alias(acc: &mut Assists, ctx: &AssistContext<'_>) -> 
     );
     let target = ty.syntax().text_range();
 
+    let resolved_ty = ctx.sema.resolve_type(&ty)?;
+    let resolved_ty = if !resolved_ty.contains_unknown() {
+        let module = ctx.sema.scope(ty.syntax())?.module();
+        resolved_ty.display_source_code(ctx.db(), module.into(), false).ok()?
+    } else {
+        ty.to_string()
+    };
+
     acc.add(
-        AssistId("extract_type_alias", AssistKind::RefactorExtract),
+        AssistId::refactor_extract("extract_type_alias"),
         "Extract type as type alias",
         target,
         |builder| {
             let mut edit = builder.make_editor(node);
+            let make = SyntaxFactory::without_mappings();
+
+            let resolved_ty = make.ty(&resolved_ty);
 
             let mut known_generics = match item.generic_param_list() {
                 Some(it) => it.generic_params().collect(),
@@ -58,24 +73,25 @@ pub(crate) fn extract_type_alias(acc: &mut Assists, ctx: &AssistContext<'_>) -> 
             }
             let generics = collect_used_generics(&ty, &known_generics);
             let generic_params =
-                generics.map(|it| make::generic_param_list(it.into_iter().cloned()));
+                generics.map(|it| make.generic_param_list(it.into_iter().cloned()));
 
             // Replace original type with the alias
-            let ty_args = generic_params
-                .as_ref()
-                .map_or(String::new(), |it| it.to_generic_args().to_string());
-            // FIXME: replace with a `ast::make` constructor
-            let new_ty = make::ty(&format!("Type{ty_args}")).clone_for_update();
+            let ty_args = generic_params.as_ref().map(|it| it.to_generic_args().generic_args());
+            let new_ty = if let Some(ty_args) = ty_args {
+                make.generic_ty_path_segment(make.name_ref("Type"), ty_args)
+            } else {
+                make.path_segment(make.name_ref("Type"))
+            };
             edit.replace(ty.syntax(), new_ty.syntax());
 
             // Insert new alias
-            let ty_alias = make::ty_alias("Type", generic_params, None, None, Some((ty, None)))
-                .clone_for_update();
+            let ty_alias =
+                make.ty_alias(None, "Type", generic_params, None, None, Some((resolved_ty, None)));
 
-            if let Some(cap) = ctx.config.snippet_cap {
-                if let Some(name) = ty_alias.name() {
-                    edit.add_annotation(name.syntax(), builder.make_tabstop_before(cap));
-                }
+            if let Some(cap) = ctx.config.snippet_cap
+                && let Some(name) = ty_alias.name()
+            {
+                edit.add_annotation(name.syntax(), builder.make_tabstop_before(cap));
             }
 
             let indent = IndentLevel::from_node(node);
@@ -83,11 +99,11 @@ pub(crate) fn extract_type_alias(acc: &mut Assists, ctx: &AssistContext<'_>) -> 
                 syntax_editor::Position::before(node),
                 vec![
                     ty_alias.syntax().clone().into(),
-                    make::tokens::whitespace(&format!("\n\n{indent}")).into(),
+                    make.whitespace(&format!("\n\n{indent}")).into(),
                 ],
             );
 
-            builder.add_file_edits(ctx.file_id(), edit);
+            builder.add_file_edits(ctx.vfs_file_id(), edit);
         },
     )
 }
@@ -100,7 +116,7 @@ fn collect_used_generics<'gp>(
     fn find_lifetime(text: &str) -> impl Fn(&&ast::GenericParam) -> bool + '_ {
         move |gp: &&ast::GenericParam| match gp {
             ast::GenericParam::LifetimeParam(lp) => {
-                lp.lifetime().map_or(false, |lt| lt.text() == text)
+                lp.lifetime().is_some_and(|lt| lt.text() == text)
             }
             _ => false,
         }
@@ -111,17 +127,17 @@ fn collect_used_generics<'gp>(
         match ty {
             ast::Type::PathType(ty) => {
                 if let Some(path) = ty.path() {
-                    if let Some(name_ref) = path.as_single_name_ref() {
-                        if let Some(param) = known_generics.iter().find(|gp| {
+                    if let Some(name_ref) = path.as_single_name_ref()
+                        && let Some(param) = known_generics.iter().find(|gp| {
                             match gp {
                                 ast::GenericParam::ConstParam(cp) => cp.name(),
                                 ast::GenericParam::TypeParam(tp) => tp.name(),
                                 _ => None,
                             }
-                            .map_or(false, |n| n.text() == name_ref.text())
-                        }) {
-                            generics.push(param);
-                        }
+                            .is_some_and(|n| n.text() == name_ref.text())
+                        })
+                    {
+                        generics.push(param);
                     }
                     generics.extend(
                         path.segments()
@@ -160,20 +176,18 @@ fn collect_used_generics<'gp>(
                     .and_then(|lt| known_generics.iter().find(find_lifetime(&lt.text()))),
             ),
             ast::Type::ArrayType(ar) => {
-                if let Some(ast::Expr::PathExpr(p)) = ar.const_arg().and_then(|x| x.expr()) {
-                    if let Some(path) = p.path() {
-                        if let Some(name_ref) = path.as_single_name_ref() {
-                            if let Some(param) = known_generics.iter().find(|gp| {
-                                if let ast::GenericParam::ConstParam(cp) = gp {
-                                    cp.name().map_or(false, |n| n.text() == name_ref.text())
-                                } else {
-                                    false
-                                }
-                            }) {
-                                generics.push(param);
-                            }
+                if let Some(ast::Expr::PathExpr(p)) = ar.const_arg().and_then(|x| x.expr())
+                    && let Some(path) = p.path()
+                    && let Some(name_ref) = path.as_single_name_ref()
+                    && let Some(param) = known_generics.iter().find(|gp| {
+                        if let ast::GenericParam::ConstParam(cp) = gp {
+                            cp.name().is_some_and(|n| n.text() == name_ref.text())
+                        } else {
+                            false
                         }
-                    }
+                    })
+                {
+                    generics.push(param);
                 }
             }
             _ => (),
@@ -389,5 +403,51 @@ where
 }
             "#,
         );
+    }
+
+    #[test]
+    fn inferred_generic_type_parameter() {
+        check_assist(
+            extract_type_alias,
+            r#"
+struct Wrap<T>(T);
+
+fn main() {
+    let wrap: $0Wrap<_>$0 = Wrap::<_>(3i32);
+}
+            "#,
+            r#"
+struct Wrap<T>(T);
+
+type $0Type = Wrap<i32>;
+
+fn main() {
+    let wrap: Type = Wrap::<_>(3i32);
+}
+            "#,
+        )
+    }
+
+    #[test]
+    fn inferred_type() {
+        check_assist(
+            extract_type_alias,
+            r#"
+struct Wrap<T>(T);
+
+fn main() {
+    let wrap: Wrap<$0_$0> = Wrap::<_>(3i32);
+}
+            "#,
+            r#"
+struct Wrap<T>(T);
+
+type $0Type = i32;
+
+fn main() {
+    let wrap: Wrap<Type> = Wrap::<_>(3i32);
+}
+            "#,
+        )
     }
 }

@@ -32,6 +32,9 @@ pub(super) const ITEM_RECOVERY_SET: TokenSet = TokenSet::new(&[
     T![impl],
     T![trait],
     T![const],
+    T![async],
+    T![unsafe],
+    T![extern],
     T![static],
     T![let],
     T![mod],
@@ -72,8 +75,19 @@ pub(super) fn item_or_macro(p: &mut Parser<'_>, stop_on_r_curly: bool, is_in_ext
     // macro_rules! ()
     // macro_rules! []
     if paths::is_use_path_start(p) {
-        macro_call(p, m);
-        return;
+        paths::use_path(p);
+        // Do not create a MACRO_CALL node here if this isn't a macro call, this causes problems with completion.
+
+        // test_err path_item_without_excl
+        // foo
+        if p.at(T![!]) {
+            macro_call(p, m);
+            return;
+        } else {
+            m.complete(p, ERROR);
+            p.error("expected an item");
+            return;
+        }
     }
 
     m.abandon(p);
@@ -121,7 +135,7 @@ pub(super) fn opt_item(p: &mut Parser<'_>, m: Marker, is_in_extern: bool) -> Res
         has_mods = true;
     }
 
-    // test_err gen_fn
+    // test_err gen_fn 2021
     // gen fn gen_fn() {}
     // async gen fn async_gen_fn() {}
     if p.at(T![gen]) && p.nth(1) == T![fn] {
@@ -247,6 +261,19 @@ fn opt_item_without_modifiers(p: &mut Parser<'_>, m: Marker) -> Result<(), Marke
         T![const] if (la == IDENT || la == T![_] || la == T![mut]) => consts::konst(p, m),
         T![static] if (la == IDENT || la == T![_] || la == T![mut]) => consts::static_(p, m),
 
+        IDENT
+            if p.at_contextual_kw(T![builtin])
+                && p.nth_at(1, T![#])
+                && p.nth_at_contextual_kw(2, T![global_asm]) =>
+        {
+            p.bump_remap(T![builtin]);
+            p.bump(T![#]);
+            p.bump_remap(T![global_asm]);
+            // test global_asm
+            // builtin#global_asm("")
+            expressions::parse_asm_expr(p, m);
+        }
+
         _ => return Err(m),
     };
     Ok(())
@@ -254,22 +281,16 @@ fn opt_item_without_modifiers(p: &mut Parser<'_>, m: Marker) -> Result<(), Marke
 
 // test extern_crate
 // extern crate foo;
+// extern crate self;
 fn extern_crate(p: &mut Parser<'_>, m: Marker) {
     p.bump(T![extern]);
     p.bump(T![crate]);
 
-    if p.at(T![self]) {
-        // test extern_crate_self
-        // extern crate self;
-        let m = p.start();
-        p.bump(T![self]);
-        m.complete(p, NAME_REF);
-    } else {
-        name_ref(p);
-    }
+    name_ref_or_self(p);
 
     // test extern_crate_rename
     // extern crate foo as bar;
+    // extern crate self as bar;
     opt_rename(p);
     p.expect(T![;]);
     m.complete(p, EXTERN_CRATE);
@@ -401,7 +422,20 @@ fn fn_(p: &mut Parser<'_>, m: Marker) {
     // test function_ret_type
     // fn foo() {}
     // fn bar() -> () {}
-    opt_ret_type(p);
+    if !opt_ret_type(p) {
+        // test_err function_ret_type_missing_arrow
+        // fn foo() usize {}
+        // fn bar() super::Foo {}
+        opt_no_arrow_ret_type(p);
+    }
+
+    // test_err fn_ret_recovery
+    // fn foo() -> A>]) { let x = 1; }
+    // fn foo() -> A>]) where T: Copy { let x = 1; }
+    while p.at(T![')']) | p.at(T![']']) | p.at(T![>]) {
+        // recover from unbalanced return type brackets
+        p.err_and_bump("expected a curly brace");
+    }
 
     // test function_where_clause
     // fn foo<T>() where T: Copy {}
@@ -416,8 +450,7 @@ fn fn_(p: &mut Parser<'_>, m: Marker) {
 }
 
 fn macro_call(p: &mut Parser<'_>, m: Marker) {
-    assert!(paths::is_use_path_start(p));
-    paths::use_path(p);
+    assert!(p.at(T![!]));
     match macro_call_after_excl(p) {
         BlockLike::Block => (),
         BlockLike::NotBlock => {

@@ -1,18 +1,19 @@
+use rustc_ast as ast;
 use rustc_errors::Applicability;
+use rustc_hir as hir;
 use rustc_hir_analysis::autoderef::Autoderef;
 use rustc_infer::infer::InferOk;
+use rustc_infer::traits::{Obligation, ObligationCauseCode};
 use rustc_middle::span_bug;
 use rustc_middle::ty::adjustment::{
-    Adjust, Adjustment, AllowTwoPhase, AutoBorrow, AutoBorrowMutability, OverloadedDeref,
-    PointerCoercion,
+    Adjust, Adjustment, AllowTwoPhase, AutoBorrow, AutoBorrowMutability, DerefAdjustKind,
+    OverloadedDeref, PointerCoercion,
 };
 use rustc_middle::ty::{self, Ty};
-use rustc_span::Span;
-use rustc_span::symbol::{Ident, sym};
+use rustc_span::{Span, sym};
 use tracing::debug;
-use {rustc_ast as ast, rustc_hir as hir};
 
-use crate::method::MethodCallee;
+use crate::method::{MethodCallee, TreatNotYetDefinedOpaques};
 use crate::{FnCtxt, PlaceOp};
 
 impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
@@ -30,10 +31,13 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         let ok = self.try_overloaded_deref(expr.span, oprnd_ty)?;
         let method = self.register_infer_ok_obligations(ok);
         if let ty::Ref(_, _, hir::Mutability::Not) = method.sig.inputs()[0].kind() {
-            self.apply_adjustments(oprnd_expr, vec![Adjustment {
-                kind: Adjust::Borrow(AutoBorrow::Ref(AutoBorrowMutability::Not)),
-                target: method.sig.inputs()[0],
-            }]);
+            self.apply_adjustments(
+                oprnd_expr,
+                vec![Adjustment {
+                    kind: Adjust::Borrow(AutoBorrow::Ref(AutoBorrowMutability::Not)),
+                    target: method.sig.inputs()[0],
+                }],
+            );
         } else {
             span_bug!(expr.span, "input to deref is not a ref?");
         }
@@ -106,8 +110,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         index_ty: Ty<'tcx>,
         index_expr: &hir::Expr<'_>,
     ) -> Option<(/*index type*/ Ty<'tcx>, /*element type*/ Ty<'tcx>)> {
-        let adjusted_ty =
-            self.structurally_resolve_type(autoderef.span(), autoderef.final_ty(false));
+        let adjusted_ty = self.structurally_resolve_type(autoderef.span(), autoderef.final_ty());
         debug!(
             "try_index_step(expr={:?}, base_expr={:?}, adjusted_ty={:?}, \
              index_ty={:?})",
@@ -137,8 +140,14 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             let mut self_ty = adjusted_ty;
             if unsize {
                 // We only unsize arrays here.
-                if let ty::Array(element_ty, _) = adjusted_ty.kind() {
-                    self_ty = Ty::new_slice(self.tcx, *element_ty);
+                if let ty::Array(element_ty, ct) = *adjusted_ty.kind() {
+                    self.register_predicate(Obligation::new(
+                        self.tcx,
+                        self.cause(base_expr.span, ObligationCauseCode::ArrayLen(adjusted_ty)),
+                        self.param_env,
+                        ty::ClauseKind::ConstArgHasType(ct, self.tcx.types.usize),
+                    ));
+                    self_ty = Ty::new_slice(self.tcx, element_ty);
                 } else {
                     continue;
                 }
@@ -202,12 +211,16 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             return None;
         };
 
-        self.lookup_method_in_trait(
+        // FIXME(trait-system-refactor-initiative#231): we may want to treat
+        // opaque types as rigid here to support `impl Deref<Target = impl Index<usize>>`.
+        let treat_opaques = TreatNotYetDefinedOpaques::AsInfer;
+        self.lookup_method_for_operator(
             self.misc(span),
-            Ident::with_dummy_span(imm_op),
+            imm_op,
             imm_tr,
             base_ty,
             opt_rhs_ty,
+            treat_opaques,
         )
     }
 
@@ -228,12 +241,18 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             return None;
         };
 
-        self.lookup_method_in_trait(
+        // We have to replace the operator with the mutable variant for the
+        // program to compile, so we don't really have a choice here and want
+        // to just try using `DerefMut` even if its not in the item bounds
+        // of the opaque.
+        let treat_opaques = TreatNotYetDefinedOpaques::AsInfer;
+        self.lookup_method_for_operator(
             self.misc(span),
-            Ident::with_dummy_span(mut_op),
+            mut_op,
             mut_tr,
             base_ty,
             opt_rhs_ty,
+            treat_opaques,
         )
     }
 
@@ -280,7 +299,8 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 self.typeck_results.borrow_mut().adjustments_mut().remove(expr.hir_id);
             if let Some(mut adjustments) = previous_adjustments {
                 for adjustment in &mut adjustments {
-                    if let Adjust::Deref(Some(ref mut deref)) = adjustment.kind
+                    if let Adjust::Deref(DerefAdjustKind::Overloaded(ref mut deref)) =
+                        adjustment.kind
                         && let Some(ok) = self.try_mutable_overloaded_place_op(
                             expr.span,
                             source,
@@ -296,7 +316,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                             );
                         };
                         *deref = OverloadedDeref { mutbl, span: deref.span };
-                        self.enforce_context_effects(expr.span, method.def_id, method.args);
+                        self.enforce_context_effects(None, expr.span, method.def_id, method.args);
                         // If this is a union field, also throw an error for `DerefMut` of `ManuallyDrop` (see RFC 2514).
                         // This helps avoid accidental drops.
                         if inside_union

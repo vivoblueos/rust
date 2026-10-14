@@ -96,7 +96,7 @@ impl<W: Write> BufWriter<W> {
 
     pub(crate) fn try_new_buffer() -> io::Result<Vec<u8>> {
         Vec::try_with_capacity(DEFAULT_BUF_SIZE).map_err(|_| {
-            io::const_io_error!(ErrorKind::OutOfMemory, "failed to allocate write buffer")
+            io::const_error!(ErrorKind::OutOfMemory, "failed to allocate write buffer")
         })
     }
 
@@ -238,7 +238,7 @@ impl<W: ?Sized + Write> BufWriter<W> {
 
             match r {
                 Ok(0) => {
-                    return Err(io::const_io_error!(
+                    return Err(io::const_error!(
                         ErrorKind::WriteZero,
                         "failed to write the buffered data",
                     ));
@@ -492,23 +492,15 @@ impl WriterPanicked {
     pub fn into_inner(self) -> Vec<u8> {
         self.buf
     }
-
-    const DESCRIPTION: &'static str =
-        "BufWriter inner writer panicked, what data remains unwritten is not known";
 }
 
 #[stable(feature = "bufwriter_into_parts", since = "1.56.0")]
-impl error::Error for WriterPanicked {
-    #[allow(deprecated, deprecated_in_future)]
-    fn description(&self) -> &str {
-        Self::DESCRIPTION
-    }
-}
+impl error::Error for WriterPanicked {}
 
 #[stable(feature = "bufwriter_into_parts", since = "1.56.0")]
 impl fmt::Display for WriterPanicked {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", Self::DESCRIPTION)
+        "BufWriter inner writer panicked, what data remains unwritten is not known".fmt(f)
     }
 }
 

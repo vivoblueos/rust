@@ -1,38 +1,18 @@
-use clippy_config::msrvs::Msrv;
-use clippy_config::{Conf, msrvs};
-use clippy_utils::consts::{ConstEvalCtxt, Constant};
+use clippy_config::Conf;
+use clippy_utils::consts::ConstEvalCtxt;
 use clippy_utils::diagnostics::span_lint_and_then;
+use clippy_utils::is_from_proc_macro;
+use clippy_utils::msrvs::{self, Msrv};
+use clippy_utils::res::MaybeResPath;
 use clippy_utils::source::SpanRangeExt;
-use clippy_utils::{is_from_proc_macro, path_to_local};
 use rustc_errors::Applicability;
+use rustc_hir::def::DefKind;
+use rustc_hir::def_id::DefId;
 use rustc_hir::{BinOpKind, Constness, Expr, ExprKind};
 use rustc_lint::{LateContext, LateLintPass, Lint, LintContext};
-use rustc_middle::lint::in_external_macro;
+use rustc_middle::ty::TyCtxt;
 use rustc_session::impl_lint_pass;
 
-declare_clippy_lint! {
-    /// ### What it does
-    /// Checks for manual `is_infinite` reimplementations
-    /// (i.e., `x == <float>::INFINITY || x == <float>::NEG_INFINITY`).
-    ///
-    /// ### Why is this bad?
-    /// The method `is_infinite` is shorter and more readable.
-    ///
-    /// ### Example
-    /// ```no_run
-    /// # let x = 1.0f32;
-    /// if x == f32::INFINITY || x == f32::NEG_INFINITY {}
-    /// ```
-    /// Use instead:
-    /// ```no_run
-    /// # let x = 1.0f32;
-    /// if x.is_infinite() {}
-    /// ```
-    #[clippy::version = "1.73.0"]
-    pub MANUAL_IS_INFINITE,
-    style,
-    "use dedicated method to check if a float is infinite"
-}
 declare_clippy_lint! {
     /// ### What it does
     /// Checks for manual `is_finite` reimplementations
@@ -58,7 +38,32 @@ declare_clippy_lint! {
     style,
     "use dedicated method to check if a float is finite"
 }
-impl_lint_pass!(ManualFloatMethods => [MANUAL_IS_INFINITE, MANUAL_IS_FINITE]);
+
+declare_clippy_lint! {
+    /// ### What it does
+    /// Checks for manual `is_infinite` reimplementations
+    /// (i.e., `x == <float>::INFINITY || x == <float>::NEG_INFINITY`).
+    ///
+    /// ### Why is this bad?
+    /// The method `is_infinite` is shorter and more readable.
+    ///
+    /// ### Example
+    /// ```no_run
+    /// # let x = 1.0f32;
+    /// if x == f32::INFINITY || x == f32::NEG_INFINITY {}
+    /// ```
+    /// Use instead:
+    /// ```no_run
+    /// # let x = 1.0f32;
+    /// if x.is_infinite() {}
+    /// ```
+    #[clippy::version = "1.73.0"]
+    pub MANUAL_IS_INFINITE,
+    style,
+    "use dedicated method to check if a float is infinite"
+}
+
+impl_lint_pass!(ManualFloatMethods => [MANUAL_IS_FINITE, MANUAL_IS_INFINITE]);
 
 #[derive(Clone, Copy)]
 enum Variant {
@@ -88,9 +93,43 @@ pub struct ManualFloatMethods {
 
 impl ManualFloatMethods {
     pub fn new(conf: &'static Conf) -> Self {
-        Self {
-            msrv: conf.msrv.clone(),
-        }
+        Self { msrv: conf.msrv }
+    }
+}
+
+fn is_not_const(tcx: TyCtxt<'_>, def_id: DefId) -> bool {
+    match tcx.def_kind(def_id) {
+        DefKind::Mod
+        | DefKind::Struct
+        | DefKind::Union
+        | DefKind::Enum
+        | DefKind::Variant
+        | DefKind::Trait
+        | DefKind::TyAlias
+        | DefKind::ForeignTy
+        | DefKind::TraitAlias
+        | DefKind::AssocTy
+        | DefKind::Macro(..)
+        | DefKind::Field
+        | DefKind::LifetimeParam
+        | DefKind::ExternCrate
+        | DefKind::Use
+        | DefKind::ForeignMod
+        | DefKind::GlobalAsm
+        | DefKind::Impl { .. }
+        | DefKind::OpaqueTy
+        | DefKind::SyntheticCoroutineBody
+        | DefKind::TyParam => true,
+
+        DefKind::AnonConst
+        | DefKind::InlineConst
+        | DefKind::Const { .. }
+        | DefKind::ConstParam
+        | DefKind::Static { .. }
+        | DefKind::Ctor(..)
+        | DefKind::AssocConst { .. } => false,
+
+        DefKind::Fn | DefKind::AssocFn | DefKind::Closure => tcx.constness(def_id) == Constness::NotConst,
     }
 }
 
@@ -102,21 +141,22 @@ impl<'tcx> LateLintPass<'tcx> for ManualFloatMethods {
             // Checking all possible scenarios using a function would be a hopeless task, as we have
             // 16 possible alignments of constants/operands. For now, let's use `partition`.
             && let mut exprs = [lhs_lhs, lhs_rhs, rhs_lhs, rhs_rhs]
-            && exprs.iter_mut().partition_in_place(|i| path_to_local(i).is_some()) == 2
-            && !in_external_macro(cx.sess(), expr.span)
+            && exprs.iter_mut().partition_in_place(|i| i.res_local_id().is_some()) == 2
+            && !expr.span.in_external_macro(cx.sess().source_map())
             && (
-                matches!(cx.tcx.constness(cx.tcx.hir().enclosing_body_owner(expr.hir_id)), Constness::NotConst)
-                    || self.msrv.meets(msrvs::CONST_FLOAT_CLASSIFY)
+                is_not_const(cx.tcx, cx.tcx.hir_enclosing_body_owner(expr.hir_id).into())
+                    || self.msrv.meets(cx, msrvs::CONST_FLOAT_CLASSIFY)
             )
             && let [first, second, const_1, const_2] = exprs
             && let ecx = ConstEvalCtxt::new(cx)
-            && let Some(const_1) = ecx.eval(const_1)
-            && let Some(const_2) = ecx.eval(const_2)
-            && path_to_local(first).is_some_and(|f| path_to_local(second).is_some_and(|s| f == s))
+            && let ctxt = expr.span.ctxt()
+            && let Some(const_1) = ecx.eval_local(const_1, ctxt)
+            && let Some(const_2) = ecx.eval_local(const_2, ctxt)
+            && first.res_local_id().is_some_and(|f| second.res_local_id().is_some_and(|s| f == s))
             // The actual infinity check, we also allow `NEG_INFINITY` before` INFINITY` just in
             // case somebody does that for some reason
-            && (is_infinity(&const_1) && is_neg_infinity(&const_2)
-                || is_neg_infinity(&const_1) && is_infinity(&const_2))
+            && (const_1.is_pos_infinity() && const_2.is_neg_infinity()
+                || const_1.is_neg_infinity() && const_2.is_pos_infinity())
             && let Some(local_snippet) = first.span.get_source_text(cx)
         {
             let variant = match (kind.node, lhs_kind.node, rhs_kind.node) {
@@ -163,25 +203,5 @@ impl<'tcx> LateLintPass<'tcx> for ManualFloatMethods {
                 }
             });
         }
-    }
-
-    extract_msrv_attr!(LateContext);
-}
-
-fn is_infinity(constant: &Constant<'_>) -> bool {
-    match constant {
-        // FIXME(f16_f128): add f16 and f128 when constants are available
-        Constant::F32(float) => *float == f32::INFINITY,
-        Constant::F64(float) => *float == f64::INFINITY,
-        _ => false,
-    }
-}
-
-fn is_neg_infinity(constant: &Constant<'_>) -> bool {
-    match constant {
-        // FIXME(f16_f128): add f16 and f128 when constants are available
-        Constant::F32(float) => *float == f32::NEG_INFINITY,
-        Constant::F64(float) => *float == f64::NEG_INFINITY,
-        _ => false,
     }
 }

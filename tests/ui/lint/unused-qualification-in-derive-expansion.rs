@@ -1,5 +1,6 @@
 //@ run-pass
-//@ aux-build:add-impl.rs
+//@ proc-macro: add-impl.rs
+//@ ignore-backends: gcc
 
 #![forbid(unused_qualifications)]
 

@@ -12,15 +12,16 @@
 //! bounds by special casing scenarios such as these. Fun!
 
 use rustc_data_structures::fx::FxIndexMap;
+use rustc_data_structures::thin_vec::ThinVec;
 use rustc_data_structures::unord::UnordSet;
 use rustc_hir::def_id::DefId;
-use thin_vec::ThinVec;
+use rustc_middle::ty::TyCtxt;
 
 use crate::clean;
 use crate::clean::{GenericArgs as PP, WherePredicate as WP};
 use crate::core::DocContext;
 
-pub(crate) fn where_clauses(cx: &DocContext<'_>, clauses: ThinVec<WP>) -> ThinVec<WP> {
+pub(crate) fn where_clauses(tcx: TyCtxt<'_>, clauses: ThinVec<WP>) -> ThinVec<WP> {
     // First, partition the where clause into its separate components.
     //
     // We use `FxIndexMap` so that the insertion order is preserved to prevent messing up to
@@ -46,11 +47,8 @@ pub(crate) fn where_clauses(cx: &DocContext<'_>, clauses: ThinVec<WP>) -> ThinVe
     // Look for equality predicates on associated types that can be merged into
     // general bound predicates.
     equalities.retain(|(lhs, rhs)| {
-        let Some((ty, trait_did, name)) = lhs.projection() else {
-            return true;
-        };
-        let Some((bounds, _)) = tybounds.get_mut(ty) else { return true };
-        merge_bounds(cx, bounds, trait_did, name, rhs)
+        let Some((bounds, _)) = tybounds.get_mut(&lhs.self_type) else { return true };
+        merge_bounds(tcx, bounds, lhs.trait_.as_ref().unwrap().def_id(), lhs.assoc.clone(), rhs)
     });
 
     // And finally, let's reassemble everything
@@ -68,7 +66,7 @@ pub(crate) fn where_clauses(cx: &DocContext<'_>, clauses: ThinVec<WP>) -> ThinVe
 }
 
 pub(crate) fn merge_bounds(
-    cx: &clean::DocContext<'_>,
+    tcx: TyCtxt<'_>,
     bounds: &mut [clean::GenericBound],
     trait_did: DefId,
     assoc: clean::PathSegment,
@@ -82,7 +80,7 @@ pub(crate) fn merge_bounds(
         // If this QPath's trait `trait_did` is the same as, or a supertrait
         // of, the bound's trait `did` then we can keep going, otherwise
         // this is just a plain old equality bound.
-        if !trait_is_same_or_supertrait(cx, trait_ref.trait_.def_id(), trait_did) {
+        if !trait_is_same_or_supertrait(tcx, trait_ref.trait_.def_id(), trait_did) {
             return false;
         }
         let last = trait_ref.trait_.segments.last_mut().expect("segments were empty");
@@ -102,20 +100,24 @@ pub(crate) fn merge_bounds(
                     }
                 }
             },
+            PP::ReturnTypeNotation => {
+                // Cannot merge bounds with RTN.
+                return false;
+            }
         };
         true
     })
 }
 
-fn trait_is_same_or_supertrait(cx: &DocContext<'_>, child: DefId, trait_: DefId) -> bool {
+fn trait_is_same_or_supertrait(tcx: TyCtxt<'_>, child: DefId, trait_: DefId) -> bool {
     if child == trait_ {
         return true;
     }
-    let predicates = cx.tcx.explicit_super_predicates_of(child);
+    let predicates = tcx.explicit_super_predicates_of(child);
     predicates
         .iter_identity_copied()
         .filter_map(|(pred, _)| Some(pred.as_trait_clause()?.def_id()))
-        .any(|did| trait_is_same_or_supertrait(cx, did, trait_))
+        .any(|did| trait_is_same_or_supertrait(tcx, did, trait_))
 }
 
 pub(crate) fn sized_bounds(cx: &mut DocContext<'_>, generics: &mut clean::Generics) {
@@ -134,10 +136,16 @@ pub(crate) fn sized_bounds(cx: &mut DocContext<'_>, generics: &mut clean::Generi
     // don't actually know the set of associated types right here so that
     // should be handled when cleaning associated types.
     generics.where_predicates.retain(|pred| {
-        if let WP::BoundPredicate { ty: clean::Generic(param), bounds, .. } = pred
-            && bounds.iter().any(|b| b.is_sized_bound(cx))
-        {
+        let WP::BoundPredicate { ty: clean::Generic(param), bounds, .. } = pred else {
+            return true;
+        };
+
+        if bounds.iter().any(|b| b.is_sized_bound(cx.tcx)) {
             sized_params.insert(*param);
+            false
+        } else if bounds.iter().any(|b| b.is_meta_sized_bound(cx.tcx)) {
+            // FIXME(sized-hierarchy): Always skip `MetaSized` bounds so that only `?Sized`
+            // is shown and none of the new sizedness traits leak into documentation.
             false
         } else {
             true

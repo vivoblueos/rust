@@ -4,9 +4,9 @@
 //@ revisions:cfail1 cfail2
 //@ compile-flags: -Z query-dep-graph
 //@ build-pass (FIXME(62277): could be check-pass?)
+//@ ignore-backends: gcc
 
 #![feature(rustc_attrs)]
-#![feature(stmt_expr_attributes)]
 #![allow(dead_code)]
 #![crate_type = "rlib"]
 
@@ -54,8 +54,8 @@ pub mod fn_calls_methods_in_same_impl {
     // The cached result should actually be loaded from disk
     // (not just marked green) - for example, `DeadVisitor`
     // always runs during compilation as a "pass", and loads
-    // the typeck results for bodies.
-    #[rustc_clean(cfg="cfail2", loaded_from_disk="typeck")]
+    // the typeck_root results for bodies.
+    #[rustc_clean(cfg="cfail2", loaded_from_disk="typeck_root")]
     pub fn check() {
         let x = Point { x: 2.0, y: 2.0 };
         x.distance_from_origin();

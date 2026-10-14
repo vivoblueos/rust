@@ -4,11 +4,11 @@
 //@ check-pass
 //@ edition:2018
 
-#![feature(specialization)] //~ WARN the feature `specialization` is incomplete
+#![feature(specialization)]
 
 fn main() {}
 
-#[cfg(FALSE)]
+#[cfg(false)]
 impl Foo for Bar {
     default async fn baz() {}
 }

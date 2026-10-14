@@ -3,8 +3,7 @@
 use std::hash::{Hash, Hasher};
 
 use rustc_index::{Idx, IndexVec};
-
-use crate::stable_hasher::{HashStable, StableHasher};
+use rustc_macros::HashStable_NoContext;
 
 /// An indexed multi-map that preserves insertion order while permitting both *O*(log *n*) lookup of
 /// an item by key and *O*(1) lookup by index.
@@ -24,11 +23,13 @@ use crate::stable_hasher::{HashStable, StableHasher};
 /// in-place.
 ///
 /// [`SortedMap`]: super::SortedMap
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, HashStable_NoContext)]
 pub struct SortedIndexMultiMap<I: Idx, K, V> {
     /// The elements of the map in insertion order.
     items: IndexVec<I, (K, V)>,
 
+    // We can ignore this field because it is not observable from the outside.
+    #[stable_hasher(ignore)]
     /// Indices of the items in the set, sorted by the item's key.
     idx_sorted_by_item_key: Vec<I>,
 }
@@ -84,7 +85,7 @@ impl<I: Idx, K: Ord, V> SortedIndexMultiMap<I, K, V> {
     /// If there are multiple items that are equivalent to `key`, they will be yielded in
     /// insertion order.
     #[inline]
-    pub fn get_by_key(&self, key: K) -> impl Iterator<Item = &V> + '_ {
+    pub fn get_by_key(&self, key: K) -> impl Iterator<Item = &V> {
         self.get_by_key_enumerated(key).map(|(_, v)| v)
     }
 
@@ -94,7 +95,7 @@ impl<I: Idx, K: Ord, V> SortedIndexMultiMap<I, K, V> {
     /// If there are multiple items that are equivalent to `key`, they will be yielded in
     /// insertion order.
     #[inline]
-    pub fn get_by_key_enumerated(&self, key: K) -> impl Iterator<Item = (I, &V)> + '_ {
+    pub fn get_by_key_enumerated(&self, key: K) -> impl Iterator<Item = (I, &V)> {
         let lower_bound = self.idx_sorted_by_item_key.partition_point(|&i| self.items[i].0 < key);
         self.idx_sorted_by_item_key[lower_bound..].iter().map_while(move |&i| {
             let (k, v) = &self.items[i];
@@ -126,28 +127,12 @@ where
     }
 }
 
-impl<I: Idx, K, V, C> HashStable<C> for SortedIndexMultiMap<I, K, V>
-where
-    K: HashStable<C>,
-    V: HashStable<C>,
-{
-    fn hash_stable(&self, ctx: &mut C, hasher: &mut StableHasher) {
-        let SortedIndexMultiMap {
-            items,
-            // We can ignore this field because it is not observable from the outside.
-            idx_sorted_by_item_key: _,
-        } = self;
-
-        items.hash_stable(ctx, hasher)
-    }
-}
-
 impl<I: Idx, K: Ord, V> FromIterator<(K, V)> for SortedIndexMultiMap<I, K, V> {
     fn from_iter<J>(iter: J) -> Self
     where
         J: IntoIterator<Item = (K, V)>,
     {
-        let items = IndexVec::from_iter(iter);
+        let items = IndexVec::<I, _>::from_iter(iter);
         let mut idx_sorted_by_item_key: Vec<_> = items.indices().collect();
 
         // `sort_by_key` is stable, so insertion order is preserved for duplicate items.

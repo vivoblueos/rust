@@ -1,4 +1,3 @@
-//@ignore-target: windows # File handling is not implemented yet
 //@compile-flags: -Zmiri-disable-isolation
 
 #![feature(io_error_more)]
@@ -7,31 +6,40 @@
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fs::{
-    File, OpenOptions, canonicalize, create_dir, read_dir, remove_dir, remove_dir_all, remove_file,
-    rename,
+    self, File, OpenOptions, create_dir, read_dir, remove_dir, remove_dir_all, remove_file, rename,
 };
 use std::io::{Error, ErrorKind, IsTerminal, Read, Result, Seek, SeekFrom, Write};
 use std::path::Path;
 
 #[path = "../../utils/mod.rs"]
 mod utils;
+use utils::check_nondet;
 
 fn main() {
     test_path_conversion();
     test_file();
-    test_file_clone();
+    // Partial reads/writes are apparently not a thing on Windows.
+    if cfg!(not(windows)) {
+        test_file_partial_reads_writes();
+    }
     test_file_create_new();
-    test_seek();
     test_metadata();
+    test_seek();
+    test_errors();
+    test_from_raw_os_error();
+    test_file_clone();
     test_file_set_len();
     test_file_sync();
-    test_errors();
     test_rename();
-    test_directory();
-    test_canonicalize();
-    test_from_raw_os_error();
-    #[cfg(unix)]
-    test_pread_pwrite();
+    // Windows file handling is very incomplete.
+    if cfg!(not(windows)) {
+        test_directory();
+        test_canonicalize();
+        #[cfg(unix)]
+        test_pread_pwrite();
+        #[cfg(not(any(target_os = "solaris", target_os = "android")))]
+        test_flock();
+    }
 }
 
 fn test_path_conversion() {
@@ -50,7 +58,7 @@ fn test_file() {
     file.write(&mut []).unwrap();
     assert_eq!(file.metadata().unwrap().len(), 0);
 
-    file.write(bytes).unwrap();
+    file.write_all(bytes).unwrap();
     assert_eq!(file.metadata().unwrap().len(), bytes.len() as u64);
     // Test opening, reading and closing a file.
     let mut file = File::open(&path).unwrap();
@@ -63,8 +71,38 @@ fn test_file() {
 
     assert!(!file.is_terminal());
 
+    // Writing to a file opened for reading should error (and not stop interpretation). std does not
+    // categorize the error so we don't check for details.
+    file.write(&[0]).unwrap_err();
+    // However, writing 0 bytes can succeed or fail.
+    let _ignore = file.write(&[]);
+
+    // Test calling File::create on an existing file, since that uses a different code path
+    File::create(&path).unwrap();
+
     // Removing file should succeed.
     remove_file(&path).unwrap();
+}
+
+fn test_file_partial_reads_writes() {
+    let path1 = utils::prepare_with_content("miri_test_fs_file1.txt", b"abcdefg");
+    let path2 = utils::prepare_with_content("miri_test_fs_file2.txt", b"abcdefg");
+
+    // Ensure we sometimes do incomplete writes.
+    check_nondet(|| {
+        let mut file = File::create(&path1).unwrap();
+        file.write(&[0; 4]).unwrap() == 4
+    });
+    // Ensure we sometimes do incomplete reads.
+    check_nondet(|| {
+        let mut file = File::open(&path2).unwrap();
+        let mut buf = [0; 4];
+        file.read(&mut buf).unwrap() == 4
+    });
+
+    // Clean up
+    remove_file(&path1).unwrap();
+    remove_file(&path2).unwrap();
 }
 
 fn test_file_clone() {
@@ -144,10 +182,10 @@ fn test_metadata() {
     let path = utils::prepare_with_content("miri_test_fs_metadata.txt", bytes);
 
     // Test that metadata of an absolute path is correct.
-    check_metadata(bytes, &path).unwrap();
+    check_metadata(bytes, &path).expect("absolute path metadata");
     // Test that metadata of a relative path is correct.
     std::env::set_current_dir(path.parent().unwrap()).unwrap();
-    check_metadata(bytes, Path::new(path.file_name().unwrap())).unwrap();
+    check_metadata(bytes, Path::new(path.file_name().unwrap())).expect("relative path metadata");
 
     // Removing file should succeed.
     remove_file(&path).unwrap();
@@ -174,7 +212,12 @@ fn test_file_set_len() {
 
     // Can't use set_len on a file not opened for writing
     let file = OpenOptions::new().read(true).open(&path).unwrap();
-    assert_eq!(ErrorKind::InvalidInput, file.set_len(14).unwrap_err().kind());
+    // Due to https://github.com/rust-lang/miri/issues/4457, we have to assume the failure could
+    // be either of the Windows or Unix kind, no matter which platform we're on.
+    assert!(
+        [ErrorKind::PermissionDenied, ErrorKind::InvalidInput]
+            .contains(&file.set_len(14).unwrap_err().kind())
+    );
 
     remove_file(&path).unwrap();
 }
@@ -188,10 +231,16 @@ fn test_file_sync() {
     file.sync_data().unwrap();
     file.sync_all().unwrap();
 
-    // Test that we can call sync_data and sync_all on a file opened for reading.
+    // Test that we can call sync_data and sync_all on a file opened for reading on unix, but not
+    // on Windows
     let file = File::open(&path).unwrap();
-    file.sync_data().unwrap();
-    file.sync_all().unwrap();
+    if cfg!(unix) {
+        file.sync_data().unwrap();
+        file.sync_all().unwrap();
+    } else {
+        file.sync_data().unwrap_err();
+        file.sync_all().unwrap_err();
+    }
 
     remove_file(&path).unwrap();
 }
@@ -238,7 +287,7 @@ fn test_canonicalize() {
     let path = dir_path.join("test_file");
     drop(File::create(&path).unwrap());
 
-    let p = canonicalize(format!("{}/./test_file", dir_path.to_string_lossy())).unwrap();
+    let p = fs::canonicalize(format!("{}/./test_file", dir_path.to_string_lossy())).unwrap();
     assert_eq!(p.to_string_lossy().find("/./"), None);
 
     remove_dir_all(&dir_path).unwrap();
@@ -276,7 +325,12 @@ fn test_directory() {
             .collect::<BTreeMap<_, _>>()
     );
     // Deleting the directory should fail, since it is not empty.
-    assert_eq!(ErrorKind::DirectoryNotEmpty, remove_dir(&dir_path).unwrap_err().kind());
+
+    // Solaris/Illumos `rmdir` call set errno to EEXIST if directory contains
+    // other entries than `.` and `..`.
+    // https://docs.oracle.com/cd/E86824_01/html/E54765/rmdir-2.html
+    let err = remove_dir(&dir_path).unwrap_err().kind();
+    assert!(matches!(err, ErrorKind::AlreadyExists | ErrorKind::DirectoryNotEmpty));
     // Clean up the files in the directory
     remove_file(&path_1).unwrap();
     remove_file(&path_2).unwrap();
@@ -343,4 +397,29 @@ fn test_pread_pwrite() {
     // Ensure that cursor position is not changed
     f.read_exact(&mut buf1).unwrap();
     assert_eq!(&buf1, b"  m");
+}
+
+// The standard library does not support this operation on Solaris, Android
+#[cfg(not(any(target_os = "solaris", target_os = "android")))]
+fn test_flock() {
+    let bytes = b"Hello, World!\n";
+    let path = utils::prepare_with_content("miri_test_fs_flock.txt", bytes);
+    let file1 = OpenOptions::new().read(true).write(true).open(&path).unwrap();
+    let file2 = OpenOptions::new().read(true).write(true).open(&path).unwrap();
+
+    // Test that we can apply many shared locks
+    file1.lock_shared().unwrap();
+    file2.lock_shared().unwrap();
+    // Test that shared lock prevents exclusive lock
+    assert!(matches!(file1.try_lock().unwrap_err(), fs::TryLockError::WouldBlock));
+    // Unlock shared lock
+    file1.unlock().unwrap();
+    file2.unlock().unwrap();
+    // Take exclusive lock
+    file1.lock().unwrap();
+    // Test that shared lock prevents exclusive and shared locks
+    assert!(matches!(file2.try_lock().unwrap_err(), fs::TryLockError::WouldBlock));
+    assert!(matches!(file2.try_lock_shared().unwrap_err(), fs::TryLockError::WouldBlock));
+    // Unlock exclusive lock
+    file1.unlock().unwrap();
 }

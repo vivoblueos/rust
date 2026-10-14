@@ -1,14 +1,8 @@
-#![feature(intrinsics)]
+#![feature(core_intrinsics)]
 
-mod rusti {
-    extern "rust-intrinsic" {
-        pub fn ctlz_nonzero<T>(x: T) -> u32;
-    }
-}
-
-pub fn main() {
+fn main() {
     unsafe {
-        use crate::rusti::*;
+        use std::intrinsics::*;
 
         ctlz_nonzero(0u8); //~ ERROR: `ctlz_nonzero` called on 0
     }

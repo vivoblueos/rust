@@ -3,21 +3,20 @@ use rustc_data_structures::fx::FxIndexSet;
 use rustc_hir as hir;
 use rustc_hir::def_id::{DefId, LocalDefId};
 use rustc_infer::infer::TyCtxtInferExt;
-use rustc_infer::infer::outlives::env::OutlivesEnvironment;
 use rustc_lint_defs::builtin::{REFINING_IMPL_TRAIT_INTERNAL, REFINING_IMPL_TRAIT_REACHABLE};
 use rustc_middle::span_bug;
-use rustc_middle::traits::{ObligationCause, Reveal};
+use rustc_middle::traits::ObligationCause;
+use rustc_middle::ty::print::{with_no_trimmed_paths, with_types_for_signature};
 use rustc_middle::ty::{
     self, Ty, TyCtxt, TypeFoldable, TypeFolder, TypeSuperVisitable, TypeVisitable,
     TypeVisitableExt, TypeVisitor, TypingMode,
 };
 use rustc_span::Span;
 use rustc_trait_selection::regions::InferCtxtRegionExt;
-use rustc_trait_selection::traits::outlives_bounds::InferCtxtExt;
 use rustc_trait_selection::traits::{ObligationCtxt, elaborate, normalize_param_env_or_error};
 
 /// Check that an implementation does not refine an RPITIT from a trait method signature.
-pub(super) fn check_refining_return_position_impl_trait_in_trait<'tcx>(
+pub(crate) fn check_refining_return_position_impl_trait_in_trait<'tcx>(
     tcx: TyCtxt<'tcx>,
     impl_m: ty::AssocItem,
     trait_m: ty::AssocItem,
@@ -81,10 +80,14 @@ pub(super) fn check_refining_return_position_impl_trait_in_trait<'tcx>(
 
     for trait_projection in collector.types.into_iter().rev() {
         let impl_opaque_args = trait_projection.args.rebase_onto(tcx, trait_m.def_id, impl_m_args);
-        let hidden_ty = hidden_tys[&trait_projection.def_id].instantiate(tcx, impl_opaque_args);
+        let hidden_ty =
+            hidden_tys[&trait_projection.kind.def_id()].instantiate(tcx, impl_opaque_args);
 
         // If the hidden type is not an opaque, then we have "refined" the trait signature.
-        let ty::Alias(ty::Opaque, impl_opaque) = *hidden_ty.kind() else {
+        let ty::Alias(
+            impl_opaque @ ty::AliasTy { kind: ty::Opaque { def_id: impl_opaque_def_id }, .. },
+        ) = *hidden_ty.kind()
+        else {
             report_mismatched_rpitit_signature(
                 tcx,
                 trait_m_sig_with_self_for_diag,
@@ -98,7 +101,7 @@ pub(super) fn check_refining_return_position_impl_trait_in_trait<'tcx>(
 
         // This opaque also needs to be from the impl method -- otherwise,
         // it's a refinement to a TAIT.
-        if !tcx.hir().get_if_local(impl_opaque.def_id).is_some_and(|node| {
+        if !tcx.hir_get_if_local(impl_opaque_def_id).is_some_and(|node| {
             matches!(
                 node.expect_opaque_ty().origin,
                 hir::OpaqueTyOrigin::AsyncFn { parent, .. }  | hir::OpaqueTyOrigin::FnReturn { parent, .. }
@@ -117,11 +120,12 @@ pub(super) fn check_refining_return_position_impl_trait_in_trait<'tcx>(
         }
 
         trait_bounds.extend(
-            tcx.item_bounds(trait_projection.def_id).iter_instantiated(tcx, trait_projection.args),
+            tcx.item_bounds(trait_projection.kind.def_id())
+                .iter_instantiated(tcx, trait_projection.args),
         );
         impl_bounds.extend(elaborate(
             tcx,
-            tcx.explicit_item_bounds(impl_opaque.def_id)
+            tcx.explicit_item_bounds(impl_opaque_def_id)
                 .iter_instantiated_copied(tcx, impl_opaque.args),
         ));
 
@@ -134,7 +138,7 @@ pub(super) fn check_refining_return_position_impl_trait_in_trait<'tcx>(
         .into_iter()
         .chain(tcx.predicates_of(trait_m.def_id).instantiate_own(tcx, trait_m_to_impl_m_args))
         .map(|(clause, _)| clause);
-    let param_env = ty::ParamEnv::new(tcx.mk_clauses_from_iter(hybrid_preds), Reveal::UserFacing);
+    let param_env = ty::ParamEnv::new(tcx.mk_clauses_from_iter(hybrid_preds));
     let param_env = normalize_param_env_or_error(tcx, param_env, ObligationCause::dummy());
 
     let ref infcx = tcx.infer_ctxt().build(TypingMode::non_body_analysis());
@@ -166,15 +170,11 @@ pub(super) fn check_refining_return_position_impl_trait_in_trait<'tcx>(
         param_env,
         trait_m_sig.inputs_and_output,
     ));
-    if !ocx.select_all_or_error().is_empty() {
+    if !ocx.evaluate_obligations_error_on_ambiguity().is_empty() {
         tcx.dcx().delayed_bug("encountered errors when checking RPITIT refinement (selection)");
         return;
     }
-    let outlives_env = OutlivesEnvironment::with_bounds(
-        param_env,
-        infcx.implied_bounds_tys(param_env, impl_m.def_id.expect_local(), &implied_wf_types),
-    );
-    let errors = infcx.resolve_regions(&outlives_env);
+    let errors = infcx.resolve_regions(impl_m.def_id.expect_local(), param_env, implied_wf_types);
     if !errors.is_empty() {
         tcx.dcx().delayed_bug("encountered errors when checking RPITIT refinement (regions)");
         return;
@@ -223,7 +223,7 @@ pub(super) fn check_refining_return_position_impl_trait_in_trait<'tcx>(
     // is literally unrepresentable in the type system; however, we may be
     // promising stronger outlives guarantees if we capture *fewer* regions.
     for (trait_projection, impl_opaque) in pairs {
-        let impl_variances = tcx.variances_of(impl_opaque.def_id);
+        let impl_variances = tcx.variances_of(impl_opaque.kind.def_id());
         let impl_captures: FxIndexSet<_> = impl_opaque
             .args
             .iter()
@@ -232,7 +232,7 @@ pub(super) fn check_refining_return_position_impl_trait_in_trait<'tcx>(
             .map(|(arg, _)| arg)
             .collect();
 
-        let trait_variances = tcx.variances_of(trait_projection.def_id);
+        let trait_variances = tcx.variances_of(trait_projection.kind.def_id());
         let mut trait_captures = FxIndexSet::default();
         for (arg, variance) in trait_projection.args.iter().zip_eq(trait_variances) {
             if *variance != ty::Invariant {
@@ -244,7 +244,7 @@ pub(super) fn check_refining_return_position_impl_trait_in_trait<'tcx>(
         if !trait_captures.iter().all(|arg| impl_captures.contains(arg)) {
             report_mismatched_rpitit_captures(
                 tcx,
-                impl_opaque.def_id.expect_local(),
+                impl_opaque.kind.def_id().expect_local(),
                 trait_captures,
                 is_internal,
             );
@@ -259,13 +259,13 @@ struct ImplTraitInTraitCollector<'tcx> {
 
 impl<'tcx> TypeVisitor<TyCtxt<'tcx>> for ImplTraitInTraitCollector<'tcx> {
     fn visit_ty(&mut self, ty: Ty<'tcx>) {
-        if let ty::Alias(ty::Projection, proj) = *ty.kind()
-            && self.tcx.is_impl_trait_in_trait(proj.def_id)
+        if let ty::Alias(proj @ ty::AliasTy { kind: ty::Projection { def_id }, .. }) = *ty.kind()
+            && self.tcx.is_impl_trait_in_trait(def_id)
         {
             if self.types.insert(proj) {
                 for (pred, _) in self
                     .tcx
-                    .explicit_item_bounds(proj.def_id)
+                    .explicit_item_bounds(def_id)
                     .iter_instantiated_copied(self.tcx, proj.args)
                 {
                     pred.visit_with(self);
@@ -289,29 +289,36 @@ fn report_mismatched_rpitit_signature<'tcx>(
         tcx.fn_sig(trait_m_def_id).skip_binder().bound_vars(),
         tcx.fn_sig(impl_m_def_id).skip_binder().bound_vars(),
     )
-    .filter_map(|(impl_bv, trait_bv)| {
+    .enumerate()
+    .filter_map(|(idx, (impl_bv, trait_bv))| {
         if let ty::BoundVariableKind::Region(impl_bv) = impl_bv
             && let ty::BoundVariableKind::Region(trait_bv) = trait_bv
         {
-            Some((impl_bv, trait_bv))
+            let var = ty::BoundVar::from_usize(idx);
+            Some((
+                ty::LateParamRegionKind::from_bound(var, impl_bv),
+                ty::LateParamRegionKind::from_bound(var, trait_bv),
+            ))
         } else {
             None
         }
     })
     .collect();
 
-    let mut return_ty =
-        trait_m_sig.output().fold_with(&mut super::RemapLateBound { tcx, mapping: &mapping });
+    let mut return_ty = trait_m_sig.output().fold_with(&mut super::RemapLateParam { tcx, mapping });
 
     if tcx.asyncness(impl_m_def_id).is_async() && tcx.asyncness(trait_m_def_id).is_async() {
-        let ty::Alias(ty::Projection, future_ty) = return_ty.kind() else {
+        let &ty::Alias(
+            future_ty @ ty::AliasTy { kind: ty::Projection { def_id: future_ty_def_id }, .. },
+        ) = return_ty.kind()
+        else {
             span_bug!(
                 tcx.def_span(trait_m_def_id),
                 "expected return type of async fn in trait to be a AFIT projection"
             );
         };
         let Some(future_output_ty) = tcx
-            .explicit_item_bounds(future_ty.def_id)
+            .explicit_item_bounds(future_ty_def_id)
             .iter_instantiated_copied(tcx, future_ty.args)
             .find_map(|(clause, _)| match clause.kind().no_bound_vars()? {
                 ty::ClauseKind::Projection(proj) => proj.term.as_type(),
@@ -329,10 +336,21 @@ fn report_mismatched_rpitit_signature<'tcx>(
             hir::FnRetTy::Return(ty) => (ty.span, ty.span, "", ""),
         };
     let trait_return_span =
-        tcx.hir().get_if_local(trait_m_def_id).map(|node| match node.fn_decl().unwrap().output {
+        tcx.hir_get_if_local(trait_m_def_id).map(|node| match node.fn_decl().unwrap().output {
             hir::FnRetTy::DefaultReturn(_) => tcx.def_span(trait_m_def_id),
             hir::FnRetTy::Return(ty) => ty.span,
         });
+
+    // Use ForSignature mode to ensure RPITITs are printed as `impl Trait` rather than
+    // `impl Trait { T::method(..) }` when RTN is enabled.
+    //
+    // We use `with_no_trimmed_paths!` to avoid triggering the `trimmed_def_paths` query,
+    // which requires diagnostic context (via `must_produce_diag`). Since we're formatting
+    // the type before creating the diagnostic, we need to avoid this query. This is the
+    // standard approach used elsewhere in the compiler for formatting types in suggestions
+    // (e.g., see `rustc_hir_typeck/src/demand.rs`).
+    let return_ty_suggestion =
+        with_no_trimmed_paths!(with_types_for_signature!(format!("{return_ty}")));
 
     let span = unmatched_bound.unwrap_or(span);
     tcx.emit_node_span_lint(
@@ -344,7 +362,7 @@ fn report_mismatched_rpitit_signature<'tcx>(
             trait_return_span,
             pre,
             post,
-            return_ty,
+            return_ty: return_ty_suggestion,
             unmatched_bound,
         },
     );
@@ -429,7 +447,7 @@ fn report_mismatched_rpitit_captures<'tcx>(
     };
 
     trait_captured_args
-        .sort_by_cached_key(|arg| !matches!(arg.unpack(), ty::GenericArgKind::Lifetime(_)));
+        .sort_by_cached_key(|arg| !matches!(arg.kind(), ty::GenericArgKind::Lifetime(_)));
     let suggestion = format!("use<{}>", trait_captured_args.iter().join(", "));
 
     tcx.emit_node_span_lint(

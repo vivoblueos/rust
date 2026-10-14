@@ -1,4 +1,4 @@
-//@compile-flags: -Zmiri-ignore-leaks -Zmiri-preemption-rate=0
+//@compile-flags: -Zmiri-ignore-leaks -Zmiri-fixed-schedule
 
 // Tests showing weak memory behaviours are exhibited. All tests
 // return true when the desired behaviour is seen.
@@ -34,7 +34,7 @@ fn relaxed() {
     j2.join().unwrap();
 }
 
-pub fn main() {
+fn main() {
     // If we try often enough, we should hit UB.
     for _ in 0..100 {
         relaxed();

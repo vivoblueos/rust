@@ -1,4 +1,6 @@
-// Regression test for #122561
+// Regression test for <https://github.com/rust-lang/rust/issues/122561>.
+//
+// Tests suggestions for type mismatch of loop expressions.
 
 fn for_infinite() -> bool {
     for i in 0.. {
@@ -39,8 +41,7 @@ fn for_single_line() -> bool { for i in 0.. { return false; } }
 // b. format the suggestion correctly so
 //    that it's readable
 fn for_in_arg(a: &[(); for x in 0..2 {}]) -> bool {
-//~^ ERROR `for` is not allowed in a `const`
-//~| ERROR mismatched types
+    //~^ ERROR mismatched types
     true
 }
 
@@ -84,16 +85,14 @@ fn loop_() -> bool {
 
 const C: i32 = {
     for i in 0.. {
-    //~^ ERROR `for` is not allowed in a `const`
-    //~| ERROR mismatched types
+    //~^ ERROR mismatched types
     }
 };
 
 fn main() {
     let _ = [10; {
         for i in 0..5 {
-        //~^ ERROR `for` is not allowed in a `const`
-        //~| ERROR mismatched types
+        //~^ ERROR mismatched types
         }
     }];
 
@@ -105,6 +104,5 @@ fn main() {
 
 
     let _ = |a: &[(); for x in 0..2 {}]| {};
-    //~^ ERROR `for` is not allowed in a `const`
-    //~| ERROR mismatched types
+    //~^ ERROR mismatched types
 }

@@ -1,5 +1,5 @@
 use clippy_utils::diagnostics::span_lint_and_sugg;
-use clippy_utils::path_res;
+use clippy_utils::res::MaybeResPath;
 use rustc_ast::ast::LitKind;
 use rustc_errors::Applicability;
 use rustc_hir::def::Res;
@@ -17,7 +17,7 @@ declare_clippy_lint! {
     ///
     /// ### Why is this bad?
     ///
-    /// This leaves the caller unable to use the `&str` as `&'static str`, causing unneccessary allocations or confusion.
+    /// This leaves the caller unable to use the `&str` as `&'static str`, causing unnecessary allocations or confusion.
     /// This is also most likely what you meant to write.
     ///
     /// ### Example
@@ -47,7 +47,7 @@ declare_clippy_lint! {
     ///     }
     /// }
     /// ```
-    #[clippy::version = "1.83.0"]
+    #[clippy::version = "1.84.0"]
     pub UNNECESSARY_LITERAL_BOUND,
     pedantic,
     "detects &str that could be &'static str in function return types"
@@ -138,7 +138,7 @@ impl<'tcx> LateLintPass<'tcx> for UnnecessaryLiteralBound {
             return;
         };
 
-        if path_res(cx, inner_hir_ty) != Res::PrimTy(PrimTy::Str) {
+        if !matches!(inner_hir_ty.basic_res(), Res::PrimTy(PrimTy::Str)) {
             return;
         }
 

@@ -1,7 +1,7 @@
 #![warn(unused)]
 #![allow(dead_code)]
 #![deny(non_snake_case)]
-
+//@ ignore-parallel-frontend `note`s on different source lines
 mod foo {
     pub enum Foo { Foo }
 }
@@ -34,6 +34,9 @@ fn main() {
     //~^ ERROR variable `Foo` should have a snake case name
     //~^^ ERROR `Foo` is named the same as one of the variants of the type `foo::Foo`
     //~^^^ WARN unused variable: `Foo`
+
+    let _: fn(CamelCase: i32);
+    //~^ ERROR variable `CamelCase` should have a snake case name
 
     test(1);
 

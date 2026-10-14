@@ -1,9 +1,9 @@
-#[prelude_import]
-use ::std::prelude::rust_2015::*;
-#[macro_use]
 extern crate std;
+#[attr = PreludeImport]
+use ::std::prelude::rust_2015::*;
 //@ compile-flags: -Zunpretty=hir
 //@ check-fail
+//@ edition: 2015
 
 // In #100948 this caused an ICE with -Zunpretty=hir.
 fn main() {

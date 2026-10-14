@@ -1,7 +1,7 @@
 // This test verifies that rustdoc `-o -` prints JSON on stdout and doesn't generate
 // a JSON file.
 
-use std::path::PathBuf;
+//@ needs-target-std
 
 use run_make_support::path_helpers::{cwd, has_extension, read_dir_entries_recursive};
 use run_make_support::{rustdoc, serde_json};
