@@ -3,7 +3,7 @@
 //@ build-fail
 //@ revisions: v0
 //@[v0]compile-flags: -C symbol-mangling-version=v0
-//@[v0]normalize-stderr-test: "core\[.*?\]" -> "core[HASH]"
+//@[v0]normalize-stderr: "core\[.*?\]" -> "core[HASH]"
 
 #![feature(rustc_attrs)]
 
@@ -12,7 +12,7 @@ trait Bar {
 }
 
 impl Bar for &dyn FnMut(&u8) {
-    #[rustc_symbol_name]
+    #[rustc_dump_symbol_name]
     //[v0]~^ ERROR symbol-name
     //[v0]~| ERROR demangling
     //[v0]~| ERROR demangling-alt
@@ -24,7 +24,7 @@ trait Foo {
 }
 
 impl Foo for &(dyn FnMut(&u8) + for<'b> Send) {
-    #[rustc_symbol_name]
+    #[rustc_dump_symbol_name]
     //[v0]~^ ERROR symbol-name
     //[v0]~| ERROR demangling
     //[v0]~| ERROR demangling-alt
@@ -36,7 +36,7 @@ trait Baz {
 }
 
 impl Baz for &(dyn for<'b> Send + FnMut(&u8)) {
-    #[rustc_symbol_name]
+    #[rustc_dump_symbol_name]
     //[v0]~^ ERROR symbol-name
     //[v0]~| ERROR demangling
     //[v0]~| ERROR demangling-alt

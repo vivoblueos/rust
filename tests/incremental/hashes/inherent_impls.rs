@@ -5,12 +5,14 @@
 // and make sure that the hash has changed, then change nothing between rev2 and
 // rev3 and make sure that the hash has not changed.
 
+//@ edition: 2024
 //@ build-pass (FIXME(62277): could be check-pass?)
 //@ revisions: cfail1 cfail2 cfail3 cfail4 cfail5 cfail6
 //@ compile-flags: -Z query-dep-graph -O
 //@ [cfail1]compile-flags: -Zincremental-ignore-spans
 //@ [cfail2]compile-flags: -Zincremental-ignore-spans
 //@ [cfail3]compile-flags: -Zincremental-ignore-spans
+//@ ignore-backends: gcc
 
 
 #![allow(warnings)]
@@ -53,12 +55,12 @@ impl Foo {
 #[cfg(not(any(cfail1,cfail4)))]
 #[rustc_clean(cfg="cfail2")]
 #[rustc_clean(cfg="cfail3")]
-#[rustc_clean(cfg="cfail5")]
+#[rustc_clean(except="opt_hir_owner_nodes", cfg="cfail5")]
 #[rustc_clean(cfg="cfail6")]
 impl Foo {
-    #[rustc_clean(cfg="cfail2", except="opt_hir_owner_nodes,optimized_mir,promoted_mir,typeck")]
+    #[rustc_clean(cfg="cfail2",except="opt_hir_owner_nodes,optimized_mir,promoted_mir,typeck_root")]
     #[rustc_clean(cfg="cfail3")]
-    #[rustc_clean(cfg="cfail5", except="opt_hir_owner_nodes,optimized_mir,promoted_mir,typeck")]
+    #[rustc_clean(cfg="cfail5",except="opt_hir_owner_nodes,optimized_mir,promoted_mir,typeck_root")]
     #[rustc_clean(cfg="cfail6")]
     pub fn method_body() {
         println!("Hello, world!");
@@ -71,15 +73,9 @@ impl Foo {
 // This should affect the method itself, but not the impl.
 #[cfg(any(cfail1,cfail4))]
 impl Foo {
-    //------------
-    //---------------
-    //----------------------------------------------------------------
-    //
+    //-----------------------------------------------------------------------------
     //--------------------------
-    //------------
-    //---------------
-    //----------------------------------------------------------------
-    //
+    //-----------------------------------------------------------------------------
     //--------------------------
     #[inline]
     pub fn method_body_inlined() {
@@ -90,18 +86,12 @@ impl Foo {
 #[cfg(not(any(cfail1,cfail4)))]
 #[rustc_clean(cfg="cfail2")]
 #[rustc_clean(cfg="cfail3")]
-#[rustc_clean(cfg="cfail5")]
+#[rustc_clean(except="opt_hir_owner_nodes", cfg="cfail5")]
 #[rustc_clean(cfg="cfail6")]
 impl Foo {
-    #[rustc_clean(
-        cfg="cfail2",
-        except="opt_hir_owner_nodes,optimized_mir,promoted_mir,typeck"
-    )]
+    #[rustc_clean(cfg="cfail2", except="opt_hir_owner_nodes,optimized_mir,typeck_root")]
     #[rustc_clean(cfg="cfail3")]
-    #[rustc_clean(
-        cfg="cfail5",
-        except="opt_hir_owner_nodes,optimized_mir,promoted_mir,typeck"
-    )]
+    #[rustc_clean(cfg="cfail5", except="opt_hir_owner_nodes,optimized_mir,typeck_root")]
     #[rustc_clean(cfg="cfail6")]
     #[inline]
     pub fn method_body_inlined() {
@@ -150,19 +140,19 @@ impl Foo {
 }
 
 #[cfg(not(any(cfail1,cfail4)))]
-#[rustc_clean(cfg="cfail2", except="opt_hir_owner_nodes")]
+#[rustc_clean(cfg="cfail2")]
 #[rustc_clean(cfg="cfail3")]
 #[rustc_clean(cfg="cfail5", except="opt_hir_owner_nodes")]
 #[rustc_clean(cfg="cfail6")]
 impl Foo {
     #[rustc_clean(
         cfg="cfail2",
-        except="opt_hir_owner_nodes,fn_sig,generics_of,typeck,associated_item,optimized_mir",
+        except="opt_hir_owner_nodes,fn_sig,generics_of,typeck_root,associated_item,optimized_mir",
     )]
     #[rustc_clean(cfg="cfail3")]
     #[rustc_clean(
         cfg="cfail5",
-        except="opt_hir_owner_nodes,fn_sig,generics_of,typeck,associated_item,optimized_mir",
+        except="opt_hir_owner_nodes,fn_sig,generics_of,typeck_root,associated_item,optimized_mir",
     )]
     #[rustc_clean(cfg="cfail6")]
     pub fn method_selfness(&self) { }
@@ -181,12 +171,12 @@ impl Foo {
 #[cfg(not(any(cfail1,cfail4)))]
 #[rustc_clean(cfg="cfail2")]
 #[rustc_clean(cfg="cfail3")]
-#[rustc_clean(cfg="cfail5")]
+#[rustc_clean(except="opt_hir_owner_nodes", cfg="cfail5")]
 #[rustc_clean(cfg="cfail6")]
 impl Foo {
-    #[rustc_clean(cfg="cfail2", except="opt_hir_owner_nodes,fn_sig,typeck,optimized_mir")]
+    #[rustc_clean(cfg="cfail2", except="opt_hir_owner_nodes,fn_sig,typeck_root,optimized_mir")]
     #[rustc_clean(cfg="cfail3")]
-    #[rustc_clean(cfg="cfail5", except="opt_hir_owner_nodes,fn_sig,typeck,optimized_mir")]
+    #[rustc_clean(cfg="cfail5", except="opt_hir_owner_nodes,fn_sig,typeck_root,optimized_mir")]
     #[rustc_clean(cfg="cfail6")]
     pub fn method_selfmutness(&mut self) { }
 }
@@ -231,12 +221,12 @@ impl Foo {
 #[cfg(not(any(cfail1,cfail4)))]
 #[rustc_clean(cfg="cfail2")]
 #[rustc_clean(cfg="cfail3")]
-#[rustc_clean(cfg="cfail5")]
+#[rustc_clean(except="opt_hir_owner_nodes", cfg="cfail5")]
 #[rustc_clean(cfg="cfail6")]
 impl Foo {
-    #[rustc_clean(cfg="cfail2", except="opt_hir_owner_nodes,fn_sig,typeck,optimized_mir")]
+    #[rustc_clean(cfg="cfail2", except="opt_hir_owner_nodes,fn_sig,typeck_root,optimized_mir")]
     #[rustc_clean(cfg="cfail3")]
-    #[rustc_clean(cfg="cfail5", except="opt_hir_owner_nodes,fn_sig,typeck,optimized_mir")]
+    #[rustc_clean(cfg="cfail5", except="opt_hir_owner_nodes,fn_sig,typeck_root,optimized_mir")]
     #[rustc_clean(cfg="cfail6")]
     pub fn add_method_parameter(&self, _: i32) { }
 }
@@ -281,12 +271,12 @@ impl Foo {
 #[cfg(not(any(cfail1,cfail4)))]
 #[rustc_clean(cfg="cfail2")]
 #[rustc_clean(cfg="cfail3")]
-#[rustc_clean(cfg="cfail5")]
+#[rustc_clean(except="opt_hir_owner_nodes", cfg="cfail5")]
 #[rustc_clean(cfg="cfail6")]
 impl Foo {
-    #[rustc_clean(cfg="cfail2", except="opt_hir_owner_nodes,fn_sig,optimized_mir,typeck")]
+    #[rustc_clean(cfg="cfail2", except="opt_hir_owner_nodes,fn_sig,optimized_mir,typeck_root")]
     #[rustc_clean(cfg="cfail3")]
-    #[rustc_clean(cfg="cfail5", except="opt_hir_owner_nodes,fn_sig,optimized_mir,typeck")]
+    #[rustc_clean(cfg="cfail5", except="opt_hir_owner_nodes,fn_sig,optimized_mir,typeck_root")]
     #[rustc_clean(cfg="cfail6")]
     pub fn change_method_return_type(&self) -> u32 { 0 }
 }
@@ -358,12 +348,12 @@ impl Foo {
 #[cfg(not(any(cfail1,cfail4)))]
 #[rustc_clean(cfg="cfail2")]
 #[rustc_clean(cfg="cfail3")]
-#[rustc_clean(cfg="cfail5")]
+#[rustc_clean(except="opt_hir_owner_nodes", cfg="cfail5")]
 #[rustc_clean(cfg="cfail6")]
 impl Foo {
-    #[rustc_clean(cfg="cfail2", except="opt_hir_owner_nodes,fn_sig,typeck")]
+    #[rustc_clean(cfg="cfail2", except="opt_hir_owner_nodes,fn_sig,typeck_root")]
     #[rustc_clean(cfg="cfail3")]
-    #[rustc_clean(cfg="cfail5", except="opt_hir_owner_nodes,fn_sig,typeck")]
+    #[rustc_clean(cfg="cfail5", except="opt_hir_owner_nodes,fn_sig,typeck_root")]
     #[rustc_clean(cfg="cfail6")]
     pub unsafe fn make_method_unsafe(&self) { }
 }
@@ -383,12 +373,12 @@ impl Foo {
 #[cfg(not(any(cfail1,cfail4)))]
 #[rustc_clean(cfg="cfail2")]
 #[rustc_clean(cfg="cfail3")]
-#[rustc_clean(cfg="cfail5")]
+#[rustc_clean(except="opt_hir_owner_nodes", cfg="cfail5")]
 #[rustc_clean(cfg="cfail6")]
 impl Foo {
-    #[rustc_clean(cfg="cfail2", except="opt_hir_owner_nodes,fn_sig,typeck")]
+    #[rustc_clean(cfg="cfail2", except="opt_hir_owner_nodes,fn_sig,typeck_root")]
     #[rustc_clean(cfg="cfail3")]
-    #[rustc_clean(cfg="cfail5", except="opt_hir_owner_nodes,fn_sig,typeck")]
+    #[rustc_clean(cfg="cfail5", except="opt_hir_owner_nodes,fn_sig,typeck_root")]
     #[rustc_clean(cfg="cfail6")]
     pub extern "C" fn make_method_extern(&self) { }
 }
@@ -408,12 +398,12 @@ impl Foo {
 #[cfg(not(any(cfail1,cfail4)))]
 #[rustc_clean(cfg="cfail2")]
 #[rustc_clean(cfg="cfail3")]
-#[rustc_clean(cfg="cfail5")]
+#[rustc_clean(except="opt_hir_owner_nodes", cfg="cfail5")]
 #[rustc_clean(cfg="cfail6")]
 impl Foo {
-    #[rustc_clean(cfg="cfail2", except="opt_hir_owner_nodes,fn_sig,typeck")]
+    #[rustc_clean(cfg="cfail2", except="opt_hir_owner_nodes,fn_sig,typeck_root")]
     #[rustc_clean(cfg="cfail3")]
-    #[rustc_clean(cfg="cfail5", except="opt_hir_owner_nodes,fn_sig,typeck")]
+    #[rustc_clean(cfg="cfail5", except="opt_hir_owner_nodes,fn_sig,typeck_root")]
     #[rustc_clean(cfg="cfail6")]
     pub extern "system" fn change_method_calling_convention(&self) { }
 }
@@ -442,18 +432,18 @@ impl Foo {
 #[cfg(not(any(cfail1,cfail4)))]
 #[rustc_clean(cfg="cfail2")]
 #[rustc_clean(cfg="cfail3")]
-#[rustc_clean(cfg="cfail5")]
+#[rustc_clean(except="opt_hir_owner_nodes", cfg="cfail5")]
 #[rustc_clean(cfg="cfail6")]
 impl Foo {
-    // Warning: Note that `typeck` are coming up clean here.
+    // Warning: Note that `typeck_root` are coming up clean here.
     // The addition or removal of lifetime parameters that don't
     // appear in the arguments or fn body in any way does not, in
-    // fact, affect the `typeck` in any semantic way (at least
+    // fact, affect the `typeck_root` in any semantic way (at least
     // as of this writing). **However,** altering the order of
-    // lowering **can** cause it appear to affect the `typeck`:
+    // lowering **can** cause it appear to affect the `typeck_root`:
     // if we lower generics before the body, then the `HirId` for
     // things in the body will be affected. So if you start to see
-    // `typeck` appear dirty, that might be the cause. -nmatsakis
+    // `typeck_root` appear dirty, that might be the cause. -nmatsakis
     #[rustc_clean(cfg="cfail2", except="opt_hir_owner_nodes,fn_sig")]
     #[rustc_clean(cfg="cfail3")]
     #[rustc_clean(cfg="cfail5", except="opt_hir_owner_nodes,fn_sig,generics_of")]
@@ -491,17 +481,17 @@ impl Foo {
 #[cfg(not(any(cfail1,cfail4)))]
 #[rustc_clean(cfg="cfail2")]
 #[rustc_clean(cfg="cfail3")]
-#[rustc_clean(cfg="cfail5")]
+#[rustc_clean(except="opt_hir_owner_nodes", cfg="cfail5")]
 #[rustc_clean(cfg="cfail6")]
 impl Foo {
-    // Warning: Note that `typeck` are coming up clean here.
+    // Warning: Note that `typeck_root` are coming up clean here.
     // The addition or removal of type parameters that don't appear in
     // the arguments or fn body in any way does not, in fact, affect
-    // the `typeck` in any semantic way (at least as of this
+    // the `typeck_root` in any semantic way (at least as of this
     // writing). **However,** altering the order of lowering **can**
-    // cause it appear to affect the `typeck`: if we lower
+    // cause it appear to affect the `typeck_root`: if we lower
     // generics before the body, then the `HirId` for things in the
-    // body will be affected. So if you start to see `typeck`
+    // body will be affected. So if you start to see `typeck_root`
     // appear dirty, that might be the cause. -nmatsakis
     #[rustc_clean(
         cfg="cfail2",
@@ -583,17 +573,17 @@ impl Foo {
 #[cfg(not(any(cfail1,cfail4)))]
 #[rustc_clean(cfg="cfail2")]
 #[rustc_clean(cfg="cfail3")]
-#[rustc_clean(cfg="cfail5")]
+#[rustc_clean(except="opt_hir_owner_nodes", cfg="cfail5")]
 #[rustc_clean(cfg="cfail6")]
 impl Foo {
-    // Warning: Note that `typeck` are coming up clean here.
+    // Warning: Note that `typeck_root` are coming up clean here.
     // The addition or removal of bounds that don't appear in the
     // arguments or fn body in any way does not, in fact, affect the
-    // `typeck` in any semantic way (at least as of this
+    // `typeck_root` in any semantic way (at least as of this
     // writing). **However,** altering the order of lowering **can**
-    // cause it appear to affect the `typeck`: if we lower
+    // cause it appear to affect the `typeck_root`: if we lower
     // generics before the body, then the `HirId` for things in the
-    // body will be affected. So if you start to see `typeck`
+    // body will be affected. So if you start to see `typeck_root`
     // appear dirty, that might be the cause. -nmatsakis
     #[rustc_clean(
         cfg="cfail2",
@@ -632,17 +622,17 @@ impl Foo {
 #[cfg(not(any(cfail1,cfail4)))]
 #[rustc_clean(cfg="cfail2")]
 #[rustc_clean(cfg="cfail3")]
-#[rustc_clean(cfg="cfail5")]
+#[rustc_clean(except="opt_hir_owner_nodes", cfg="cfail5")]
 #[rustc_clean(cfg="cfail6")]
 impl Foo {
-    // Warning: Note that `typeck` are coming up clean here.
+    // Warning: Note that `typeck_root` are coming up clean here.
     // The addition or removal of bounds that don't appear in the
     // arguments or fn body in any way does not, in fact, affect the
-    // `typeck` in any semantic way (at least as of this
+    // `typeck_root` in any semantic way (at least as of this
     // writing). **However,** altering the order of lowering **can**
-    // cause it appear to affect the `typeck`: if we lower
+    // cause it appear to affect the `typeck_root`: if we lower
     // generics before the body, then the `HirId` for things in the
-    // body will be affected. So if you start to see `typeck`
+    // body will be affected. So if you start to see `typeck_root`
     // appear dirty, that might be the cause. -nmatsakis
     #[rustc_clean(cfg="cfail2", except="opt_hir_owner_nodes,predicates_of")]
     #[rustc_clean(cfg="cfail3")]
@@ -660,7 +650,7 @@ impl Foo {
     //--------------------------
     //--------------------------
     //--------------------------
-    //----------
+    //------------------
     pub fn add_no_mangle_to_method(&self) { }
 }
 
@@ -674,7 +664,7 @@ impl Foo {
     #[rustc_clean(cfg="cfail3")]
     #[rustc_clean(cfg="cfail5")]
     #[rustc_clean(cfg="cfail6")]
-    #[no_mangle]
+    #[unsafe(no_mangle)]
     pub fn add_no_mangle_to_method(&self) { }
 }
 
@@ -696,12 +686,12 @@ impl Bar<u32> {
 impl<T> Bar<T> {
     #[rustc_clean(
         cfg="cfail2",
-        except="generics_of,fn_sig,typeck,type_of,optimized_mir"
+        except="generics_of,fn_sig,typeck_root,type_of,optimized_mir"
     )]
     #[rustc_clean(cfg="cfail3")]
     #[rustc_clean(
         cfg="cfail5",
-        except="generics_of,fn_sig,typeck,type_of,optimized_mir"
+        except="generics_of,fn_sig,typeck_root,type_of,optimized_mir"
     )]
     #[rustc_clean(cfg="cfail6")]
     pub fn add_type_parameter_to_impl(&self) { }
@@ -721,9 +711,9 @@ impl Bar<u32> {
 #[rustc_clean(cfg="cfail5", except="opt_hir_owner_nodes")]
 #[rustc_clean(cfg="cfail6")]
 impl Bar<u64> {
-    #[rustc_clean(cfg="cfail2", except="fn_sig,optimized_mir,typeck")]
+    #[rustc_clean(cfg="cfail2", except="fn_sig,optimized_mir,typeck_root")]
     #[rustc_clean(cfg="cfail3")]
-    #[rustc_clean(cfg="cfail5", except="fn_sig,optimized_mir,typeck")]
+    #[rustc_clean(cfg="cfail5", except="fn_sig,optimized_mir,typeck_root")]
     #[rustc_clean(cfg="cfail6")]
     pub fn change_impl_self_type(&self) { }
 }

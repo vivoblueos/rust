@@ -1,11 +1,9 @@
+use rustc_hir::def_id::DefId;
 use rustc_middle::traits::solve::Goal;
-use rustc_middle::ty::relate::combine::{super_combine_consts, super_combine_tys};
-use rustc_middle::ty::relate::{
-    Relate, RelateResult, TypeRelation, relate_args_invariantly, relate_args_with_variances,
-};
-use rustc_middle::ty::{self, Ty, TyCtxt, TyVar};
+use rustc_middle::ty::relate::combine::{combine_ty_args, super_combine_consts, super_combine_tys};
+use rustc_middle::ty::relate::{Relate, RelateResult, TypeRelation, relate_args_invariantly};
+use rustc_middle::ty::{self, DelayedSet, Ty, TyCtxt, TyVar};
 use rustc_span::Span;
-use rustc_type_ir::data_structures::DelayedSet;
 use tracing::{debug, instrument};
 
 use crate::infer::BoundRegionConversionTime::HigherRankedType;
@@ -80,21 +78,24 @@ impl<'tcx> TypeRelation<TyCtxt<'tcx>> for TypeRelating<'_, 'tcx> {
         self.infcx.tcx
     }
 
-    fn relate_item_args(
+    fn relate_ty_args(
         &mut self,
-        item_def_id: rustc_hir::def_id::DefId,
-        a_arg: ty::GenericArgsRef<'tcx>,
-        b_arg: ty::GenericArgsRef<'tcx>,
-    ) -> RelateResult<'tcx, ty::GenericArgsRef<'tcx>> {
+        a_ty: Ty<'tcx>,
+        b_ty: Ty<'tcx>,
+        def_id: DefId,
+        a_args: ty::GenericArgsRef<'tcx>,
+        b_args: ty::GenericArgsRef<'tcx>,
+        _: impl FnOnce(ty::GenericArgsRef<'tcx>) -> Ty<'tcx>,
+    ) -> RelateResult<'tcx, Ty<'tcx>> {
         if self.ambient_variance == ty::Invariant {
             // Avoid fetching the variance if we are in an invariant
             // context; no need, and it can induce dependency cycles
             // (e.g., #41849).
-            relate_args_invariantly(self, a_arg, b_arg)
+            relate_args_invariantly(self, a_args, b_args)?;
+            Ok(a_ty)
         } else {
-            let tcx = self.cx();
-            let opt_variances = tcx.variances_of(item_def_id);
-            relate_args_with_variances(self, item_def_id, opt_variances, a_arg, b_arg, false)
+            let variances = self.cx().variances_of(def_id);
+            combine_ty_args(self.infcx, self, a_ty, b_ty, variances, a_args, b_args, |_| a_ty)
         }
     }
 
@@ -183,14 +184,14 @@ impl<'tcx> TypeRelation<TyCtxt<'tcx>> for TypeRelating<'_, 'tcx> {
             }
 
             (
-                &ty::Alias(ty::Opaque, ty::AliasTy { def_id: a_def_id, .. }),
-                &ty::Alias(ty::Opaque, ty::AliasTy { def_id: b_def_id, .. }),
+                &ty::Alias(ty::AliasTy { kind: ty::Opaque { def_id: a_def_id }, .. }),
+                &ty::Alias(ty::AliasTy { kind: ty::Opaque { def_id: b_def_id }, .. }),
             ) if a_def_id == b_def_id => {
                 super_combine_tys(infcx, self, a, b)?;
             }
 
-            (&ty::Alias(ty::Opaque, ty::AliasTy { def_id, .. }), _)
-            | (_, &ty::Alias(ty::Opaque, ty::AliasTy { def_id, .. }))
+            (&ty::Alias(ty::AliasTy { kind: ty::Opaque { def_id }, .. }), _)
+            | (_, &ty::Alias(ty::AliasTy { kind: ty::Opaque { def_id }, .. }))
                 if self.define_opaque_types == DefineOpaqueTypes::Yes && def_id.is_local() =>
             {
                 self.register_goals(infcx.handle_opaque_type(

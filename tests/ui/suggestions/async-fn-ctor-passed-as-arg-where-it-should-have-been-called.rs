@@ -1,5 +1,6 @@
 //@ edition:2018
-#![feature(async_closure)]
+//@ run-rustfix
+#![allow(unused_variables)]
 use std::future::Future;
 
 async fn foo() {}

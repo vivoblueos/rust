@@ -8,13 +8,13 @@
 
 struct Foo(u64);
 impl Foo {
-    #[rustfmt::skip] // rustfmt is wrong about which line contains an error
-    fn add(&mut self, n: u64) -> u64 { //~ ERROR: /reborrow through .* is forbidden/
+    fn add(&mut self, n: u64) -> u64 {
+        //~^ ERROR: /reborrow through .* is forbidden/
         self.0 + n
     }
 }
 
-pub fn main() {
+fn main() {
     let mut f = Foo(0);
     let alias = &mut f.0 as *mut u64;
     let res = f.add(unsafe {

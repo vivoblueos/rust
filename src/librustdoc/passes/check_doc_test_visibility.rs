@@ -6,7 +6,8 @@
 //! - PRIVATE_DOC_TESTS: this lint is **STABLE** and looks for private items with doctests.
 
 use rustc_hir as hir;
-use rustc_middle::lint::LintLevelSource;
+use rustc_macros::Diagnostic;
+use rustc_middle::lint::{LevelAndSource, LintLevelSource};
 use rustc_session::lint;
 use tracing::debug;
 
@@ -34,7 +35,7 @@ pub(crate) fn check_doc_test_visibility(krate: Crate, cx: &mut DocContext<'_>) -
     krate
 }
 
-impl<'a, 'tcx> DocVisitor<'_> for DocTestVisibilityLinter<'a, 'tcx> {
+impl DocVisitor<'_> for DocTestVisibilityLinter<'_, '_> {
     fn visit_item(&mut self, item: &Item) {
         look_for_tests(self.cx, &item.doc_value(), item);
 
@@ -55,13 +56,12 @@ impl crate::doctest::DocTestVisitor for Tests {
 }
 
 pub(crate) fn should_have_doc_example(cx: &DocContext<'_>, item: &clean::Item) -> bool {
-    if !cx.cache.effective_visibilities.is_directly_public(cx.tcx, item.item_id.expect_def_id())
+    if !(cx.cache.effective_visibilities.is_directly_public(cx.tcx, item.item_id.expect_def_id())
+        || item.is_exported_macro())
         || matches!(
             item.kind,
             clean::StructFieldItem(_)
                 | clean::VariantItem(_)
-                | clean::AssocConstItem(..)
-                | clean::AssocTypeItem(..)
                 | clean::TypeAliasItem(_)
                 | clean::StaticItem(_)
                 | clean::ConstantItem(..)
@@ -69,8 +69,19 @@ pub(crate) fn should_have_doc_example(cx: &DocContext<'_>, item: &clean::Item) -
                 | clean::ImportItem(_)
                 | clean::PrimitiveItem(_)
                 | clean::KeywordItem
-                // check for trait impl
-                | clean::ImplItem(box clean::Impl { trait_: Some(_), .. })
+                | clean::AttributeItem
+                | clean::ModuleItem(_)
+                | clean::TraitAliasItem(_)
+                | clean::ForeignFunctionItem(..)
+                | clean::ForeignStaticItem(..)
+                | clean::ForeignTypeItem
+                | clean::AssocTypeItem(..)
+                | clean::RequiredAssocConstItem(..)
+                | clean::ProvidedAssocConstItem(..)
+                | clean::ImplAssocConstItem(..)
+                | clean::RequiredAssocTypeItem(..)
+                | clean::ImplItem(_)
+                | clean::PlaceholderImplItem
         )
     {
         return false;
@@ -93,20 +104,28 @@ pub(crate) fn should_have_doc_example(cx: &DocContext<'_>, item: &clean::Item) -
         return false;
     }
 
-    if (!cx.render_options.document_hidden
+    if (!cx.document_hidden()
         && (cx.tcx.is_doc_hidden(def_id.to_def_id()) || inherits_doc_hidden(cx.tcx, def_id, None)))
         || cx.tcx.def_span(def_id.to_def_id()).in_derive_expansion()
     {
         return false;
     }
-    let (level, source) = cx.tcx.lint_level_at_node(
+    let LevelAndSource { level, src, .. } = cx.tcx.lint_level_at_node(
         crate::lint::MISSING_DOC_CODE_EXAMPLES,
         cx.tcx.local_def_id_to_hir_id(def_id),
     );
-    level != lint::Level::Allow || matches!(source, LintLevelSource::Default)
+    level != lint::Level::Allow || matches!(src, LintLevelSource::Default)
 }
 
-pub(crate) fn look_for_tests<'tcx>(cx: &DocContext<'tcx>, dox: &str, item: &Item) {
+pub(crate) fn look_for_tests(cx: &DocContext<'_>, dox: &str, item: &Item) {
+    #[derive(Diagnostic)]
+    #[diag("missing code example in this documentation")]
+    struct MissingCodeExample;
+
+    #[derive(Diagnostic)]
+    #[diag("documentation test in private item")]
+    struct DoctestInPrivateItem;
+
     let Some(hir_id) = DocContext::as_local_hir_id(cx.tcx, item.item_id) else {
         // If non-local, no need to check anything.
         return;
@@ -114,26 +133,27 @@ pub(crate) fn look_for_tests<'tcx>(cx: &DocContext<'tcx>, dox: &str, item: &Item
 
     let mut tests = Tests { found_tests: 0 };
 
-    find_testable_code(dox, &mut tests, ErrorCodes::No, false, None);
+    find_testable_code(dox, &mut tests, ErrorCodes::No, None);
 
     if tests.found_tests == 0 && cx.tcx.features().rustdoc_missing_doc_code_examples() {
         if should_have_doc_example(cx, item) {
             debug!("reporting error for {item:?} (hir_id={hir_id:?})");
             let sp = item.attr_span(cx.tcx);
-            cx.tcx.node_span_lint(crate::lint::MISSING_DOC_CODE_EXAMPLES, hir_id, sp, |lint| {
-                lint.primary_message("missing code example in this documentation");
-            });
+            cx.tcx.emit_node_span_lint(
+                crate::lint::MISSING_DOC_CODE_EXAMPLES,
+                hir_id,
+                sp,
+                MissingCodeExample,
+            );
         }
     } else if tests.found_tests > 0
         && !cx.cache.effective_visibilities.is_exported(cx.tcx, item.item_id.expect_def_id())
     {
-        cx.tcx.node_span_lint(
+        cx.tcx.emit_node_span_lint(
             crate::lint::PRIVATE_DOC_TESTS,
             hir_id,
             item.attr_span(cx.tcx),
-            |lint| {
-                lint.primary_message("documentation test in private item");
-            },
+            DoctestInPrivateItem,
         );
     }
 }

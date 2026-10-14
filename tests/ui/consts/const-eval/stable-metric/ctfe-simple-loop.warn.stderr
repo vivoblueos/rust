@@ -2,15 +2,12 @@ warning: constant evaluation is taking a long time
   --> $DIR/ctfe-simple-loop.rs:10:5
    |
 LL | /     while index < n {
-LL | |
-LL | |
-LL | |
-LL | |         index = index + 1;
+...  |
 LL | |     }
    | |_____^
    |
    = note: this lint makes sure the compiler doesn't get stuck due to infinite loops in const eval.
-           If your compilation actually takes a long time, you can safely allow the lint.
+           If your compilation actually takes a long time, you can safely allow the lint
 help: the constant being evaluated
   --> $DIR/ctfe-simple-loop.rs:19:1
    |
@@ -26,15 +23,12 @@ warning: constant evaluation is taking a long time
   --> $DIR/ctfe-simple-loop.rs:10:5
    |
 LL | /     while index < n {
-LL | |
-LL | |
-LL | |
-LL | |         index = index + 1;
+...  |
 LL | |     }
    | |_____^
    |
    = note: this lint makes sure the compiler doesn't get stuck due to infinite loops in const eval.
-           If your compilation actually takes a long time, you can safely allow the lint.
+           If your compilation actually takes a long time, you can safely allow the lint
 help: the constant being evaluated
   --> $DIR/ctfe-simple-loop.rs:20:1
    |
@@ -45,10 +39,7 @@ warning: constant evaluation is taking a long time
   --> $DIR/ctfe-simple-loop.rs:10:5
    |
 LL | /     while index < n {
-LL | |
-LL | |
-LL | |
-LL | |         index = index + 1;
+...  |
 LL | |     }
    | |_____^ the const evaluator is currently interpreting this expression
    |

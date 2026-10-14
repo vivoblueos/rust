@@ -1,15 +1,14 @@
 // issue-103476
-//@ compile-flags: -Zlint-mir -Zunstable-options
+//@ compile-flags: -Zlint-mir
 //@ edition: 2024
 //@ check-pass
 
-#![feature(let_chains)]
 #![allow(irrefutable_let_patterns)]
 
 struct Pd;
 
 impl Pd {
-    fn it(&self) -> It {
+    fn it(&self) -> It<'_> {
         todo!()
     }
 }

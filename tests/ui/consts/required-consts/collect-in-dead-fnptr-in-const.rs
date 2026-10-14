@@ -3,10 +3,10 @@
 //@[noopt] compile-flags: -Copt-level=0
 //@[opt] compile-flags: -O
 //! This fails without optimizations, so it should also fail with optimizations.
-
+//@ ignore-parallel-frontend post-monomorphization errors
 struct Late<T>(T);
 impl<T> Late<T> {
-    const FAIL: () = panic!(); //~ERROR evaluation of `Late::<i32>::FAIL` failed
+    const FAIL: () = panic!(); //~ERROR evaluation panicked: explicit panic
     const FNPTR: fn() = || Self::FAIL;
 }
 

@@ -1,5 +1,4 @@
 //@ run-pass
-//@ pretty-expanded FIXME #23616
 
 #![deny(unused_mut)]
 #![allow(unused_must_use)]
@@ -14,11 +13,17 @@ fn set(x: &mut usize) { *x = 42; }
 fn main() {
     {
         let mut x = 0_usize;
-        move || x += 1; //~ WARN unused variable: `x`
+        //~^ WARN unused variable: `x`
+        move || x += 1;
+        //~^ WARN value captured by `x` is never read
+        //~| WARN value assigned to `x` is never read
     }
     {
         let mut x = 0_usize;
-        move || x += 1; //~ WARN unused variable: `x`
+        //~^ WARN unused variable: `x`
+        move || x += 1;
+        //~^ WARN value captured by `x` is never read
+        //~| WARN value assigned to `x` is never read
     }
     {
         let mut x = 0_usize;

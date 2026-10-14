@@ -39,7 +39,8 @@ declare_clippy_lint! {
     "useless use of `format!`"
 }
 
-#[allow(clippy::module_name_repetitions)]
+impl_lint_pass!(UselessFormat => [USELESS_FORMAT]);
+
 pub struct UselessFormat {
     format_args: FormatArgsStorage,
 }
@@ -49,8 +50,6 @@ impl UselessFormat {
         Self { format_args }
     }
 }
-
-impl_lint_pass!(UselessFormat => [USELESS_FORMAT]);
 
 impl<'tcx> LateLintPass<'tcx> for UselessFormat {
     fn check_expr(&mut self, cx: &LateContext<'tcx>, expr: &'tcx Expr<'_>) {
@@ -94,7 +93,7 @@ impl<'tcx> LateLintPass<'tcx> for UselessFormat {
                                 .into_owned()
                         } else {
                             let sugg = Sugg::hir_with_context(cx, value, call_site.ctxt(), "<arg>", &mut applicability);
-                            format!("{}.to_string()", sugg.maybe_par())
+                            format!("{}.to_string()", sugg.maybe_paren())
                         };
                         span_useless_format(cx, call_site, sugg, applicability);
                     }

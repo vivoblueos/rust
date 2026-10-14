@@ -1,6 +1,7 @@
 //@ check-pass
 //@ edition:2018
-//@ aux-build:edition-imports-2015.rs
+//@ proc-macro: edition-imports-2015.rs
+//@ ignore-backends: gcc
 
 #[macro_use]
 extern crate edition_imports_2015;

@@ -8,12 +8,12 @@ use std::mem::transmute;
 
 // Make sure we can do static lifetime transmutes
 unsafe fn transmute_lifetime_to_static<'a, T>(t: &'a T) -> &'static T {
-    transmute::<&'a T, &'static T>(t)
+    unsafe { transmute::<&'a T, &'static T>(t) }
 }
 
 // Make sure we can do non-static lifetime transmutes
 unsafe fn transmute_lifetime<'a, 'b, T>(t: &'a T, u: &'b T) -> &'b T {
-    transmute::<&'a T, &'b T>(t)
+    unsafe { transmute::<&'a T, &'b T>(t) }
 }
 
 struct LifetimeParam<'a> {
@@ -24,6 +24,13 @@ struct GenericParam<T> {
     t: T,
 }
 
+#[derive(Clone, Copy)]
+struct PtrNamed {
+    ptr: *const u32,
+}
+#[derive(Clone, Copy)]
+struct Ptr(*const u32);
+
 fn transmute_ptr_to_ptr() {
     let ptr = &1u32 as *const u32;
     let mut_ptr = &mut 1u32 as *mut u32;
@@ -31,24 +38,32 @@ fn transmute_ptr_to_ptr() {
         // pointer-to-pointer transmutes; bad
         let _: *const f32 = transmute(ptr);
         //~^ transmute_ptr_to_ptr
+
         let _: *mut f32 = transmute(mut_ptr);
         //~^ transmute_ptr_to_ptr
+
         // ref-ref transmutes; bad
         let _: &f32 = transmute(&1u32);
         //~^ transmute_ptr_to_ptr
+
         let _: &f32 = transmute(&1f64);
         //~^ transmute_ptr_to_ptr
+
         //:^ this test is here because both f32 and f64 are the same TypeVariant, but they are not
         // the same type
         let _: &mut f32 = transmute(&mut 1u32);
         //~^ transmute_ptr_to_ptr
+
         let _: &GenericParam<f32> = transmute(&GenericParam { t: 1u32 });
         //~^ transmute_ptr_to_ptr
+
         let u64_ref: &u64 = &0u64;
         let u8_ref: &u8 = transmute(u64_ref);
         //~^ transmute_ptr_to_ptr
+
         let _: *const u32 = transmute(mut_ptr);
         //~^ transmute_ptr_to_ptr
+
         let _: *mut u32 = transmute(ptr);
         //~^ transmute_ptr_to_ptr
     }
@@ -58,6 +73,18 @@ fn transmute_ptr_to_ptr() {
     let lp = LifetimeParam { s: &s };
     let _: &LifetimeParam<'static> = unsafe { transmute(&lp) };
     let _: &GenericParam<&LifetimeParam<'static>> = unsafe { transmute(&GenericParam { t: &lp }) };
+}
+
+fn issue1966() {
+    let ptr = &1u32 as *const u32;
+    unsafe {
+        let _: *const f32 = transmute(Ptr(ptr));
+        //~^ transmute_ptr_to_ptr
+        let _: *const f32 = transmute(PtrNamed { ptr });
+        //~^ transmute_ptr_to_ptr
+        let _: *mut u32 = transmute(Ptr(ptr));
+        //~^ transmute_ptr_to_ptr
+    }
 }
 
 fn lifetime_to_static(v: *mut &()) -> *const &'static () {
@@ -73,10 +100,15 @@ const _: &() = {
     unsafe { transmute::<&'static Zst, &'static ()>(zst) }
 };
 
+#[derive(Clone, Copy)]
+struct Ptr8(*const u8);
 #[clippy::msrv = "1.37"]
 fn msrv_1_37(ptr: *const u8) {
     unsafe {
         let _: *const i8 = transmute(ptr);
+        //~^ transmute_ptr_to_ptr
+        let _: *const i8 = transmute(Ptr8(ptr));
+        //~^ transmute_ptr_to_ptr
     }
 }
 
@@ -84,6 +116,7 @@ fn msrv_1_37(ptr: *const u8) {
 fn msrv_1_38(ptr: *const u8) {
     unsafe {
         let _: *const i8 = transmute(ptr);
+        //~^ transmute_ptr_to_ptr
     }
 }
 
@@ -91,7 +124,9 @@ fn msrv_1_38(ptr: *const u8) {
 fn msrv_1_64(ptr: *const u8, mut_ptr: *mut u8) {
     unsafe {
         let _: *mut u8 = transmute(ptr);
+        //~^ transmute_ptr_to_ptr
         let _: *const u8 = transmute(mut_ptr);
+        //~^ transmute_ptr_to_ptr
     }
 }
 
@@ -99,7 +134,9 @@ fn msrv_1_64(ptr: *const u8, mut_ptr: *mut u8) {
 fn msrv_1_65(ptr: *const u8, mut_ptr: *mut u8) {
     unsafe {
         let _: *mut u8 = transmute(ptr);
+        //~^ transmute_ptr_to_ptr
         let _: *const u8 = transmute(mut_ptr);
+        //~^ transmute_ptr_to_ptr
     }
 }
 

@@ -6,58 +6,28 @@ use rustc_ast::ast::{Expr, ExprKind, LitKind};
 use rustc_ast::token;
 use rustc_errors::Applicability;
 use rustc_lint::{EarlyContext, EarlyLintPass, Lint, LintContext};
-use rustc_middle::lint::in_external_macro;
 use rustc_session::impl_lint_pass;
 use rustc_span::Span;
 use std::iter;
 
 declare_clippy_lint! {
     /// ### What it does
-    /// Warns if a long integral or floating-point constant does
-    /// not contain underscores.
+    /// Warns if there is a better representation for a numeric literal.
     ///
-    /// ### Why is this bad?
-    /// Reading long numbers is difficult without separators.
+    /// ### Why restrict this?
+    /// Especially for big powers of 2, a hexadecimal representation is usually more
+    /// readable than a decimal representation.
     ///
     /// ### Example
-    /// ```no_run
-    /// # let _: u64 =
-    /// 61864918973511
-    /// # ;
-    /// ```
-    ///
-    /// Use instead:
-    /// ```no_run
-    /// # let _: u64 =
-    /// 61_864_918_973_511
-    /// # ;
+    /// ```text
+    /// `255` => `0xFF`
+    /// `65_535` => `0xFFFF`
+    /// `4_042_322_160` => `0xF0F0_F0F0`
     /// ```
     #[clippy::version = "pre 1.29.0"]
-    pub UNREADABLE_LITERAL,
-    pedantic,
-    "long literal without underscores"
-}
-
-declare_clippy_lint! {
-    /// ### What it does
-    /// Warns for mistyped suffix in literals
-    ///
-    /// ### Why is this bad?
-    /// This is most probably a typo
-    ///
-    /// ### Known problems
-    /// - Does not match on integers too large to fit in the corresponding unsigned type
-    /// - Does not match on `_127` since that is a valid grouping for decimal and octal numbers
-    ///
-    /// ### Example
-    /// ```ignore
-    /// `2_32` => `2_i32`
-    /// `250_8 => `250_u8`
-    /// ```
-    #[clippy::version = "1.30.0"]
-    pub MISTYPED_LITERAL_SUFFIXES,
-    correctness,
-    "mistyped literal suffix"
+    pub DECIMAL_LITERAL_REPRESENTATION,
+    restriction,
+    "using decimal representation when hexadecimal would be better"
 }
 
 declare_clippy_lint! {
@@ -90,25 +60,6 @@ declare_clippy_lint! {
 
 declare_clippy_lint! {
     /// ### What it does
-    /// Warns if hexadecimal or binary literals are not grouped
-    /// by nibble or byte.
-    ///
-    /// ### Why is this bad?
-    /// Negatively impacts readability.
-    ///
-    /// ### Example
-    /// ```no_run
-    /// let x: u32 = 0xFFF_FFF;
-    /// let y: u8 = 0b01_011_101;
-    /// ```
-    #[clippy::version = "1.49.0"]
-    pub UNUSUAL_BYTE_GROUPINGS,
-    style,
-    "binary or hex literals that aren't grouped by four"
-}
-
-declare_clippy_lint! {
-    /// ### What it does
     /// Warns if the digits of an integral or floating-point
     /// constant are grouped into groups that
     /// are too large.
@@ -128,23 +79,81 @@ declare_clippy_lint! {
 
 declare_clippy_lint! {
     /// ### What it does
-    /// Warns if there is a better representation for a numeric literal.
+    /// Warns for mistyped suffix in literals
     ///
-    /// ### Why restrict this?
-    /// Especially for big powers of 2, a hexadecimal representation is usually more
-    /// readable than a decimal representation.
+    /// ### Why is this bad?
+    /// This is most probably a typo
+    ///
+    /// ### Known problems
+    /// - Does not match on integers too large to fit in the corresponding unsigned type
+    /// - Does not match on `_127` since that is a valid grouping for decimal and octal numbers
     ///
     /// ### Example
-    /// ```text
-    /// `255` => `0xFF`
-    /// `65_535` => `0xFFFF`
-    /// `4_042_322_160` => `0xF0F0_F0F0`
+    /// ```ignore
+    /// `2_32` => `2_i32`
+    /// `250_8 => `250_u8`
+    /// ```
+    #[clippy::version = "1.30.0"]
+    pub MISTYPED_LITERAL_SUFFIXES,
+    correctness,
+    "mistyped literal suffix"
+}
+
+declare_clippy_lint! {
+    /// ### What it does
+    /// Warns if a long integral or floating-point constant does
+    /// not contain underscores.
+    ///
+    /// ### Why is this bad?
+    /// Reading long numbers is difficult without separators.
+    ///
+    /// ### Example
+    /// ```no_run
+    /// # let _: u64 =
+    /// 61864918973511
+    /// # ;
+    /// ```
+    ///
+    /// Use instead:
+    /// ```no_run
+    /// # let _: u64 =
+    /// 61_864_918_973_511
+    /// # ;
     /// ```
     #[clippy::version = "pre 1.29.0"]
-    pub DECIMAL_LITERAL_REPRESENTATION,
-    restriction,
-    "using decimal representation when hexadecimal would be better"
+    pub UNREADABLE_LITERAL,
+    pedantic,
+    "long literal without underscores"
 }
+
+declare_clippy_lint! {
+    /// ### What it does
+    /// Warns if hexadecimal or binary literals are not grouped
+    /// by nibble or byte.
+    ///
+    /// ### Why is this bad?
+    /// Negatively impacts readability.
+    ///
+    /// ### Example
+    /// ```no_run
+    /// let x: u32 = 0xFFF_FFF;
+    /// let y: u8 = 0b01_011_101;
+    /// ```
+    #[clippy::version = "1.49.0"]
+    pub UNUSUAL_BYTE_GROUPINGS,
+    style,
+    "binary or hex literals that aren't grouped by four"
+}
+
+impl_lint_pass!(DecimalLiteralRepresentation => [DECIMAL_LITERAL_REPRESENTATION]);
+
+impl_lint_pass!(LiteralDigitGrouping => [
+    INCONSISTENT_DIGIT_GROUPING,
+    LARGE_DIGIT_GROUPS,
+    MISTYPED_LITERAL_SUFFIXES,
+    UNREADABLE_LITERAL,
+    UNUSUAL_BYTE_GROUPINGS,
+]);
 
 enum WarningType {
     UnreadableLiteral,
@@ -196,18 +205,10 @@ pub struct LiteralDigitGrouping {
     lint_fraction_readability: bool,
 }
 
-impl_lint_pass!(LiteralDigitGrouping => [
-    UNREADABLE_LITERAL,
-    INCONSISTENT_DIGIT_GROUPING,
-    LARGE_DIGIT_GROUPS,
-    MISTYPED_LITERAL_SUFFIXES,
-    UNUSUAL_BYTE_GROUPINGS,
-]);
-
 impl EarlyLintPass for LiteralDigitGrouping {
     fn check_expr(&mut self, cx: &EarlyContext<'_>, expr: &Expr) {
         if let ExprKind::Lit(lit) = expr.kind
-            && !in_external_macro(cx.sess(), expr.span)
+            && !expr.span.in_external_macro(cx.sess().source_map())
         {
             self.check_lit(cx, lit, expr.span);
         }
@@ -251,7 +252,7 @@ impl LiteralDigitGrouping {
                     );
                     if !consistent {
                         return Err(WarningType::InconsistentDigitGrouping);
-                    };
+                    }
                 }
 
                 Ok(())
@@ -388,12 +389,11 @@ impl LiteralDigitGrouping {
 
         let first = groups.next().expect("At least one group");
 
-        if radix == Radix::Binary || radix == Radix::Octal || radix == Radix::Hexadecimal {
-            if let Some(second_size) = groups.next() {
-                if !groups.all(|i| i == second_size) || first > second_size {
-                    return Err(WarningType::UnusualByteGroupings);
-                }
-            }
+        if (radix == Radix::Binary || radix == Radix::Octal || radix == Radix::Hexadecimal)
+            && let Some(second_size) = groups.next()
+            && (!groups.all(|i| i == second_size) || first > second_size)
+        {
+            return Err(WarningType::UnusualByteGroupings);
         }
 
         if let Some(second) = groups.next() {
@@ -416,12 +416,10 @@ pub struct DecimalLiteralRepresentation {
     threshold: u64,
 }
 
-impl_lint_pass!(DecimalLiteralRepresentation => [DECIMAL_LITERAL_REPRESENTATION]);
-
 impl EarlyLintPass for DecimalLiteralRepresentation {
     fn check_expr(&mut self, cx: &EarlyContext<'_>, expr: &Expr) {
         if let ExprKind::Lit(lit) = expr.kind
-            && !in_external_macro(cx.sess(), expr.span)
+            && !expr.span.in_external_macro(cx.sess().source_map())
         {
             self.check_lit(cx, lit, expr.span);
         }

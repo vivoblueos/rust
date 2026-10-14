@@ -1,7 +1,7 @@
 import * as vscode from "vscode";
 import * as os from "os";
 import type { Config } from "./config";
-import { type Env, log, spawnAsync } from "./util";
+import { type Env, log, RUST_TOOLCHAIN_FILES, spawnAsync } from "./util";
 import type { PersistentState } from "./persistent_state";
 import { exec } from "child_process";
 import { TextDecoder } from "node:util";
@@ -15,7 +15,7 @@ export async function bootstrap(
     if (!path) {
         throw new Error(
             "rust-analyzer Language Server is not available. " +
-                "Please, ensure its [proper installation](https://rust-analyzer.github.io/manual.html#installation).",
+                "Please, ensure its [proper installation](https://rust-analyzer.github.io/book/installation.html).",
         );
     }
 
@@ -59,8 +59,12 @@ async function getServer(
             // otherwise check if there is a toolchain override for the current vscode workspace
             // and if the toolchain of this override has a rust-analyzer component
             // if so, use the rust-analyzer component
-            const toolchainUri = vscode.Uri.joinPath(workspaceFolder.uri, "rust-toolchain.toml");
-            if (await hasToolchainFileWithRaDeclared(toolchainUri)) {
+            // Check both rust-toolchain.toml and rust-toolchain files
+            for (const toolchainFile of RUST_TOOLCHAIN_FILES) {
+                const toolchainUri = vscode.Uri.joinPath(workspaceFolder.uri, toolchainFile);
+                if (!(await hasToolchainFileWithRaDeclared(toolchainUri))) {
+                    continue;
+                }
                 const res = await spawnAsync("rustup", ["which", "rust-analyzer"], {
                     env: { ...process.env },
                     cwd: workspaceFolder.uri.fsPath,
@@ -71,6 +75,7 @@ async function getServer(
                         res.stdout.trim(),
                         raVersionResolver,
                     );
+                    break;
                 }
             }
         }
@@ -177,9 +182,9 @@ async function hasToolchainFileWithRaDeclared(uri: vscode.Uri): Promise<boolean>
             await vscode.workspace.fs.readFile(uri),
         );
         return (
-            toolchainFileContents.match(/components\s*=\s*\[.*\"rust-analyzer\".*\]/g)?.length === 1
+            toolchainFileContents.match(/components\s*=\s*\[.*"rust-analyzer".*\]/g)?.length === 1
         );
-    } catch (e) {
+    } catch (_) {
         return false;
     }
 }
@@ -187,8 +192,16 @@ async function hasToolchainFileWithRaDeclared(uri: vscode.Uri): Promise<boolean>
 export async function isValidExecutable(path: string, extraEnv: Env): Promise<boolean> {
     log.debug("Checking availability of a binary at", path);
 
+    const newEnv = { ...process.env };
+    for (const [k, v] of Object.entries(extraEnv)) {
+        if (v) {
+            newEnv[k] = v;
+        } else if (k in newEnv) {
+            delete newEnv[k];
+        }
+    }
     const res = await spawnAsync(path, ["--version"], {
-        env: { ...process.env, ...extraEnv },
+        env: newEnv,
     });
 
     if (res.error) {

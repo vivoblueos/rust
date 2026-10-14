@@ -18,13 +18,14 @@ SOURCE_FILE
       WHERE_KW "where"
       WHITESPACE "\n   "
       WHERE_PRED
-        FOR_KW "for"
-        GENERIC_PARAM_LIST
-          L_ANGLE "<"
-          LIFETIME_PARAM
-            LIFETIME
-              LIFETIME_IDENT "'a"
-          R_ANGLE ">"
+        FOR_BINDER
+          FOR_KW "for"
+          GENERIC_PARAM_LIST
+            L_ANGLE "<"
+            LIFETIME_PARAM
+              LIFETIME
+                LIFETIME_IDENT "'a"
+            R_ANGLE ">"
         WHITESPACE " "
         PATH_TYPE
           PATH
@@ -40,9 +41,9 @@ SOURCE_FILE
                 PATH_SEGMENT
                   NAME_REF
                     IDENT "Fn"
-                  PARAM_LIST
+                  PARENTHESIZED_ARG_LIST
                     L_PAREN "("
-                    PARAM
+                    TYPE_ARG
                       REF_TYPE
                         AMP "&"
                         LIFETIME

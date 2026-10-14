@@ -1,10 +1,14 @@
-//@ needs-asm-support
-//@ only-x86_64
-// Make sure rustc doesn't ICE on asm! for a foreign architecture.
-
+//@ add-minicore
+//@ compile-flags: --target x86_64-unknown-linux-gnu
+//@ needs-llvm-components: x86
 #![crate_type = "rlib"]
+#![feature(no_core)]
+#![no_core]
 
-use std::arch::asm;
+extern crate minicore;
+use minicore::*;
+
+// Make sure rustc doesn't ICE on asm! for a foreign architecture.
 
 pub unsafe fn aarch64(a: f64, b: f64) -> f64 {
     let c;
@@ -12,9 +16,9 @@ pub unsafe fn aarch64(a: f64, b: f64) -> f64 {
         || {};
         b
     });
-    //~^^^^ invalid register class
-    //~^^^^^ invalid register class
-    //~^^^^^^ invalid register
+    //~^^^^ ERROR invalid register class
+    //~^^^^^ ERROR invalid register class
+    //~^^^^^^ ERROR invalid register
     c
 }
 

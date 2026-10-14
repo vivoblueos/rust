@@ -1,6 +1,5 @@
 #![feature(coverage_attribute)]
 #![feature(custom_inner_attributes)] // for #![rustfmt::skip]
-#![feature(noop_waker)]
 #![allow(unused_assignments, dead_code)]
 #![rustfmt::skip]
 //@ edition: 2018
@@ -25,7 +24,7 @@ async fn f() -> u8 { 1 }
 
 async fn foo() -> [bool; 10] { [false; 10] } // unused function; executor does not block on `h()`
 
-pub async fn g(x: u8) {
+async fn g(x: u8) {
     match x {
         y if e().await == y => (),
         y if f().await == y => (),

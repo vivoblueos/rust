@@ -1,6 +1,10 @@
 #![feature(pointer_is_aligned_to)]
 use std::{mem, ptr, slice};
 
+#[path = "../../utils/mod.rs"]
+mod utils;
+use utils::check_nondet;
+
 fn test_memcpy() {
     unsafe {
         let src = [1i8, 2, 3];
@@ -55,12 +59,12 @@ fn test_memcpy() {
 }
 
 fn test_strcpy() {
-    use std::ffi::{CStr, CString};
+    use std::ffi::CStr;
 
     // case: src_size equals dest_size
     unsafe {
-        let src = CString::new("rust").unwrap();
-        let size = src.as_bytes_with_nul().len();
+        let src = c"rust";
+        let size = src.to_bytes_with_nul().len();
         let dest = libc::malloc(size);
         libc::strcpy(dest as *mut libc::c_char, src.as_ptr());
         assert_eq!(CStr::from_ptr(dest as *const libc::c_char), src.as_ref());
@@ -69,8 +73,8 @@ fn test_strcpy() {
 
     // case: src_size is less than dest_size
     unsafe {
-        let src = CString::new("rust").unwrap();
-        let size = src.as_bytes_with_nul().len();
+        let src = c"rust";
+        let size = src.to_bytes_with_nul().len();
         let dest = libc::malloc(size + 1);
         libc::strcpy(dest as *mut libc::c_char, src.as_ptr());
         assert_eq!(CStr::from_ptr(dest as *const libc::c_char), src.as_ref());
@@ -78,14 +82,54 @@ fn test_strcpy() {
     }
 }
 
+fn test_memset() {
+    unsafe {
+        let val = 1;
+        let dest = libc::calloc(3, 1);
+        libc::memset(dest, val, 3);
+        let slc = std::slice::from_raw_parts(dest as *const i8, 3);
+        assert_eq!(*slc, [1i8, 1, 1]);
+        libc::free(dest);
+    }
+
+    unsafe {
+        let val = 1;
+        let dest = libc::calloc(4, 1);
+        libc::memset(dest, val, 3);
+        let slc = std::slice::from_raw_parts(dest as *const i8, 4);
+        assert_eq!(*slc, [1i8, 1, 1, 0]);
+        libc::free(dest);
+    }
+
+    unsafe {
+        let val = 1;
+        let mut dest = 0_i8;
+        libc::memset(&mut dest as *mut i8 as *mut libc::c_void, val, mem::size_of::<i8>());
+        assert_eq!(dest, val as i8);
+    }
+
+    unsafe {
+        let val = 1;
+        let mut dest = 0_i16;
+        libc::memset(&mut dest as *mut i16 as *mut libc::c_void, val, mem::size_of::<i16>());
+        assert_eq!(dest, 257);
+    }
+
+    unsafe {
+        let val = 257;
+        let mut dest = 0_i16;
+        libc::memset(&mut dest as *mut i16 as *mut libc::c_void, val, mem::size_of::<i16>());
+        assert_eq!(dest, 257);
+    }
+}
+
 fn test_malloc() {
-    // Test that small allocations sometimes *are* not very aligned.
-    let saw_unaligned = (0..64).any(|_| unsafe {
+    // Test that small allocations sometimes are *not* very aligned (and sometimes they are).
+    check_nondet(|| unsafe {
         let p = libc::malloc(3);
         libc::free(p);
-        (p as usize) % 4 != 0 // find any that this is *not* 4-aligned
+        (p as usize) % 4 == 0
     });
-    assert!(saw_unaligned);
 
     unsafe {
         let p1 = libc::malloc(20);
@@ -310,4 +354,5 @@ fn main() {
 
     test_memcpy();
     test_strcpy();
+    test_memset();
 }

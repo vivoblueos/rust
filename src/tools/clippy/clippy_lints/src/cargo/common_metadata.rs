@@ -9,7 +9,7 @@ pub(super) fn check(cx: &LateContext<'_>, metadata: &Metadata, ignore_publish: b
     for package in &metadata.packages {
         // only run the lint if publish is `None` (`publish = true` or skipped entirely)
         // or if the vector isn't empty (`publish = ["something"]`)
-        if package.publish.as_ref().filter(|publish| publish.is_empty()).is_none() || ignore_publish {
+        if package.publish.as_ref().is_none_or(|publish| !publish.is_empty()) || ignore_publish {
             if is_empty_str(package.description.as_ref()) {
                 missing_warning(cx, package, "package.description");
             }
@@ -43,7 +43,7 @@ fn missing_warning(cx: &LateContext<'_>, package: &cargo_metadata::Package, fiel
 }
 
 fn is_empty_str<T: AsRef<std::ffi::OsStr>>(value: Option<&T>) -> bool {
-    value.map_or(true, |s| s.as_ref().is_empty())
+    value.is_none_or(|s| s.as_ref().is_empty())
 }
 
 fn is_empty_vec(value: &[String]) -> bool {

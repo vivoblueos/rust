@@ -10,45 +10,51 @@
 #![allow(internal_features)]
 #![allow(rustc::default_hash_types)]
 #![allow(rustc::potential_query_instability)]
+#![cfg_attr(bootstrap, feature(assert_matches))]
+#![cfg_attr(test, feature(test))]
 #![deny(unsafe_op_in_unsafe_fn)]
-#![doc(html_root_url = "https://doc.rust-lang.org/nightly/nightly-rustc/")]
-#![doc(rust_logo)]
 #![feature(allocator_api)]
-#![feature(array_windows)]
 #![feature(ascii_char)]
 #![feature(ascii_char_variants)]
-#![feature(assert_matches)]
 #![feature(auto_traits)]
-#![feature(cfg_match)]
-#![feature(core_intrinsics)]
+#![feature(const_default)]
+#![feature(const_trait_impl)]
 #![feature(dropck_eyepatch)]
 #![feature(extend_one)]
 #![feature(file_buffered)]
-#![feature(hash_raw_entry)]
-#![feature(macro_metavar_expr)]
 #![feature(map_try_insert)]
 #![feature(min_specialization)]
 #![feature(negative_impls)]
 #![feature(never_type)]
+#![feature(pattern_type_macro)]
+#![feature(pattern_types)]
 #![feature(ptr_alignment_type)]
 #![feature(rustc_attrs)]
-#![feature(rustdoc_internals)]
-#![feature(test)]
+#![feature(sized_hierarchy)]
 #![feature(thread_id_value)]
+#![feature(trusted_len)]
 #![feature(type_alias_impl_trait)]
 #![feature(unwrap_infallible)]
 // tidy-alphabetical-end
+
+// This allows derive macros to reference this crate
+extern crate self as rustc_data_structures;
 
 use std::fmt;
 
 pub use atomic_ref::AtomicRef;
 pub use ena::{snapshot_vec, undo_log, unify};
+// Re-export `hashbrown::hash_table`, because it's part of our API
+// (via `ShardedHashMap`), and because it lets other compiler crates use the
+// lower-level `HashTable` API without a tricky `hashbrown` dependency.
+pub use hashbrown::hash_table;
 pub use rustc_index::static_assert_size;
+// Re-export some data-structure crates which are part of our public API.
+pub use {either, indexmap, smallvec, thin_vec};
 
 pub mod aligned;
 pub mod base_n;
 pub mod binary_search_util;
-pub mod captures;
 pub mod fingerprint;
 pub mod flat_map_in_place;
 pub mod flock;
@@ -76,14 +82,15 @@ pub mod sync;
 pub mod tagged_ptr;
 pub mod temp_dir;
 pub mod thinvec;
+pub mod thousands;
 pub mod transitive_relation;
 pub mod unhash;
+pub mod union_find;
 pub mod unord;
 pub mod vec_cache;
 pub mod work_queue;
 
 mod atomic_ref;
-mod hashes;
 
 /// This calls the passed function while ensuring it won't be inlined into the caller.
 #[inline(never)]

@@ -1,8 +1,6 @@
 //@ edition:2018
 //@ aux-build:edition-kw-macro-2018.rs
 
-#![feature(async_closure)]
-
 fn main() {}
 
 #[macro_use]
@@ -38,6 +36,6 @@ pub fn check_async() {
     if local_passes_tt!(r#async) == 1 {} // OK
     module::async(); //~ ERROR expected identifier, found keyword `async`
     module::r#async(); // OK
-
-    let _recovery_witness: () = 0; //~ ERROR mismatched types
 }
+
+//~? ERROR macro expansion ends with an incomplete expression

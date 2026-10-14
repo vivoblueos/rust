@@ -10,21 +10,20 @@
 //! otherwise silence errors, if move analysis runs after promotion on broken
 //! MIR.
 
-use std::assert_matches::assert_matches;
 use std::cell::Cell;
-use std::{cmp, iter, mem};
+use std::{assert_matches, cmp, iter, mem};
 
 use either::{Left, Right};
 use rustc_const_eval::check_consts::{ConstCx, qualifs};
 use rustc_data_structures::fx::FxHashSet;
 use rustc_hir as hir;
-use rustc_index::{Idx, IndexSlice, IndexVec};
+use rustc_hir::def::DefKind;
+use rustc_index::{IndexSlice, IndexVec};
 use rustc_middle::mir::visit::{MutVisitor, MutatingUseContext, PlaceContext, Visitor};
 use rustc_middle::mir::*;
 use rustc_middle::ty::{self, GenericArgs, List, Ty, TyCtxt, TypeVisitableExt};
 use rustc_middle::{bug, mir, span_bug};
-use rustc_span::Span;
-use rustc_span::source_map::Spanned;
+use rustc_span::{Span, Spanned};
 use tracing::{debug, instrument};
 
 /// A `MirPass` for promotion.
@@ -60,6 +59,10 @@ impl<'tcx> crate::MirPass<'tcx> for PromoteTemps<'tcx> {
 
         let promoted = promote_candidates(body, tcx, temps, promotable_candidates);
         self.promoted_fragments.set(promoted);
+    }
+
+    fn is_required(&self) -> bool {
+        true
     }
 }
 
@@ -288,8 +291,8 @@ impl<'tcx> Validator<'_, 'tcx> {
         match elem {
             // Recurse directly.
             ProjectionElem::ConstantIndex { .. }
-            | ProjectionElem::Subtype(_)
-            | ProjectionElem::Subslice { .. } => {}
+            | ProjectionElem::Subslice { .. }
+            | ProjectionElem::UnwrapUnsafeBinder(_) => {}
 
             // Never recurse.
             ProjectionElem::OpaqueCast(..) | ProjectionElem::Downcast(..) => {
@@ -325,6 +328,7 @@ impl<'tcx> Validator<'_, 'tcx> {
                 if let TempState::Defined { location: loc, .. } = self.temps[local]
                     && let Left(statement) =  self.body.stmt_at(loc)
                     && let Some((_, Rvalue::Use(Operand::Constant(c)))) = statement.kind.as_assign()
+                    && self.should_evaluate_for_promotion_checks(c.const_)
                     && let Some(idx) = c.const_.try_eval_target_usize(self.tcx, self.typing_env)
                     // Determine the type of the thing we are indexing.
                     && let ty::Array(_, len) = place_base.ty(self.body, self.tcx).ty.kind()
@@ -355,6 +359,10 @@ impl<'tcx> Validator<'_, 'tcx> {
     fn validate_operand(&mut self, operand: &Operand<'tcx>) -> Result<(), Unpromotable> {
         match operand {
             Operand::Copy(place) | Operand::Move(place) => self.validate_place(place.as_ref()),
+
+            // `RuntimeChecks` behaves different in const-eval and runtime MIR,
+            // so we do not promote it.
+            Operand::RuntimeChecks(_) => Err(Unpromotable),
 
             // The qualifs for a constant (e.g. `HasMutInterior`) are checked in
             // `validate_rvalue` upon access.
@@ -406,14 +414,8 @@ impl<'tcx> Validator<'_, 'tcx> {
                 // In theory, any zero-sized value could be borrowed
                 // mutably without consequences. However, only &mut []
                 // is allowed right now.
-                if let ty::Array(_, len) = ty.kind() {
-                    match len.try_to_target_usize(self.tcx) {
-                        Some(0) => {}
-                        _ => return Err(Unpromotable),
-                    }
-                } else {
-                    return Err(Unpromotable);
-                }
+                let ty::Array(_, len) = ty.kind() else { return Err(Unpromotable) };
+                let Some(0) = len.try_to_target_usize(self.tcx) else { return Err(Unpromotable) };
             }
         }
 
@@ -422,7 +424,9 @@ impl<'tcx> Validator<'_, 'tcx> {
 
     fn validate_rvalue(&mut self, rvalue: &Rvalue<'tcx>) -> Result<(), Unpromotable> {
         match rvalue {
-            Rvalue::Use(operand) | Rvalue::Repeat(operand, _) => {
+            Rvalue::Use(operand)
+            | Rvalue::Repeat(operand, _)
+            | Rvalue::WrapUnsafeBinder(operand, _) => {
                 self.validate_operand(operand)?;
             }
             Rvalue::CopyForDeref(place) => {
@@ -430,9 +434,7 @@ impl<'tcx> Validator<'_, 'tcx> {
                 self.validate_operand(op)?
             }
 
-            Rvalue::Discriminant(place) | Rvalue::Len(place) => {
-                self.validate_place(place.as_ref())?
-            }
+            Rvalue::Discriminant(place) => self.validate_place(place.as_ref())?,
 
             Rvalue::ThreadLocalRef(_) => return Err(Unpromotable),
 
@@ -444,15 +446,6 @@ impl<'tcx> Validator<'_, 'tcx> {
             Rvalue::Cast(_, operand, _) => {
                 self.validate_operand(operand)?;
             }
-
-            Rvalue::NullaryOp(op, _) => match op {
-                NullOp::SizeOf => {}
-                NullOp::AlignOf => {}
-                NullOp::OffsetOf(_) => {}
-                NullOp::UbChecks => {}
-            },
-
-            Rvalue::ShallowInitBox(_, _) => return Err(Unpromotable),
 
             Rvalue::UnaryOp(op, operand) => {
                 match op {
@@ -488,40 +481,33 @@ impl<'tcx> Validator<'_, 'tcx> {
                         if lhs_ty.is_integral() {
                             let sz = lhs_ty.primitive_size(self.tcx);
                             // Integer division: the RHS must be a non-zero const.
-                            let rhs_val = match rhs {
-                                Operand::Constant(c) => {
-                                    c.const_.try_eval_scalar_int(self.tcx, self.typing_env)
-                                }
-                                _ => None,
-                            };
-                            match rhs_val.map(|x| x.to_uint(sz)) {
+                            let rhs_val = if let Operand::Constant(rhs_c) = rhs
+                                && self.should_evaluate_for_promotion_checks(rhs_c.const_)
+                                && let Some(rhs_val) =
+                                    rhs_c.const_.try_eval_scalar_int(self.tcx, self.typing_env)
                                 // for the zero test, int vs uint does not matter
-                                Some(x) if x != 0 => {}        // okay
-                                _ => return Err(Unpromotable), // value not known or 0 -- not okay
-                            }
+                                && rhs_val.to_uint(sz) != 0
+                            {
+                                rhs_val
+                            } else {
+                                // value not known or 0 -- not okay
+                                return Err(Unpromotable);
+                            };
                             // Furthermore, for signed division, we also have to exclude `int::MIN /
                             // -1`.
-                            if lhs_ty.is_signed() {
-                                match rhs_val.map(|x| x.to_int(sz)) {
-                                    Some(-1) | None => {
-                                        // The RHS is -1 or unknown, so we have to be careful.
-                                        // But is the LHS int::MIN?
-                                        let lhs_val = match lhs {
-                                            Operand::Constant(c) => c
-                                                .const_
-                                                .try_eval_scalar_int(self.tcx, self.typing_env),
-                                            _ => None,
-                                        };
-                                        let lhs_min = sz.signed_int_min();
-                                        match lhs_val.map(|x| x.to_int(sz)) {
-                                            // okay
-                                            Some(x) if x != lhs_min => {}
-
-                                            // value not known or int::MIN -- not okay
-                                            _ => return Err(Unpromotable),
-                                        }
-                                    }
-                                    _ => {}
+                            if lhs_ty.is_signed() && rhs_val.to_int(sz) == -1 {
+                                // The RHS is -1, so we have to be careful. But is the LHS int::MIN?
+                                if let Operand::Constant(lhs_c) = lhs
+                                    && self.should_evaluate_for_promotion_checks(lhs_c.const_)
+                                    && let Some(lhs_val) =
+                                        lhs_c.const_.try_eval_scalar_int(self.tcx, self.typing_env)
+                                    && let lhs_min = sz.signed_int_min()
+                                    && lhs_val.to_int(sz) != lhs_min
+                                {
+                                    // okay
+                                } else {
+                                    // value not known or int::MIN -- not okay
+                                    return Err(Unpromotable);
                                 }
                             }
                         }
@@ -688,6 +674,28 @@ impl<'tcx> Validator<'_, 'tcx> {
         // This passed all checks, so let's accept.
         Ok(())
     }
+
+    /// Can we try to evaluate a given constant at this point in compilation? Attempting to evaluate
+    /// a const block before borrow-checking will result in a query cycle (#150464).
+    fn should_evaluate_for_promotion_checks(&self, constant: Const<'tcx>) -> bool {
+        match constant {
+            // `Const::Ty` is always a `ConstKind::Param` right now and that can never be turned
+            // into a mir value for promotion
+            // FIXME(mgca): do we want uses of type_const to be normalized during promotion?
+            Const::Ty(..) => false,
+            Const::Val(..) => true,
+            // Evaluating a MIR constant requires borrow-checking it. For inline consts, as of
+            // #138499, this means borrow-checking its typeck root. Since borrow-checking the
+            // typeck root requires promoting its constants, trying to evaluate an inline const here
+            // will result in a query cycle. To avoid the cycle, we can't evaluate const blocks yet.
+            // Other kinds of unevaluated's can cause query cycles too when they arise from
+            // self-reference in user code; e.g. evaluating a constant can require evaluating a
+            // const function that uses that constant, again requiring evaluation of the constant.
+            // However, this form of cycle renders both the constant and function unusable in
+            // general, so we don't need to special-case it here.
+            Const::Unevaluated(uc, _) => self.tcx.def_kind(uc.def) != DefKind::InlineConst,
+        }
+    }
 }
 
 fn validate_candidates(
@@ -723,23 +731,22 @@ struct Promoter<'a, 'tcx> {
 impl<'a, 'tcx> Promoter<'a, 'tcx> {
     fn new_block(&mut self) -> BasicBlock {
         let span = self.promoted.span;
-        self.promoted.basic_blocks_mut().push(BasicBlockData {
-            statements: vec![],
-            terminator: Some(Terminator {
+        self.promoted.basic_blocks_mut().push(BasicBlockData::new(
+            Some(Terminator {
                 source_info: SourceInfo::outermost(span),
                 kind: TerminatorKind::Return,
             }),
-            is_cleanup: false,
-        })
+            false,
+        ))
     }
 
     fn assign(&mut self, dest: Local, rvalue: Rvalue<'tcx>, span: Span) {
         let last = self.promoted.basic_blocks.last_index().unwrap();
         let data = &mut self.promoted[last];
-        data.statements.push(Statement {
-            source_info: SourceInfo::outermost(span),
-            kind: StatementKind::Assign(Box::new((Place::from(dest), rvalue))),
-        });
+        data.statements.push(Statement::new(
+            SourceInfo::outermost(span),
+            StatementKind::Assign(Box::new((Place::from(dest), rvalue))),
+        ));
     }
 
     fn is_temp_kind(&self, local: Local) -> bool {
@@ -856,17 +863,22 @@ impl<'a, 'tcx> Promoter<'a, 'tcx> {
         new_temp
     }
 
-    fn promote_candidate(mut self, candidate: Candidate, next_promoted_id: usize) -> Body<'tcx> {
+    fn promote_candidate(
+        mut self,
+        candidate: Candidate,
+        next_promoted_index: Promoted,
+    ) -> Body<'tcx> {
         let def = self.source.source.def_id();
         let (mut rvalue, promoted_op) = {
             let promoted = &mut self.promoted;
-            let promoted_id = Promoted::new(next_promoted_id);
             let tcx = self.tcx;
             let mut promoted_operand = |ty, span| {
                 promoted.span = span;
                 promoted.local_decls[RETURN_PLACE] = LocalDecl::new(ty, span);
-                let args = tcx.erase_regions(GenericArgs::identity_for_item(tcx, def));
-                let uneval = mir::UnevaluatedConst { def, args, promoted: Some(promoted_id) };
+                let args =
+                    tcx.erase_and_anonymize_regions(GenericArgs::identity_for_item(tcx, def));
+                let uneval =
+                    mir::UnevaluatedConst { def, args, promoted: Some(next_promoted_index) };
 
                 ConstOperand { span, user_ty: None, const_: Const::Unevaluated(uneval, ty) }
             };
@@ -902,29 +914,33 @@ impl<'a, 'tcx> Promoter<'a, 'tcx> {
             assert_eq!(self.temps.push(TempState::Unpromotable), promoted_ref);
 
             let promoted_operand = promoted_operand(ref_ty, span);
-            let promoted_ref_statement = Statement {
-                source_info: statement.source_info,
-                kind: StatementKind::Assign(Box::new((
+            let promoted_ref_statement = Statement::new(
+                statement.source_info,
+                StatementKind::Assign(Box::new((
                     Place::from(promoted_ref),
                     Rvalue::Use(Operand::Constant(Box::new(promoted_operand))),
                 ))),
-            };
+            );
             self.extra_statements.push((loc, promoted_ref_statement));
 
             (
-                Rvalue::Ref(tcx.lifetimes.re_erased, *borrow_kind, Place {
-                    local: mem::replace(&mut place.local, promoted_ref),
-                    projection: List::empty(),
-                }),
+                Rvalue::Ref(
+                    tcx.lifetimes.re_erased,
+                    *borrow_kind,
+                    Place {
+                        local: mem::replace(&mut place.local, promoted_ref),
+                        projection: List::empty(),
+                    },
+                ),
                 promoted_operand,
             )
         };
 
         assert_eq!(self.new_block(), START_BLOCK);
-        self.visit_rvalue(&mut rvalue, Location {
-            block: START_BLOCK,
-            statement_index: usize::MAX,
-        });
+        self.visit_rvalue(
+            &mut rvalue,
+            Location { block: START_BLOCK, statement_index: usize::MAX },
+        );
 
         let span = self.promoted.span;
         self.assign(RETURN_PLACE, rvalue, span);
@@ -982,12 +998,11 @@ fn promote_candidates<'tcx>(
     for candidate in candidates.into_iter().rev() {
         let Location { block, statement_index } = candidate.location;
         if let StatementKind::Assign(box (place, _)) = &body[block].statements[statement_index].kind
+            && let Some(local) = place.as_local()
         {
-            if let Some(local) = place.as_local() {
-                if temps[local] == TempState::PromotedOut {
-                    // Already promoted.
-                    continue;
-                }
+            if temps[local] == TempState::PromotedOut {
+                // Already promoted.
+                continue;
             }
         }
 
@@ -1022,7 +1037,7 @@ fn promote_candidates<'tcx>(
             required_consts: Vec::new(),
         };
 
-        let mut promoted = promoter.promote_candidate(candidate, promotions.len());
+        let mut promoted = promoter.promote_candidate(candidate, promotions.next_index());
         promoted.source.promoted = Some(promotions.next_index());
         promotions.push(promoted);
     }
@@ -1037,7 +1052,7 @@ fn promote_candidates<'tcx>(
     // Eliminate assignments to, and drops of promoted temps.
     let promoted = |index: Local| temps[index] == TempState::PromotedOut;
     for block in body.basic_blocks_mut() {
-        block.statements.retain(|statement| match &statement.kind {
+        block.retain_statements(|statement| match &statement.kind {
             StatementKind::Assign(box (place, _)) => {
                 if let Some(index) = place.as_local() {
                     !promoted(index)
@@ -1051,11 +1066,11 @@ fn promote_candidates<'tcx>(
             _ => true,
         });
         let terminator = block.terminator_mut();
-        if let TerminatorKind::Drop { place, target, .. } = &terminator.kind {
-            if let Some(index) = place.as_local() {
-                if promoted(index) {
-                    terminator.kind = TerminatorKind::Goto { target: *target };
-                }
+        if let TerminatorKind::Drop { place, target, .. } = &terminator.kind
+            && let Some(index) = place.as_local()
+        {
+            if promoted(index) {
+                terminator.kind = TerminatorKind::Goto { target: *target };
             }
         }
     }

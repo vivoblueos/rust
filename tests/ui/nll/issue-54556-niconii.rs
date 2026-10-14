@@ -9,7 +9,6 @@
 //@ revisions: edition2021 edition2024
 //@ [edition2021] edition: 2021
 //@ [edition2024] edition: 2024
-//@ [edition2024] compile-flags: -Z unstable-options
 //@ [edition2024] check-pass
 
 struct Mutex;
@@ -19,7 +18,7 @@ impl Drop for Mutex { fn drop(&mut self) { println!("Mutex::drop"); } }
 impl<'a> Drop for MutexGuard<'a> { fn drop(&mut self) { println!("MutexGuard::drop");  } }
 
 impl Mutex {
-    fn lock(&self) -> Result<MutexGuard, ()> { Ok(MutexGuard(self)) }
+    fn lock(&self) -> Result<MutexGuard<'_>, ()> { Ok(MutexGuard(self)) }
 }
 
 fn main() {

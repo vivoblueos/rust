@@ -108,18 +108,16 @@ use std::io::{self, ErrorKind};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use rand::{RngCore, thread_rng};
+use rand::{RngCore, rng};
 use rustc_data_structures::base_n::{BaseNString, CASE_INSENSITIVE, ToBaseN};
 use rustc_data_structures::fx::{FxHashSet, FxIndexSet};
 use rustc_data_structures::svh::Svh;
 use rustc_data_structures::unord::{UnordMap, UnordSet};
 use rustc_data_structures::{base_n, flock};
-use rustc_errors::ErrorGuaranteed;
 use rustc_fs_util::{LinkOrCopy, link_or_copy, try_canonicalize};
 use rustc_middle::bug;
-use rustc_session::config::CrateType;
-use rustc_session::output::{collect_crate_types, find_crate_name};
 use rustc_session::{Session, StableCrateId};
+use rustc_span::Symbol;
 use tracing::debug;
 
 use crate::errors;
@@ -212,19 +210,21 @@ pub fn in_incr_comp_dir(incr_comp_session_dir: &Path, file_name: &str) -> PathBu
 /// The garbage collection will take care of it.
 ///
 /// [`rustc_interface::queries::dep_graph`]: ../../rustc_interface/struct.Queries.html#structfield.dep_graph
-pub(crate) fn prepare_session_directory(sess: &Session) -> Result<(), ErrorGuaranteed> {
-    if sess.opts.incremental.is_none() {
-        return Ok(());
-    }
+pub(crate) fn prepare_session_directory(
+    sess: &Session,
+    crate_name: Symbol,
+    stable_crate_id: StableCrateId,
+) {
+    assert!(sess.opts.incremental.is_some());
 
     let _timer = sess.timer("incr_comp_prepare_session_directory");
 
     debug!("prepare_session_directory");
 
     // {incr-comp-dir}/{crate-name-and-disambiguator}
-    let crate_dir = crate_path(sess);
+    let crate_dir = crate_path(sess, crate_name, stable_crate_id);
     debug!("crate-dir: {}", crate_dir.display());
-    create_dir(sess, &crate_dir, "crate")?;
+    create_dir(sess, &crate_dir, "crate");
 
     // Hack: canonicalize the path *after creating the directory*
     // because, on windows, long paths can cause problems;
@@ -233,7 +233,7 @@ pub(crate) fn prepare_session_directory(sess: &Session) -> Result<(), ErrorGuara
     let crate_dir = match try_canonicalize(&crate_dir) {
         Ok(v) => v,
         Err(err) => {
-            return Err(sess.dcx().emit_err(errors::CanonicalizePath { path: crate_dir, err }));
+            sess.dcx().emit_fatal(errors::CanonicalizePath { path: crate_dir, err });
         }
     };
 
@@ -248,11 +248,11 @@ pub(crate) fn prepare_session_directory(sess: &Session) -> Result<(), ErrorGuara
 
         // Lock the new session directory. If this fails, return an
         // error without retrying
-        let (directory_lock, lock_file_path) = lock_directory(sess, &session_dir)?;
+        let (directory_lock, lock_file_path) = lock_directory(sess, &session_dir);
 
         // Now that we have the lock, we can actually create the session
         // directory
-        create_dir(sess, &session_dir, "session")?;
+        create_dir(sess, &session_dir, "session");
 
         // Find a suitable source directory to copy from. Ignore those that we
         // have already tried before.
@@ -266,7 +266,7 @@ pub(crate) fn prepare_session_directory(sess: &Session) -> Result<(), ErrorGuara
             );
 
             sess.init_incr_comp_session(session_dir, directory_lock);
-            return Ok(());
+            return;
         };
 
         debug!("attempting to copy data from source: {}", source_directory.display());
@@ -280,7 +280,7 @@ pub(crate) fn prepare_session_directory(sess: &Session) -> Result<(), ErrorGuara
             }
 
             sess.init_incr_comp_session(session_dir, directory_lock);
-            return Ok(());
+            return;
         } else {
             debug!("copying failed - trying next directory");
 
@@ -290,7 +290,7 @@ pub(crate) fn prepare_session_directory(sess: &Session) -> Result<(), ErrorGuara
 
             // Try to remove the session directory we just allocated. We don't
             // know if there's any garbage in it from the failed copy action.
-            if let Err(err) = safe_remove_dir_all(&session_dir) {
+            if let Err(err) = std_fs::remove_dir_all(&session_dir) {
                 sess.dcx().emit_warn(errors::DeletePartial { path: &session_dir, err });
             }
 
@@ -324,7 +324,7 @@ pub fn finalize_session_directory(sess: &Session, svh: Option<Svh>) {
             incr_comp_session_dir.display()
         );
 
-        if let Err(err) = safe_remove_dir_all(&*incr_comp_session_dir) {
+        if let Err(err) = std_fs::remove_dir_all(&*incr_comp_session_dir) {
             sess.dcx().emit_warn(errors::DeleteFull { path: &incr_comp_session_dir, err });
         }
 
@@ -364,7 +364,7 @@ pub fn finalize_session_directory(sess: &Session, svh: Option<Svh>) {
         }
         Err(e) => {
             // Warn about the error. However, no need to abort compilation now.
-            sess.dcx().emit_warn(errors::Finalize { path: &incr_comp_session_dir, err: e });
+            sess.dcx().emit_note(errors::Finalize { path: &incr_comp_session_dir, err: e });
 
             debug!("finalize_session_directory() - error, marking as invalid");
             // Drop the file lock, so we can garage collect
@@ -445,7 +445,7 @@ fn copy_files(sess: &Session, target_dir: &Path, source_dir: &Path) -> Result<bo
 fn generate_session_dir_path(crate_dir: &Path) -> PathBuf {
     let timestamp = timestamp_to_string(SystemTime::now());
     debug!("generate_session_dir_path: timestamp = {}", timestamp);
-    let random_number = thread_rng().next_u32();
+    let random_number = rng().next_u32();
     debug!("generate_session_dir_path: random_number = {}", random_number);
 
     // Chop the first 3 characters off the timestamp. Those 3 bytes will be zero for a while.
@@ -459,21 +459,17 @@ fn generate_session_dir_path(crate_dir: &Path) -> PathBuf {
     directory_path
 }
 
-fn create_dir(sess: &Session, path: &Path, dir_tag: &str) -> Result<(), ErrorGuaranteed> {
+fn create_dir(sess: &Session, path: &Path, dir_tag: &str) {
     match std_fs::create_dir_all(path) {
         Ok(()) => {
             debug!("{} directory created successfully", dir_tag);
-            Ok(())
         }
-        Err(err) => Err(sess.dcx().emit_err(errors::CreateIncrCompDir { tag: dir_tag, path, err })),
+        Err(err) => sess.dcx().emit_fatal(errors::CreateIncrCompDir { tag: dir_tag, path, err }),
     }
 }
 
 /// Allocate the lock-file and lock it.
-fn lock_directory(
-    sess: &Session,
-    session_dir: &Path,
-) -> Result<(flock::Lock, PathBuf), ErrorGuaranteed> {
+fn lock_directory(sess: &Session, session_dir: &Path) -> (flock::Lock, PathBuf) {
     let lock_file_path = lock_file_path(session_dir);
     debug!("lock_directory() - lock_file: {}", lock_file_path.display());
 
@@ -484,15 +480,15 @@ fn lock_directory(
         true,
     ) {
         // the lock should be exclusive
-        Ok(lock) => Ok((lock, lock_file_path)),
+        Ok(lock) => (lock, lock_file_path),
         Err(lock_err) => {
             let is_unsupported_lock = flock::Lock::error_unsupported(&lock_err);
-            Err(sess.dcx().emit_err(errors::CreateLock {
+            sess.dcx().emit_fatal(errors::CreateLock {
                 lock_err,
                 session_dir,
                 is_unsupported_lock,
                 is_cargo: rustc_session::utils::was_invoked_from_cargo(),
-            }))
+            });
         }
     }
 }
@@ -599,17 +595,8 @@ fn string_to_timestamp(s: &str) -> Result<SystemTime, &'static str> {
     Ok(UNIX_EPOCH + duration)
 }
 
-fn crate_path(sess: &Session) -> PathBuf {
+fn crate_path(sess: &Session, crate_name: Symbol, stable_crate_id: StableCrateId) -> PathBuf {
     let incr_dir = sess.opts.incremental.as_ref().unwrap().clone();
-
-    let crate_name = find_crate_name(sess, &[]);
-    let crate_types = collect_crate_types(sess, &[]);
-    let stable_crate_id = StableCrateId::new(
-        crate_name,
-        crate_types.contains(&CrateType::Executable),
-        sess.opts.cg.metadata.clone(),
-        sess.cfg_version,
-    );
 
     let crate_name =
         format!("{crate_name}-{}", stable_crate_id.as_u64().to_base_fixed_len(CASE_INSENSITIVE));
@@ -720,16 +707,42 @@ pub(crate) fn garbage_collect_session_directories(sess: &Session) -> io::Result<
     for directory_name in session_directories {
         if !lock_file_to_session_dir.items().any(|(_, dir)| *dir == directory_name) {
             let path = crate_directory.join(directory_name);
-            if let Err(err) = safe_remove_dir_all(&path) {
+            if let Err(err) = std_fs::remove_dir_all(&path) {
                 sess.dcx().emit_warn(errors::InvalidGcFailed { path: &path, err });
             }
         }
     }
 
+    let current_session_directory_name =
+        session_directory.file_name().expect("session directory is not `..`");
+
     // Now garbage collect the valid session directories.
     let deletion_candidates =
         lock_file_to_session_dir.items().filter_map(|(lock_file_name, directory_name)| {
             debug!("garbage_collect_session_directories() - inspecting: {}", directory_name);
+
+            if directory_name.as_str() == current_session_directory_name {
+                // Skipping our own directory is, unfortunately, important for correctness.
+                //
+                // To summarize #147821: we will try to lock directories before deciding they can be
+                // garbage collected, but the ability of `flock::Lock` to detect a lock held *by the
+                // same process* varies across file locking APIs. Then, if our own session directory
+                // has become old enough to be eligible for GC, we are beholden to platform-specific
+                // details about detecting the our own lock on the session directory.
+                //
+                // POSIX `fcntl(F_SETLK)`-style file locks are maintained across a process. On
+                // systems where this is the mechanism for `flock::Lock`, there is no way to
+                // discover if an `flock::Lock` has been created in the same process on the same
+                // file. Attempting to set a lock on the lockfile again will succeed, even if the
+                // lock was set by another thread, on another file descriptor. Then we would
+                // garbage collect our own live directory, unable to tell it was locked perhaps by
+                // this same thread.
+                //
+                // It's not clear that `flock::Lock` can be fixed for this in general, and our own
+                // incremental session directory is the only one which this process may own, so skip
+                // it here and avoid the problem. We know it's not garbage anyway: we're using it.
+                return None;
+            }
 
             let Ok(timestamp) = extract_timestamp_from_session_dir(directory_name) else {
                 debug!(
@@ -826,7 +839,7 @@ pub(crate) fn garbage_collect_session_directories(sess: &Session) -> io::Result<
     all_except_most_recent(deletion_candidates).into_items().all(|(path, lock)| {
         debug!("garbage_collect_session_directories() - deleting `{}`", path.display());
 
-        if let Err(err) = safe_remove_dir_all(&path) {
+        if let Err(err) = std_fs::remove_dir_all(&path) {
             sess.dcx().emit_warn(errors::FinalizedGcFailed { path: &path, err });
         } else {
             delete_session_dir_lock_file(sess, &lock_file_path(&path));
@@ -844,7 +857,7 @@ pub(crate) fn garbage_collect_session_directories(sess: &Session) -> io::Result<
 fn delete_old(sess: &Session, path: &Path) {
     debug!("garbage_collect_session_directories() - deleting `{}`", path.display());
 
-    if let Err(err) = safe_remove_dir_all(path) {
+    if let Err(err) = std_fs::remove_dir_all(path) {
         sess.dcx().emit_warn(errors::SessionGcFailed { path, err });
     } else {
         delete_session_dir_lock_file(sess, &lock_file_path(path));
@@ -867,30 +880,8 @@ fn all_except_most_recent(
     }
 }
 
-/// Since paths of artifacts within session directories can get quite long, we
-/// need to support deleting files with very long paths. The regular
-/// WinApi functions only support paths up to 260 characters, however. In order
-/// to circumvent this limitation, we canonicalize the path of the directory
-/// before passing it to std::fs::remove_dir_all(). This will convert the path
-/// into the '\\?\' format, which supports much longer paths.
-fn safe_remove_dir_all(p: &Path) -> io::Result<()> {
-    let canonicalized = match try_canonicalize(p) {
-        Ok(canonicalized) => canonicalized,
-        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
-        Err(err) => return Err(err),
-    };
-
-    std_fs::remove_dir_all(canonicalized)
-}
-
 fn safe_remove_file(p: &Path) -> io::Result<()> {
-    let canonicalized = match try_canonicalize(p) {
-        Ok(canonicalized) => canonicalized,
-        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
-        Err(err) => return Err(err),
-    };
-
-    match std_fs::remove_file(canonicalized) {
+    match std_fs::remove_file(p) {
         Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
         result => result,
     }

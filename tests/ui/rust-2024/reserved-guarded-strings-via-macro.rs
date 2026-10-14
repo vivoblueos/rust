@@ -1,7 +1,7 @@
 //@ run-pass
-//@ compile-flags: -Zunstable-options
 //@ edition:2024
-//@ aux-build:reserved-guarded-strings-macro-2021.rs
+//@ proc-macro: reserved-guarded-strings-macro-2021.rs
+//@ ignore-backends: gcc
 
 extern crate reserved_guarded_strings_macro_2021 as m2021;
 

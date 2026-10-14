@@ -37,29 +37,11 @@ impl<'b, 'tcx> CostChecker<'b, 'tcx> {
     /// and even the full `Inline` doesn't call `visit_body`, so there's nowhere
     /// to put this logic in the visitor.
     pub(super) fn add_function_level_costs(&mut self) {
-        fn is_call_like(bbd: &BasicBlockData<'_>) -> bool {
-            use TerminatorKind::*;
-            match bbd.terminator().kind {
-                Call { .. } | TailCall { .. } | Drop { .. } | Assert { .. } | InlineAsm { .. } => {
-                    true
-                }
-
-                Goto { .. }
-                | SwitchInt { .. }
-                | UnwindResume
-                | UnwindTerminate(_)
-                | Return
-                | Unreachable => false,
-
-                Yield { .. } | CoroutineDrop | FalseEdge { .. } | FalseUnwind { .. } => {
-                    unreachable!()
-                }
-            }
-        }
-
         // If the only has one Call (or similar), inlining isn't increasing the total
         // number of calls, so give extra encouragement to inlining that.
-        if self.callee_body.basic_blocks.iter().filter(|bbd| is_call_like(bbd)).count() == 1 {
+        if self.callee_body.basic_blocks.iter().filter(|bbd| is_call_like(bbd.terminator())).count()
+            == 1
+        {
             self.bonus += CALL_PENALTY;
         }
     }
@@ -78,7 +60,27 @@ impl<'b, 'tcx> CostChecker<'b, 'tcx> {
 }
 
 impl<'tcx> Visitor<'tcx> for CostChecker<'_, 'tcx> {
-    fn visit_statement(&mut self, statement: &Statement<'tcx>, location: Location) {
+    fn visit_operand(&mut self, operand: &Operand<'tcx>, _: Location) {
+        match operand {
+            Operand::RuntimeChecks(RuntimeChecks::UbChecks) => {
+                if !self
+                    .tcx
+                    .sess
+                    .opts
+                    .unstable_opts
+                    .inline_mir_preserve_debug
+                    .unwrap_or(self.tcx.sess.ub_checks())
+                {
+                    // If this is in optimized MIR it's because it's used later, so if we don't need UB
+                    // checks this session, give a bonus here to offset the cost of the call later.
+                    self.bonus += CALL_PENALTY;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn visit_statement(&mut self, statement: &Statement<'tcx>, loc: Location) {
         // Most costs are in rvalues and terminators, not in statements.
         match statement.kind {
             StatementKind::Intrinsic(ref ndi) => {
@@ -87,34 +89,13 @@ impl<'tcx> Visitor<'tcx> for CostChecker<'_, 'tcx> {
                     NonDivergingIntrinsic::CopyNonOverlapping(..) => CALL_PENALTY,
                 };
             }
-            _ => self.super_statement(statement, location),
+            StatementKind::Assign(..) => self.penalty += INSTR_COST,
+            _ => {}
         }
+        self.super_statement(statement, loc)
     }
 
-    fn visit_rvalue(&mut self, rvalue: &Rvalue<'tcx>, _location: Location) {
-        match rvalue {
-            Rvalue::NullaryOp(NullOp::UbChecks, ..)
-                if !self
-                    .tcx
-                    .sess
-                    .opts
-                    .unstable_opts
-                    .inline_mir_preserve_debug
-                    .unwrap_or(self.tcx.sess.ub_checks()) =>
-            {
-                // If this is in optimized MIR it's because it's used later,
-                // so if we don't need UB checks this session, give a bonus
-                // here to offset the cost of the call later.
-                self.bonus += CALL_PENALTY;
-            }
-            // These are essentially constants that didn't end up in an Operand,
-            // so treat them as also being free.
-            Rvalue::NullaryOp(..) => {}
-            _ => self.penalty += INSTR_COST,
-        }
-    }
-
-    fn visit_terminator(&mut self, terminator: &Terminator<'tcx>, _: Location) {
+    fn visit_terminator(&mut self, terminator: &Terminator<'tcx>, loc: Location) {
         match &terminator.kind {
             TerminatorKind::Drop { place, unwind, .. } => {
                 // If the place doesn't actually need dropping, treat it like a regular goto.
@@ -143,7 +124,7 @@ impl<'tcx> Visitor<'tcx> for CostChecker<'_, 'tcx> {
                 self.penalty += CALL_PENALTY;
             }
             TerminatorKind::SwitchInt { discr, targets } => {
-                if discr.constant().is_some() {
+                if matches!(discr, Operand::Constant(_) | Operand::RuntimeChecks(_)) {
                     // Not only will this become a `Goto`, but likely other
                     // things will be removable as unreachable.
                     self.bonus += CONST_SWITCH_BONUS;
@@ -190,6 +171,30 @@ impl<'tcx> Visitor<'tcx> for CostChecker<'_, 'tcx> {
             | TerminatorKind::CoroutineDrop) => {
                 bug!("{kind:?} should not be in runtime MIR");
             }
+        }
+        self.super_terminator(terminator, loc)
+    }
+}
+
+/// A terminator that's more call-like (might do a bunch of work, might panic, etc)
+/// than it is goto-/return-like (no side effects, etc).
+///
+/// Used to treat multi-call functions (which could inline exponentially)
+/// different from those that only do one or none of these "complex" things.
+pub(super) fn is_call_like(terminator: &Terminator<'_>) -> bool {
+    use TerminatorKind::*;
+    match terminator.kind {
+        Call { .. } | TailCall { .. } | Drop { .. } | Assert { .. } | InlineAsm { .. } => true,
+
+        Goto { .. }
+        | SwitchInt { .. }
+        | UnwindResume
+        | UnwindTerminate(_)
+        | Return
+        | Unreachable => false,
+
+        Yield { .. } | CoroutineDrop | FalseEdge { .. } | FalseUnwind { .. } => {
+            unreachable!()
         }
     }
 }

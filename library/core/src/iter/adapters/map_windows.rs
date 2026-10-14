@@ -1,5 +1,5 @@
 use crate::iter::FusedIterator;
-use crate::mem::{self, MaybeUninit};
+use crate::mem::MaybeUninit;
 use crate::{fmt, ptr};
 
 /// An iterator over the mapped windows of another iterator.
@@ -7,17 +7,14 @@ use crate::{fmt, ptr};
 /// This `struct` is created by the [`Iterator::map_windows`]. See its
 /// documentation for more information.
 #[must_use = "iterators are lazy and do nothing unless consumed"]
-#[unstable(feature = "iter_map_windows", reason = "recently added", issue = "87155")]
+#[unstable(feature = "iter_map_windows", issue = "87155")]
 pub struct MapWindows<I: Iterator, F, const N: usize> {
     f: F,
     inner: MapWindowsInner<I, N>,
 }
 
 struct MapWindowsInner<I: Iterator, const N: usize> {
-    // We fuse the inner iterator because there shouldn't be "holes" in
-    // the sliding window. Once the iterator returns a `None`, we make
-    // our `MapWindows` iterator return `None` forever.
-    iter: Option<I>,
+    iter: I,
     // Since iterators are assumed lazy, i.e. it only yields an item when
     // `Iterator::next()` is called, and `MapWindows` is not an exception.
     //
@@ -26,7 +23,7 @@ struct MapWindowsInner<I: Iterator, const N: usize> {
     // we collect the first `N` items yielded from the inner iterator and
     // put it into the buffer.
     //
-    // When the inner iterator has returned a `None` (i.e. fused), we take
+    // When the inner iterator has returned a `None`, we take
     // away this `buffer` and leave it `None` to reclaim its resources.
     //
     // FIXME: should we shrink the size of `buffer` using niche optimization?
@@ -46,11 +43,11 @@ struct Buffer<T, const N: usize> {
 }
 
 impl<I: Iterator, F, const N: usize> MapWindows<I, F, N> {
-    pub(in crate::iter) fn new(iter: I, f: F) -> Self {
+    pub(in crate::iter) const fn new(iter: I, f: F) -> Self {
         assert!(N != 0, "array in `Iterator::map_windows` must contain more than 0 elements");
 
         // Only ZST arrays' length can be so large.
-        if mem::size_of::<I::Item>() == 0 {
+        if size_of::<I::Item>() == 0 {
             assert!(
                 N.checked_mul(2).is_some(),
                 "array size of `Iterator::map_windows` is too large"
@@ -63,20 +60,17 @@ impl<I: Iterator, F, const N: usize> MapWindows<I, F, N> {
 
 impl<I: Iterator, const N: usize> MapWindowsInner<I, N> {
     #[inline]
-    fn new(iter: I) -> Self {
-        Self { iter: Some(iter), buffer: None }
+    const fn new(iter: I) -> Self {
+        Self { iter, buffer: None }
     }
 
     fn next_window(&mut self) -> Option<&[I::Item; N]> {
-        let iter = self.iter.as_mut()?;
         match self.buffer {
             // It is the first time to advance. We collect
             // the first `N` items from `self.iter` to initialize `self.buffer`.
-            None => self.buffer = Buffer::try_from_iter(iter),
-            Some(ref mut buffer) => match iter.next() {
+            None => self.buffer = Buffer::try_from_iter(&mut self.iter),
+            Some(ref mut buffer) => match self.iter.next() {
                 None => {
-                    // Fuse the inner iterator since it yields a `None`.
-                    self.iter.take();
                     self.buffer.take();
                 }
                 // Advance the iterator. We first call `next` before changing our buffer
@@ -89,8 +83,7 @@ impl<I: Iterator, const N: usize> MapWindowsInner<I, N> {
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        let Some(ref iter) = self.iter else { return (0, Some(0)) };
-        let (lo, hi) = iter.size_hint();
+        let (lo, hi) = self.iter.size_hint();
         if self.buffer.is_some() {
             // If the first `N` items are already yielded by the inner iterator,
             // the size hint is then equal to the that of the inner iterator's.
@@ -195,7 +188,7 @@ impl<T, const N: usize> Buffer<T, N> {
 
         // SAFETY: the index is valid and this is element `a` in the
         // diagram above and has not been dropped yet.
-        unsafe { ptr::drop_in_place(to_drop.cast::<T>()) };
+        unsafe { ptr::drop_in_place(to_drop.cast_init()) };
     }
 }
 
@@ -234,7 +227,7 @@ impl<T, const N: usize> Drop for Buffer<T, N> {
     }
 }
 
-#[unstable(feature = "iter_map_windows", reason = "recently added", issue = "87155")]
+#[unstable(feature = "iter_map_windows", issue = "87155")]
 impl<I, F, R, const N: usize> Iterator for MapWindows<I, F, N>
 where
     I: Iterator,
@@ -253,17 +246,15 @@ where
     }
 }
 
-// Note that even if the inner iterator not fused, the `MapWindows` is still fused,
-// because we don't allow "holes" in the mapping window.
-#[unstable(feature = "iter_map_windows", reason = "recently added", issue = "87155")]
+#[unstable(feature = "iter_map_windows", issue = "87155")]
 impl<I, F, R, const N: usize> FusedIterator for MapWindows<I, F, N>
 where
-    I: Iterator,
+    I: FusedIterator,
     F: FnMut(&[I::Item; N]) -> R,
 {
 }
 
-#[unstable(feature = "iter_map_windows", reason = "recently added", issue = "87155")]
+#[unstable(feature = "iter_map_windows", issue = "87155")]
 impl<I, F, R, const N: usize> ExactSizeIterator for MapWindows<I, F, N>
 where
     I: ExactSizeIterator,
@@ -271,14 +262,14 @@ where
 {
 }
 
-#[unstable(feature = "iter_map_windows", reason = "recently added", issue = "87155")]
+#[unstable(feature = "iter_map_windows", issue = "87155")]
 impl<I: Iterator + fmt::Debug, F, const N: usize> fmt::Debug for MapWindows<I, F, N> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("MapWindows").field("iter", &self.inner.iter).finish()
     }
 }
 
-#[unstable(feature = "iter_map_windows", reason = "recently added", issue = "87155")]
+#[unstable(feature = "iter_map_windows", issue = "87155")]
 impl<I, F, const N: usize> Clone for MapWindows<I, F, N>
 where
     I: Iterator + Clone,

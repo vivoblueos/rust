@@ -13,6 +13,12 @@ const RUST_PROJECT_CONTEXT_NAME = "inRustProject";
 export interface RustAnalyzerExtensionApi {
     // FIXME: this should be non-optional
     readonly client?: lc.LanguageClient;
+
+    // Allows adding a configuration override from another extension.
+    // `extensionId` is used to only merge configuration override from present
+    // extensions. `configuration` is map of rust-analyzer-specific setting
+    // overrides, e.g., `{"cargo.cfgs": ["foo", "bar"]}`.
+    addConfiguration(extensionId: string, configuration: Record<string, unknown>): Promise<void>;
 }
 
 export async function deactivate() {
@@ -158,7 +164,7 @@ function createCommands(): Record<string, CommandFactory> {
         matchingBrace: { enabled: commands.matchingBrace },
         joinLines: { enabled: commands.joinLines },
         parentModule: { enabled: commands.parentModule },
-        syntaxTree: { enabled: commands.syntaxTree },
+        childModules: { enabled: commands.childModules },
         viewHir: { enabled: commands.viewHir },
         viewMir: { enabled: commands.viewMir },
         interpretFunction: { enabled: commands.interpretFunction },
@@ -167,7 +173,7 @@ function createCommands(): Record<string, CommandFactory> {
         viewCrateGraph: { enabled: commands.viewCrateGraph },
         viewFullCrateGraph: { enabled: commands.viewFullCrateGraph },
         expandMacro: { enabled: commands.expandMacro },
-        run: { enabled: commands.run },
+        run: { enabled: (ctx) => (mode?: "cursor") => commands.run(ctx, mode)() },
         copyRunCommandLine: { enabled: commands.copyRunCommandLine },
         debug: { enabled: commands.debug },
         newDebugConfig: { enabled: commands.newDebugConfig },
@@ -188,7 +194,9 @@ function createCommands(): Record<string, CommandFactory> {
         openWalkthrough: { enabled: commands.openWalkthrough },
         // Internal commands which are invoked by the server.
         applyActionGroup: { enabled: commands.applyActionGroup },
-        applySnippetWorkspaceEdit: { enabled: commands.applySnippetWorkspaceEditCommand },
+        applySnippetWorkspaceEdit: {
+            enabled: commands.applySnippetWorkspaceEditCommand,
+        },
         debugSingle: { enabled: commands.debugSingle },
         gotoLocation: { enabled: commands.gotoLocation },
         hoverRefCommandProxy: { enabled: commands.hoverRefCommandProxy },
@@ -199,6 +207,15 @@ function createCommands(): Record<string, CommandFactory> {
         rename: { enabled: commands.rename },
         openLogs: { enabled: commands.openLogs },
         revealDependency: { enabled: commands.revealDependency },
+        syntaxTreeReveal: { enabled: commands.syntaxTreeReveal },
+        syntaxTreeCopy: { enabled: commands.syntaxTreeCopy },
+        syntaxTreeHideWhitespace: {
+            enabled: commands.syntaxTreeHideWhitespace,
+        },
+        syntaxTreeShowWhitespace: {
+            enabled: commands.syntaxTreeShowWhitespace,
+        },
+        getFailedObligations: { enabled: commands.getFailedObligations },
     };
 }
 
@@ -211,6 +228,7 @@ function checkConflictingExtensions() {
                     "both plugins to not work correctly. You should disable one of them.",
                 "Got it",
             )
+            // eslint-disable-next-line no-console
             .then(() => {}, console.error);
     }
 }

@@ -1,7 +1,4 @@
-//@ force-host
-//@ no-prefer-dynamic
-
-#![crate_type = "proc-macro"]
+//@ edition:2015
 #![feature(proc_macro_quote)]
 
 extern crate proc_macro;

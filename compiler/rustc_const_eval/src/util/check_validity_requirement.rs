@@ -1,9 +1,11 @@
 use rustc_abi::{BackendRepr, FieldsShape, Scalar, Variants};
-use rustc_middle::bug;
 use rustc_middle::ty::layout::{
     HasTyCtxt, LayoutCx, LayoutError, LayoutOf, TyAndLayout, ValidityRequirement,
 };
-use rustc_middle::ty::{PseudoCanonicalInput, Ty, TyCtxt};
+use rustc_middle::ty::print::with_no_trimmed_paths;
+use rustc_middle::ty::{PseudoCanonicalInput, ScalarInt, Ty, TyCtxt};
+use rustc_middle::{bug, ty};
+use rustc_span::DUMMY_SP;
 
 use crate::const_eval::{CanAccessMutGlobal, CheckAlignment, CompileTimeMachine};
 use crate::interpret::{InterpCx, MemoryKind};
@@ -34,7 +36,7 @@ pub fn check_validity_requirement<'tcx>(
 
     let layout_cx = LayoutCx::new(tcx, input.typing_env);
     if kind == ValidityRequirement::Uninit || tcx.sess.opts.unstable_opts.strict_init_checks {
-        check_validity_requirement_strict(layout, &layout_cx, kind)
+        Ok(check_validity_requirement_strict(layout, &layout_cx, kind))
     } else {
         check_validity_requirement_lax(layout, &layout_cx, kind)
     }
@@ -46,19 +48,19 @@ fn check_validity_requirement_strict<'tcx>(
     ty: TyAndLayout<'tcx>,
     cx: &LayoutCx<'tcx>,
     kind: ValidityRequirement,
-) -> Result<bool, &'tcx LayoutError<'tcx>> {
+) -> bool {
     let machine = CompileTimeMachine::new(CanAccessMutGlobal::No, CheckAlignment::Error);
 
-    let mut cx = InterpCx::new(cx.tcx(), rustc_span::DUMMY_SP, cx.typing_env, machine);
+    let mut cx = InterpCx::new(cx.tcx(), DUMMY_SP, cx.typing_env, machine);
 
-    let allocated = cx
-        .allocate(ty, MemoryKind::Machine(crate::const_eval::MemoryKind::Heap))
-        .expect("OOM: failed to allocate for uninit check");
+    // It doesn't really matter which `MemoryKind` we use here, `Stack` is the least wrong.
+    let allocated =
+        cx.allocate(ty, MemoryKind::Stack).expect("OOM: failed to allocate for uninit check");
 
     if kind == ValidityRequirement::Zero {
         cx.write_bytes_ptr(
             allocated.ptr(),
-            std::iter::repeat(0_u8).take(ty.layout.size().bytes_usize()),
+            std::iter::repeat_n(0_u8, ty.layout.size().bytes_usize()),
         )
         .expect("failed to write bytes for zero valid check");
     }
@@ -68,15 +70,20 @@ fn check_validity_requirement_strict<'tcx>(
     // require dereferenceability also require non-null, we don't actually get any false negatives
     // due to this.
     // The value we are validating is temporary and discarded at the end of this function, so
-    // there is no point in reseting provenance and padding.
-    Ok(cx
-        .validate_operand(
+    // there is no point in resetting provenance and padding.
+    // This is pretty inefficient: we do the full path tracking and even format an error message
+    // in case there is a problem, only to entirely throw that away again. For a nightly-only
+    // option this is fine, but if this is ever meant to be stable we should probably add
+    // a "fast mode" to validation.
+    with_no_trimmed_paths!(
+        cx.validate_operand(
             &allocated.into(),
             /*recursive*/ false,
             /*reset_provenance_and_padding*/ false,
         )
         .discard_err()
-        .is_some())
+        .is_some()
+    )
 }
 
 /// Implements the 'lax' (default) version of the [`check_validity_requirement`] checks; see that
@@ -111,13 +118,17 @@ fn check_validity_requirement_lax<'tcx>(
     };
 
     // Check the ABI.
-    let valid = match this.backend_repr {
-        BackendRepr::Uninhabited => false, // definitely UB
-        BackendRepr::Scalar(s) => scalar_allows_raw_init(s),
-        BackendRepr::ScalarPair(s1, s2) => scalar_allows_raw_init(s1) && scalar_allows_raw_init(s2),
-        BackendRepr::Vector { element: s, count } => count == 0 || scalar_allows_raw_init(s),
-        BackendRepr::Memory { .. } => true, // Fields are checked below.
-    };
+    let valid = !this.is_uninhabited() // definitely UB if uninhabited
+        && match this.backend_repr {
+            BackendRepr::Scalar(s) => scalar_allows_raw_init(s),
+            BackendRepr::ScalarPair(s1, s2) => {
+                scalar_allows_raw_init(s1) && scalar_allows_raw_init(s2)
+            }
+            BackendRepr::SimdVector { element: s, count } => count == 0 || scalar_allows_raw_init(s),
+            BackendRepr::Memory { .. } => true, // Fields are checked below.
+            BackendRepr::SimdScalableVector { element, .. } => scalar_allows_raw_init(element),
+        };
+
     if !valid {
         // This is definitely not okay.
         return Ok(false);
@@ -127,7 +138,7 @@ fn check_validity_requirement_lax<'tcx>(
     if let Some(pointee) = this.ty.builtin_deref(false) {
         let pointee = cx.layout_of(pointee)?;
         // We need to ensure that the LLVM attributes `aligned` and `dereferenceable(size)` are satisfied.
-        if pointee.align.abi.bytes() > 1 {
+        if pointee.align.bytes() > 1 {
             // 0x01-filling is not aligned.
             return Ok(false);
         }
@@ -155,6 +166,7 @@ fn check_validity_requirement_lax<'tcx>(
     }
 
     match &this.variants {
+        Variants::Empty => return Ok(false),
         Variants::Single { .. } => {
             // All fields of this single variant have already been checked above, there is nothing
             // else to do.
@@ -166,4 +178,33 @@ fn check_validity_requirement_lax<'tcx>(
     }
 
     Ok(true)
+}
+
+pub(crate) fn validate_scalar_in_layout<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    scalar: ScalarInt,
+    ty: Ty<'tcx>,
+) -> bool {
+    let machine = CompileTimeMachine::new(CanAccessMutGlobal::No, CheckAlignment::Error);
+
+    let typing_env = ty::TypingEnv::fully_monomorphized();
+    let mut cx = InterpCx::new(tcx, DUMMY_SP, typing_env, machine);
+
+    let Ok(layout) = cx.layout_of(ty) else {
+        bug!("could not compute layout of {scalar:?}:{ty:?}")
+    };
+
+    // It doesn't really matter which `MemoryKind` we use here, `Stack` is the least wrong.
+    let allocated =
+        cx.allocate(layout, MemoryKind::Stack).expect("OOM: failed to allocate for uninit check");
+
+    cx.write_scalar(scalar, &allocated).unwrap();
+
+    cx.validate_operand(
+        &allocated.into(),
+        /*recursive*/ false,
+        /*reset_provenance_and_padding*/ false,
+    )
+    .discard_err()
+    .is_some()
 }

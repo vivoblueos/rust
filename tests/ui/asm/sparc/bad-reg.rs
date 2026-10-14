@@ -1,3 +1,4 @@
+//@ add-minicore
 //@ revisions: sparc sparcv8plus sparc64
 //@[sparc] compile-flags: --target sparc-unknown-none-elf
 //@[sparc] needs-llvm-components: sparc
@@ -5,23 +6,14 @@
 //@[sparcv8plus] needs-llvm-components: sparc
 //@[sparc64] compile-flags: --target sparc64-unknown-linux-gnu
 //@[sparc64] needs-llvm-components: sparc
-//@ needs-asm-support
+//@ ignore-backends: gcc
 
 #![crate_type = "rlib"]
-#![feature(no_core, rustc_attrs, lang_items, asm_experimental_arch)]
+#![feature(no_core, asm_experimental_arch)]
 #![no_core]
 
-#[lang = "sized"]
-trait Sized {}
-#[lang = "copy"]
-trait Copy {}
-
-impl Copy for i32 {}
-
-#[rustc_builtin_macro]
-macro_rules! asm {
-    () => {};
-}
+extern crate minicore;
+use minicore::*;
 
 fn f() {
     let mut x = 0;

@@ -6,9 +6,10 @@
 //! * [`Sender`]
 //! * [`Receiver`]
 //!
-//! [`Sender`]s are used to send data to a set of [`Receiver`]s. Both
-//! sender and receiver are cloneable (multi-producer) such that many threads can send
-//! simultaneously to receivers (multi-consumer).
+//! [`Sender`]s are used to send data to a set of [`Receiver`]s where each item
+//! sent is delivered to (at most) one receiver. Both sender and receiver are
+//! cloneable (multi-producer) such that many threads can send simultaneously
+//! to receivers (multi-consumer).
 //!
 //! These channels come in two flavors:
 //!
@@ -18,7 +19,7 @@
 //!    infinite buffer.
 //!
 //! 2. A synchronous, bounded channel. The [`sync_channel`] function will
-//!    return a `(SyncSender, Receiver)` tuple where the storage for pending
+//!    return a `(Sender, Receiver)` tuple where the storage for pending
 //!    messages is a pre-allocated buffer of a fixed size. All sends will be
 //!    **synchronous** by blocking until there is buffer space available. Note
 //!    that a bound of 0 is allowed, causing the channel to become a "rendezvous"
@@ -187,7 +188,7 @@ use crate::time::{Duration, Instant};
 ///     sender.send(expensive_computation()).unwrap();
 /// });
 ///
-/// // Do some useful work for awhile
+/// // Do some useful work for a while
 ///
 /// // Let's see what that answer was
 /// println!("{:?}", receiver.recv().unwrap());
@@ -360,9 +361,17 @@ impl<T> Sender<T> {
     /// that a return value of [`Err`] means that the data will never be
     /// received, but a return value of [`Ok`] does *not* mean that the data
     /// will be received. It is possible for the corresponding receiver to
-    /// hang up immediately after this function returns [`Ok`].
+    /// hang up immediately after this function returns [`Ok`]. However, if
+    /// the channel is zero-capacity, it acts as a rendezvous channel and a
+    /// return value of [`Ok`] means that the data has been received.
     ///
-    /// This method will never block the current thread.
+    /// If the channel is full and not disconnected, this call will block until
+    /// the send operation can proceed. If the channel becomes disconnected,
+    /// this call will wake up and return an error. The returned error contains
+    /// the original message.
+    ///
+    /// If called on a zero-capacity channel, this method will wait for a receive
+    /// operation to appear on the other side of the channel.
     ///
     /// # Examples
     ///
@@ -608,10 +617,37 @@ impl<T> Sender<T> {
     #[unstable(feature = "mpmc_channel", issue = "126840")]
     pub fn same_channel(&self, other: &Sender<T>) -> bool {
         match (&self.flavor, &other.flavor) {
-            (SenderFlavor::Array(ref a), SenderFlavor::Array(ref b)) => a == b,
-            (SenderFlavor::List(ref a), SenderFlavor::List(ref b)) => a == b,
-            (SenderFlavor::Zero(ref a), SenderFlavor::Zero(ref b)) => a == b,
+            (SenderFlavor::Array(a), SenderFlavor::Array(b)) => a == b,
+            (SenderFlavor::List(a), SenderFlavor::List(b)) => a == b,
+            (SenderFlavor::Zero(a), SenderFlavor::Zero(b)) => a == b,
             _ => false,
+        }
+    }
+
+    /// Returns `true` if the channel is disconnected.
+    ///
+    /// Note that a return value of `false` does not guarantee the channel will
+    /// remain connected. The channel may be disconnected immediately after this method
+    /// returns, so a subsequent [`Sender::send`] may still fail with [`SendError`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// #![feature(mpmc_channel)]
+    ///
+    /// use std::sync::mpmc::channel;
+    ///
+    /// let (tx, rx) = channel::<i32>();
+    /// assert!(!tx.is_disconnected());
+    /// drop(rx);
+    /// assert!(tx.is_disconnected());
+    /// ```
+    #[unstable(feature = "mpmc_channel", issue = "126840")]
+    pub fn is_disconnected(&self) -> bool {
+        match &self.flavor {
+            SenderFlavor::Array(chan) => chan.is_disconnected(),
+            SenderFlavor::List(chan) => chan.is_disconnected(),
+            SenderFlavor::Zero(chan) => chan.is_disconnected(),
         }
     }
 }
@@ -645,12 +681,12 @@ impl<T> Clone for Sender<T> {
 #[unstable(feature = "mpmc_channel", issue = "126840")]
 impl<T> fmt::Debug for Sender<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.pad("Sender { .. }")
+        f.debug_struct("Sender").finish_non_exhaustive()
     }
 }
 
 /// The receiving half of Rust's [`channel`] (or [`sync_channel`]) type.
-/// Different threads can share this [`Sender`] by cloning it.
+/// Different threads can share this [`Receiver`] by cloning it.
 ///
 /// Messages sent to the channel can be retrieved using [`recv`].
 ///
@@ -1340,6 +1376,33 @@ impl<T> Receiver<T> {
     pub fn iter(&self) -> Iter<'_, T> {
         Iter { rx: self }
     }
+
+    /// Returns `true` if the channel is disconnected.
+    ///
+    /// Note that a return value of `false` does not guarantee the channel will
+    /// remain connected. The channel may be disconnected immediately after this method
+    /// returns, so a subsequent [`Receiver::recv`] may still fail with [`RecvError`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// #![feature(mpmc_channel)]
+    ///
+    /// use std::sync::mpmc::channel;
+    ///
+    /// let (tx, rx) = channel::<i32>();
+    /// assert!(!rx.is_disconnected());
+    /// drop(tx);
+    /// assert!(rx.is_disconnected());
+    /// ```
+    #[unstable(feature = "mpmc_channel", issue = "126840")]
+    pub fn is_disconnected(&self) -> bool {
+        match &self.flavor {
+            ReceiverFlavor::Array(chan) => chan.is_disconnected(),
+            ReceiverFlavor::List(chan) => chan.is_disconnected(),
+            ReceiverFlavor::Zero(chan) => chan.is_disconnected(),
+        }
+    }
 }
 
 #[unstable(feature = "mpmc_channel", issue = "126840")]
@@ -1371,6 +1434,9 @@ impl<T> Clone for Receiver<T> {
 #[unstable(feature = "mpmc_channel", issue = "126840")]
 impl<T> fmt::Debug for Receiver<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.pad("Receiver { .. }")
+        f.debug_struct("Receiver").finish_non_exhaustive()
     }
 }
+
+#[cfg(test)]
+mod tests;

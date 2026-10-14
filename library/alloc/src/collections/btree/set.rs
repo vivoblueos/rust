@@ -3,15 +3,20 @@ use core::cmp::Ordering::{self, Equal, Greater, Less};
 use core::cmp::{max, min};
 use core::fmt::{self, Debug};
 use core::hash::{Hash, Hasher};
-use core::iter::{FusedIterator, Peekable};
+use core::iter::{FusedIterator, Peekable, TrustedLen};
 use core::mem::ManuallyDrop;
 use core::ops::{BitAnd, BitOr, BitXor, Bound, RangeBounds, Sub};
 
-use super::map::{BTreeMap, Keys};
+use super::map::{self, BTreeMap, Keys};
 use super::merge_iter::MergeIterInner;
 use super::set_val::SetValZST;
 use crate::alloc::{Allocator, Global};
 use crate::vec::Vec;
+
+mod entry;
+
+#[unstable(feature = "btree_set_entry", issue = "133549")]
+pub use self::entry::{Entry, OccupiedEntry, VacantEntry};
 
 /// An ordered set based on a B-Tree.
 ///
@@ -134,7 +139,7 @@ pub struct Iter<'a, T: 'a> {
 #[stable(feature = "collection_debug", since = "1.17.0")]
 impl<T: fmt::Debug> fmt::Debug for Iter<'_, T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_tuple("Iter").field(&self.iter.clone()).finish()
+        f.debug_tuple("Iter").field(&self.iter).finish()
     }
 }
 
@@ -350,12 +355,14 @@ impl<T, A: Allocator + Clone> BTreeSet<T, A> {
     /// # #![allow(unused_mut)]
     /// # #![feature(allocator_api)]
     /// # #![feature(btreemap_alloc)]
+    ///
     /// use std::collections::BTreeSet;
     /// use std::alloc::Global;
     ///
-    /// let mut set: BTreeSet<i32> = BTreeSet::new_in(Global);
+    /// let set: BTreeSet<i32> = BTreeSet::new_in(Global);
     /// ```
     #[unstable(feature = "btreemap_alloc", issue = "32838")]
+    #[must_use]
     pub const fn new_in(alloc: A) -> BTreeSet<T, A> {
         BTreeSet { map: BTreeMap::new_in(alloc) }
     }
@@ -422,39 +429,35 @@ impl<T, A: Allocator + Clone> BTreeSet<T, A> {
     where
         T: Ord,
     {
-        let (self_min, self_max) =
-            if let (Some(self_min), Some(self_max)) = (self.first(), self.last()) {
-                (self_min, self_max)
-            } else {
-                return Difference { inner: DifferenceInner::Iterate(self.iter()) };
-            };
-        let (other_min, other_max) =
-            if let (Some(other_min), Some(other_max)) = (other.first(), other.last()) {
-                (other_min, other_max)
-            } else {
-                return Difference { inner: DifferenceInner::Iterate(self.iter()) };
-            };
-        Difference {
-            inner: match (self_min.cmp(other_max), self_max.cmp(other_min)) {
-                (Greater, _) | (_, Less) => DifferenceInner::Iterate(self.iter()),
-                (Equal, _) => {
-                    let mut self_iter = self.iter();
-                    self_iter.next();
-                    DifferenceInner::Iterate(self_iter)
-                }
-                (_, Equal) => {
-                    let mut self_iter = self.iter();
-                    self_iter.next_back();
-                    DifferenceInner::Iterate(self_iter)
-                }
-                _ if self.len() <= other.len() / ITER_PERFORMANCE_TIPPING_SIZE_DIFF => {
-                    DifferenceInner::Search { self_iter: self.iter(), other_set: other }
-                }
-                _ => DifferenceInner::Stitch {
-                    self_iter: self.iter(),
-                    other_iter: other.iter().peekable(),
+        if let Some(self_min) = self.first()
+            && let Some(self_max) = self.last()
+            && let Some(other_min) = other.first()
+            && let Some(other_max) = other.last()
+        {
+            Difference {
+                inner: match (self_min.cmp(other_max), self_max.cmp(other_min)) {
+                    (Greater, _) | (_, Less) => DifferenceInner::Iterate(self.iter()),
+                    (Equal, _) => {
+                        let mut self_iter = self.iter();
+                        self_iter.next();
+                        DifferenceInner::Iterate(self_iter)
+                    }
+                    (_, Equal) => {
+                        let mut self_iter = self.iter();
+                        self_iter.next_back();
+                        DifferenceInner::Iterate(self_iter)
+                    }
+                    _ if self.len() <= other.len() / ITER_PERFORMANCE_TIPPING_SIZE_DIFF => {
+                        DifferenceInner::Search { self_iter: self.iter(), other_set: other }
+                    }
+                    _ => DifferenceInner::Stitch {
+                        self_iter: self.iter(),
+                        other_iter: other.iter().peekable(),
+                    },
                 },
-            },
+            }
+        } else {
+            Difference { inner: DifferenceInner::Iterate(self.iter()) }
         }
     }
 
@@ -514,31 +517,27 @@ impl<T, A: Allocator + Clone> BTreeSet<T, A> {
     where
         T: Ord,
     {
-        let (self_min, self_max) =
-            if let (Some(self_min), Some(self_max)) = (self.first(), self.last()) {
-                (self_min, self_max)
-            } else {
-                return Intersection { inner: IntersectionInner::Answer(None) };
-            };
-        let (other_min, other_max) =
-            if let (Some(other_min), Some(other_max)) = (other.first(), other.last()) {
-                (other_min, other_max)
-            } else {
-                return Intersection { inner: IntersectionInner::Answer(None) };
-            };
-        Intersection {
-            inner: match (self_min.cmp(other_max), self_max.cmp(other_min)) {
-                (Greater, _) | (_, Less) => IntersectionInner::Answer(None),
-                (Equal, _) => IntersectionInner::Answer(Some(self_min)),
-                (_, Equal) => IntersectionInner::Answer(Some(self_max)),
-                _ if self.len() <= other.len() / ITER_PERFORMANCE_TIPPING_SIZE_DIFF => {
-                    IntersectionInner::Search { small_iter: self.iter(), large_set: other }
-                }
-                _ if other.len() <= self.len() / ITER_PERFORMANCE_TIPPING_SIZE_DIFF => {
-                    IntersectionInner::Search { small_iter: other.iter(), large_set: self }
-                }
-                _ => IntersectionInner::Stitch { a: self.iter(), b: other.iter() },
-            },
+        if let Some(self_min) = self.first()
+            && let Some(self_max) = self.last()
+            && let Some(other_min) = other.first()
+            && let Some(other_max) = other.last()
+        {
+            Intersection {
+                inner: match (self_min.cmp(other_max), self_max.cmp(other_min)) {
+                    (Greater, _) | (_, Less) => IntersectionInner::Answer(None),
+                    (Equal, _) => IntersectionInner::Answer(Some(self_min)),
+                    (_, Equal) => IntersectionInner::Answer(Some(self_max)),
+                    _ if self.len() <= other.len() / ITER_PERFORMANCE_TIPPING_SIZE_DIFF => {
+                        IntersectionInner::Search { small_iter: self.iter(), large_set: other }
+                    }
+                    _ if other.len() <= self.len() / ITER_PERFORMANCE_TIPPING_SIZE_DIFF => {
+                        IntersectionInner::Search { small_iter: other.iter(), large_set: self }
+                    }
+                    _ => IntersectionInner::Stitch { a: self.iter(), b: other.iter() },
+                },
+            }
+        } else {
+            Intersection { inner: IntersectionInner::Answer(None) }
         }
     }
 
@@ -689,55 +688,56 @@ impl<T, A: Allocator + Clone> BTreeSet<T, A> {
         // Same result as self.difference(other).next().is_none()
         // but the code below is faster (hugely in some cases).
         if self.len() > other.len() {
-            return false;
+            return false; // self has more elements than other
         }
-        let (self_min, self_max) =
-            if let (Some(self_min), Some(self_max)) = (self.first(), self.last()) {
-                (self_min, self_max)
-            } else {
-                return true; // self is empty
-            };
-        let (other_min, other_max) =
-            if let (Some(other_min), Some(other_max)) = (other.first(), other.last()) {
-                (other_min, other_max)
-            } else {
-                return false; // other is empty
-            };
+        let (Some(self_min), Some(self_max)) = (self.first(), self.last()) else {
+            return true; // self is empty
+        };
+        let (Some(other_min), Some(other_max)) = (other.first(), other.last()) else {
+            return false; // other is empty
+        };
         let mut self_iter = self.iter();
         match self_min.cmp(other_min) {
-            Less => return false,
+            Less => return false, // other does not contain self_min
             Equal => {
-                self_iter.next();
+                self_iter.next(); // self_min is contained in other, so remove it from consideration
+                // other_min is now not in self_iter (used below)
             }
-            Greater => (),
-        }
+            Greater => {} // other_min is not in self_iter (used below)
+        };
+
         match self_max.cmp(other_max) {
-            Greater => return false,
+            Greater => return false, // other does not contain self_max
             Equal => {
-                self_iter.next_back();
+                self_iter.next_back(); // self_max is contained in other, so remove it from consideration
+                // other_max is now not in self_iter (used below)
             }
-            Less => (),
-        }
+            Less => {} // other_max is not in self_iter (used below)
+        };
         if self_iter.len() <= other.len() / ITER_PERFORMANCE_TIPPING_SIZE_DIFF {
-            for next in self_iter {
-                if !other.contains(next) {
-                    return false;
-                }
-            }
+            self_iter.all(|e| other.contains(e))
         } else {
             let mut other_iter = other.iter();
-            other_iter.next();
-            other_iter.next_back();
-            let mut self_next = self_iter.next();
-            while let Some(self1) = self_next {
-                match other_iter.next().map_or(Less, |other1| self1.cmp(other1)) {
-                    Less => return false,
-                    Equal => self_next = self_iter.next(),
-                    Greater => (),
-                }
+            {
+                // remove other_min and other_max as they are not in self_iter (see above)
+                other_iter.next();
+                other_iter.next_back();
             }
+            // custom `self_iter.all(|e| other.contains(e))`
+            self_iter.all(|self1| {
+                while let Some(other1) = other_iter.next() {
+                    match other1.cmp(self1) {
+                        // happens up to `ITER_PERFORMANCE_TIPPING_SIZE_DIFF * self.len() - 1` times
+                        Less => continue, // skip over elements that are smaller
+                        // happens `self.len()` times
+                        Equal => return true, // self1 is in other
+                        // happens only once
+                        Greater => return false, // self1 is not in other
+                    }
+                }
+                false
+            })
         }
-        true
     }
 
     /// Returns `true` if the set is a superset of another,
@@ -928,6 +928,109 @@ impl<T, A: Allocator + Clone> BTreeSet<T, A> {
         self.map.replace(value)
     }
 
+    /// Inserts the given `value` into the set if it is not present, then
+    /// returns a reference to the value in the set.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// #![feature(btree_set_entry)]
+    ///
+    /// use std::collections::BTreeSet;
+    ///
+    /// let mut set = BTreeSet::from([1, 2, 3]);
+    /// assert_eq!(set.len(), 3);
+    /// assert_eq!(set.get_or_insert(2), &2);
+    /// assert_eq!(set.get_or_insert(100), &100);
+    /// assert_eq!(set.len(), 4); // 100 was inserted
+    /// ```
+    #[inline]
+    #[unstable(feature = "btree_set_entry", issue = "133549")]
+    pub fn get_or_insert(&mut self, value: T) -> &T
+    where
+        T: Ord,
+    {
+        self.map.entry(value).insert_entry(SetValZST).into_key()
+    }
+
+    /// Inserts a value computed from `f` into the set if the given `value` is
+    /// not present, then returns a reference to the value in the set.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// #![feature(btree_set_entry)]
+    ///
+    /// use std::collections::BTreeSet;
+    ///
+    /// let mut set: BTreeSet<String> = ["cat", "dog", "horse"]
+    ///     .iter().map(|&pet| pet.to_owned()).collect();
+    ///
+    /// assert_eq!(set.len(), 3);
+    /// for &pet in &["cat", "dog", "fish"] {
+    ///     let value = set.get_or_insert_with(pet, str::to_owned);
+    ///     assert_eq!(value, pet);
+    /// }
+    /// assert_eq!(set.len(), 4); // a new "fish" was inserted
+    /// ```
+    #[inline]
+    #[unstable(feature = "btree_set_entry", issue = "133549")]
+    pub fn get_or_insert_with<Q: ?Sized, F>(&mut self, value: &Q, f: F) -> &T
+    where
+        T: Borrow<Q> + Ord,
+        Q: Ord,
+        F: FnOnce(&Q) -> T,
+    {
+        self.map.get_or_insert_with(value, f)
+    }
+
+    /// Gets the given value's corresponding entry in the set for in-place manipulation.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// #![feature(btree_set_entry)]
+    ///
+    /// use std::collections::BTreeSet;
+    /// use std::collections::btree_set::Entry::*;
+    ///
+    /// let mut singles = BTreeSet::new();
+    /// let mut dupes = BTreeSet::new();
+    ///
+    /// for ch in "a short treatise on fungi".chars() {
+    ///     if let Vacant(dupe_entry) = dupes.entry(ch) {
+    ///         // We haven't already seen a duplicate, so
+    ///         // check if we've at least seen it once.
+    ///         match singles.entry(ch) {
+    ///             Vacant(single_entry) => {
+    ///                 // We found a new character for the first time.
+    ///                 single_entry.insert()
+    ///             }
+    ///             Occupied(single_entry) => {
+    ///                 // We've already seen this once, "move" it to dupes.
+    ///                 single_entry.remove();
+    ///                 dupe_entry.insert();
+    ///             }
+    ///         }
+    ///     }
+    /// }
+    ///
+    /// assert!(!singles.contains(&'t') && dupes.contains(&'t'));
+    /// assert!(singles.contains(&'u') && !dupes.contains(&'u'));
+    /// assert!(!singles.contains(&'v') && !dupes.contains(&'v'));
+    /// ```
+    #[inline]
+    #[unstable(feature = "btree_set_entry", issue = "133549")]
+    pub fn entry(&mut self, value: T) -> Entry<'_, T, A>
+    where
+        T: Ord,
+    {
+        match self.map.entry(value) {
+            map::Entry::Occupied(entry) => Entry::Occupied(OccupiedEntry { inner: entry }),
+            map::Entry::Vacant(entry) => Entry::Vacant(VacantEntry { inner: entry }),
+        }
+    }
+
     /// If the set contains an element equal to the value, removes it from the
     /// set and drops it. Returns whether such an element was present.
     ///
@@ -1001,7 +1104,7 @@ impl<T, A: Allocator + Clone> BTreeSet<T, A> {
         T: Ord,
         F: FnMut(&T) -> bool,
     {
-        self.extract_if(|v| !f(v)).for_each(drop);
+        self.extract_if(.., |v| !f(v)).for_each(drop);
     }
 
     /// Moves all elements from `other` into `self`, leaving `other` empty.
@@ -1079,7 +1182,7 @@ impl<T, A: Allocator + Clone> BTreeSet<T, A> {
         BTreeSet { map: self.map.split_off(value) }
     }
 
-    /// Creates an iterator that visits all elements in ascending order and
+    /// Creates an iterator that visits elements in the specified range in ascending order and
     /// uses a closure to determine if an element should be removed.
     ///
     /// If the closure returns `true`, the element is removed from the set and
@@ -1088,30 +1191,37 @@ impl<T, A: Allocator + Clone> BTreeSet<T, A> {
     ///
     /// If the returned `ExtractIf` is not exhausted, e.g. because it is dropped without iterating
     /// or the iteration short-circuits, then the remaining elements will be retained.
-    /// Use [`retain`] with a negated predicate if you do not need the returned iterator.
+    /// Use `extract_if().for_each(drop)` if you do not need the returned iterator,
+    /// or [`retain`] with a negated predicate if you also do not need to restrict the range.
     ///
     /// [`retain`]: BTreeSet::retain
     /// # Examples
     ///
-    /// Splitting a set into even and odd values, reusing the original set:
-    ///
     /// ```
-    /// #![feature(btree_extract_if)]
     /// use std::collections::BTreeSet;
     ///
+    /// // Splitting a set into even and odd values, reusing the original set:
     /// let mut set: BTreeSet<i32> = (0..8).collect();
-    /// let evens: BTreeSet<_> = set.extract_if(|v| v % 2 == 0).collect();
+    /// let evens: BTreeSet<_> = set.extract_if(.., |v| v % 2 == 0).collect();
     /// let odds = set;
     /// assert_eq!(evens.into_iter().collect::<Vec<_>>(), vec![0, 2, 4, 6]);
     /// assert_eq!(odds.into_iter().collect::<Vec<_>>(), vec![1, 3, 5, 7]);
+    ///
+    /// // Splitting a set into low and high halves, reusing the original set:
+    /// let mut set: BTreeSet<i32> = (0..8).collect();
+    /// let low: BTreeSet<_> = set.extract_if(0..4, |_v| true).collect();
+    /// let high = set;
+    /// assert_eq!(low.into_iter().collect::<Vec<_>>(), [0, 1, 2, 3]);
+    /// assert_eq!(high.into_iter().collect::<Vec<_>>(), [4, 5, 6, 7]);
     /// ```
-    #[unstable(feature = "btree_extract_if", issue = "70530")]
-    pub fn extract_if<'a, F>(&'a mut self, pred: F) -> ExtractIf<'a, T, F, A>
+    #[stable(feature = "btree_extract_if", since = "1.91.0")]
+    pub fn extract_if<F, R>(&mut self, range: R, pred: F) -> ExtractIf<'_, T, R, F, A>
     where
         T: Ord,
-        F: 'a + FnMut(&T) -> bool,
+        R: RangeBounds<T>,
+        F: FnMut(&T) -> bool,
     {
-        let (inner, alloc) = self.map.extract_if_inner();
+        let (inner, alloc) = self.map.extract_if_inner(range);
         ExtractIf { pred, inner, alloc }
     }
 
@@ -1334,20 +1444,20 @@ impl<T, A: Allocator + Clone> BTreeSet<T, A> {
     ///
     /// let mut set = BTreeSet::from([1, 2, 3, 4]);
     ///
-    /// let mut cursor = unsafe { set.upper_bound_mut(Bound::Included(&3)) };
+    /// let mut cursor = set.upper_bound_mut(Bound::Included(&3));
     /// assert_eq!(cursor.peek_prev(), Some(&3));
     /// assert_eq!(cursor.peek_next(), Some(&4));
     ///
-    /// let mut cursor = unsafe { set.upper_bound_mut(Bound::Excluded(&3)) };
+    /// let mut cursor = set.upper_bound_mut(Bound::Excluded(&3));
     /// assert_eq!(cursor.peek_prev(), Some(&2));
     /// assert_eq!(cursor.peek_next(), Some(&3));
     ///
-    /// let mut cursor = unsafe { set.upper_bound_mut(Bound::Unbounded) };
+    /// let mut cursor = set.upper_bound_mut(Bound::Unbounded);
     /// assert_eq!(cursor.peek_prev(), Some(&4));
     /// assert_eq!(cursor.peek_next(), None);
     /// ```
     #[unstable(feature = "btree_cursors", issue = "107540")]
-    pub unsafe fn upper_bound_mut<Q: ?Sized>(&mut self, bound: Bound<&Q>) -> CursorMut<'_, T, A>
+    pub fn upper_bound_mut<Q: ?Sized>(&mut self, bound: Bound<&Q>) -> CursorMut<'_, T, A>
     where
         T: Borrow<Q> + Ord,
         Q: Ord,
@@ -1383,6 +1493,11 @@ impl<T: Ord, A: Allocator + Clone> BTreeSet<T, A> {
 impl<T: Ord, const N: usize> From<[T; N]> for BTreeSet<T> {
     /// Converts a `[T; N]` into a `BTreeSet<T>`.
     ///
+    /// If the array contains any equal values,
+    /// all but one will be dropped.
+    ///
+    /// # Examples
+    ///
     /// ```
     /// use std::collections::BTreeSet;
     ///
@@ -1397,9 +1512,7 @@ impl<T: Ord, const N: usize> From<[T; N]> for BTreeSet<T> {
 
         // use stable sort to preserve the insertion order.
         arr.sort();
-        let iter = IntoIterator::into_iter(arr).map(|k| (k, SetValZST::default()));
-        let map = BTreeMap::bulk_build_from_sorted_iter(iter, Global);
-        BTreeSet { map }
+        BTreeSet::from_sorted_iter(IntoIterator::into_iter(arr), Global)
     }
 }
 
@@ -1435,39 +1548,44 @@ impl<'a, T, A: Allocator + Clone> IntoIterator for &'a BTreeSet<T, A> {
     }
 }
 
-/// An iterator produced by calling `extract_if` on BTreeSet.
-#[unstable(feature = "btree_extract_if", issue = "70530")]
-#[must_use = "iterators are lazy and do nothing unless consumed"]
+/// This `struct` is created by the [`extract_if`] method on [`BTreeSet`].
+///
+/// [`extract_if`]: BTreeSet::extract_if
+#[stable(feature = "btree_extract_if", since = "1.91.0")]
+#[must_use = "iterators are lazy and do nothing unless consumed; \
+    use `retain` or `extract_if().for_each(drop)` to remove and discard elements"]
 pub struct ExtractIf<
     'a,
     T,
+    R,
     F,
     #[unstable(feature = "allocator_api", issue = "32838")] A: Allocator + Clone = Global,
-> where
-    T: 'a,
-    F: 'a + FnMut(&T) -> bool,
-{
+> {
     pred: F,
-    inner: super::map::ExtractIfInner<'a, T, SetValZST>,
+    inner: super::map::ExtractIfInner<'a, T, SetValZST, R>,
     /// The BTreeMap will outlive this IntoIter so we don't care about drop order for `alloc`.
     alloc: A,
 }
 
-#[unstable(feature = "btree_extract_if", issue = "70530")]
-impl<T, F, A: Allocator + Clone> fmt::Debug for ExtractIf<'_, T, F, A>
+#[stable(feature = "btree_extract_if", since = "1.91.0")]
+impl<T, R, F, A> fmt::Debug for ExtractIf<'_, T, R, F, A>
 where
     T: fmt::Debug,
-    F: FnMut(&T) -> bool,
+    A: Allocator + Clone,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_tuple("ExtractIf").field(&self.inner.peek().map(|(k, _)| k)).finish()
+        f.debug_struct("ExtractIf")
+            .field("peek", &self.inner.peek().map(|(k, _)| k))
+            .finish_non_exhaustive()
     }
 }
 
-#[unstable(feature = "btree_extract_if", issue = "70530")]
-impl<'a, T, F, A: Allocator + Clone> Iterator for ExtractIf<'_, T, F, A>
+#[stable(feature = "btree_extract_if", since = "1.91.0")]
+impl<T, R, F, A: Allocator + Clone> Iterator for ExtractIf<'_, T, R, F, A>
 where
-    F: 'a + FnMut(&T) -> bool,
+    T: PartialOrd,
+    R: RangeBounds<T>,
+    F: FnMut(&T) -> bool,
 {
     type Item = T;
 
@@ -1482,8 +1600,14 @@ where
     }
 }
 
-#[unstable(feature = "btree_extract_if", issue = "70530")]
-impl<T, F, A: Allocator + Clone> FusedIterator for ExtractIf<'_, T, F, A> where F: FnMut(&T) -> bool {}
+#[stable(feature = "btree_extract_if", since = "1.91.0")]
+impl<T, R, F, A: Allocator + Clone> FusedIterator for ExtractIf<'_, T, R, F, A>
+where
+    T: PartialOrd,
+    R: RangeBounds<T>,
+    F: FnMut(&T) -> bool,
+{
+}
 
 #[stable(feature = "rust1", since = "1.0.0")]
 impl<T: Ord, A: Allocator + Clone> Extend<T> for BTreeSet<T, A> {
@@ -1633,6 +1757,7 @@ impl<T> Clone for Iter<'_, T> {
         Iter { iter: self.iter.clone() }
     }
 }
+
 #[stable(feature = "rust1", since = "1.0.0")]
 impl<'a, T> Iterator for Iter<'a, T> {
     type Item = &'a T;
@@ -1663,18 +1788,23 @@ impl<'a, T> Iterator for Iter<'a, T> {
         self.next_back()
     }
 }
+
 #[stable(feature = "rust1", since = "1.0.0")]
 impl<'a, T> DoubleEndedIterator for Iter<'a, T> {
     fn next_back(&mut self) -> Option<&'a T> {
         self.iter.next_back()
     }
 }
+
 #[stable(feature = "rust1", since = "1.0.0")]
 impl<T> ExactSizeIterator for Iter<'_, T> {
     fn len(&self) -> usize {
         self.iter.len()
     }
 }
+
+#[unstable(feature = "trusted_len", issue = "37572")]
+unsafe impl<T> TrustedLen for Iter<'_, T> {}
 
 #[stable(feature = "fused", since = "1.26.0")]
 impl<T> FusedIterator for Iter<'_, T> {}
@@ -1712,12 +1842,16 @@ impl<T, A: Allocator + Clone> DoubleEndedIterator for IntoIter<T, A> {
         self.iter.next_back().map(|(k, _)| k)
     }
 }
+
 #[stable(feature = "rust1", since = "1.0.0")]
 impl<T, A: Allocator + Clone> ExactSizeIterator for IntoIter<T, A> {
     fn len(&self) -> usize {
         self.iter.len()
     }
 }
+
+#[unstable(feature = "trusted_len", issue = "37572")]
+unsafe impl<T, A: Allocator + Clone> TrustedLen for IntoIter<T, A> {}
 
 #[stable(feature = "fused", since = "1.26.0")]
 impl<T, A: Allocator + Clone> FusedIterator for IntoIter<T, A> {}

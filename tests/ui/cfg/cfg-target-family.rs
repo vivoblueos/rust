@@ -1,7 +1,8 @@
 //@ build-pass
 //@ ignore-sgx
+//@ reference: cfg.target_family.def
+//@ reference: cfg.target_family.values
 
-//@ pretty-expanded FIXME #23616
 
 #[cfg(target_family = "windows")]
 pub fn main() {}

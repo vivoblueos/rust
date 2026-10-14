@@ -1,15 +1,18 @@
 use rustc_ast::ast::ParamKindOrd;
 use rustc_errors::codes::*;
-use rustc_errors::{Applicability, Diag, ErrorGuaranteed, MultiSpan, struct_span_code_err};
-use rustc_hir as hir;
-use rustc_hir::GenericArg;
+use rustc_errors::{
+    Applicability, Diag, DiagCtxtHandle, Diagnostic, ErrorGuaranteed, Level, MultiSpan,
+    struct_span_code_err,
+};
 use rustc_hir::def::{DefKind, Res};
 use rustc_hir::def_id::DefId;
+use rustc_hir::{self as hir, GenericArg};
 use rustc_middle::ty::{
     self, GenericArgsRef, GenericParamDef, GenericParamDefKind, IsSuggestable, Ty,
 };
 use rustc_session::lint::builtin::LATE_BOUND_LIFETIME_ARGUMENTS;
-use rustc_span::symbol::{kw, sym};
+use rustc_span::kw;
+use rustc_trait_selection::traits;
 use smallvec::SmallVec;
 use tracing::{debug, instrument};
 
@@ -41,17 +44,6 @@ fn generic_arg_mismatch_err(
         param.kind.descr(),
     );
 
-    if let GenericParamDefKind::Const { .. } = param.kind {
-        if matches!(arg, GenericArg::Type(hir::Ty { kind: hir::TyKind::Infer, .. })) {
-            err.help("const arguments cannot yet be inferred with `_`");
-            tcx.disabled_nightly_features(
-                &mut err,
-                param.def_id.as_local().map(|local| tcx.local_def_id_to_hir_id(local)),
-                [(String::new(), sym::generic_arg_infer)],
-            );
-        }
-    }
-
     let add_braces_suggestion = |arg: &GenericArg<'_>, err: &mut Diag<'_>| {
         let suggestions = vec![
             (arg.span().shrink_to_lo(), String::from("{ ")),
@@ -82,10 +74,10 @@ fn generic_arg_mismatch_err(
             }
             Res::Def(DefKind::TyParam, src_def_id) => {
                 if let Some(param_local_id) = param.def_id.as_local() {
-                    let param_name = tcx.hir().ty_param_name(param_local_id);
+                    let param_name = tcx.hir_ty_param_name(param_local_id);
                     let param_type = tcx.type_of(param.def_id).instantiate_identity();
                     if param_type.is_suggestable(tcx, false) {
-                        err.span_suggestion(
+                        err.span_suggestion_verbose(
                             tcx.def_span(src_def_id),
                             "consider changing this type parameter to a const parameter",
                             format!("const {param_name}: {param_type}"),
@@ -104,7 +96,7 @@ fn generic_arg_mismatch_err(
             GenericArg::Type(hir::Ty { kind: hir::TyKind::Array(_, len), .. }),
             GenericParamDefKind::Const { .. },
         ) if tcx.type_of(param.def_id).skip_binder() == tcx.types.usize => {
-            let snippet = sess.source_map().span_to_snippet(tcx.hir().span(len.hir_id()));
+            let snippet = sess.source_map().span_to_snippet(tcx.hir_span(len.hir_id));
             if let Ok(snippet) = snippet {
                 err.span_suggestion(
                     arg.span(),
@@ -122,12 +114,12 @@ fn generic_arg_mismatch_err(
                 err.help(format!("`{}` is a function item, not a type", tcx.item_name(id)));
                 err.help("function item types cannot be named directly");
             } else if let hir::ConstArgKind::Anon(anon) = cnst.kind
-                && let body = tcx.hir().body(anon.body)
+                && let body = tcx.hir_body(anon.body)
                 && let rustc_hir::ExprKind::Path(rustc_hir::QPath::Resolved(_, path)) =
                     body.value.kind
                 && let Res::Def(DefKind::Fn { .. }, id) = path.res
             {
-                // FIXME(min_generic_const_args): this branch is dead once new const path lowering
+                // FIXME(mgca): this branch is dead once new const path lowering
                 // (for single-segment paths) is no longer gated
                 err.help(format!("`{}` is a function item, not a type", tcx.item_name(id)));
                 err.help("function item types cannot be named directly");
@@ -270,6 +262,8 @@ pub fn lower_generic_args<'tcx: 'a, 'a>(
                             GenericParamDefKind::Const { .. },
                             _,
                         ) => {
+                            // We lower to an infer even when the feature gate is not enabled
+                            // as it is useful for diagnostics to be able to see a `ConstKind::Infer`
                             args.push(ctx.provided_kind(&args, param, arg));
                             args_iter.next();
                             params.next();
@@ -391,19 +385,15 @@ pub fn lower_generic_args<'tcx: 'a, 'a>(
 
 /// Checks that the correct number of generic arguments have been provided.
 /// Used specifically for function calls.
-pub fn check_generic_arg_count_for_call(
+pub fn check_generic_arg_count_for_value_path(
     cx: &dyn HirTyLowerer<'_>,
     def_id: DefId,
     generics: &ty::Generics,
     seg: &hir::PathSegment<'_>,
     is_method_call: IsMethodCall,
 ) -> GenericArgCountResult {
-    let gen_pos = match is_method_call {
-        IsMethodCall::Yes => GenericArgPosition::MethodCall,
-        IsMethodCall::No => GenericArgPosition::Value,
-    };
-    let has_self = generics.parent.is_none() && generics.has_self;
-    check_generic_arg_count(cx, def_id, seg, generics, gen_pos, has_self)
+    let gen_pos = GenericArgPosition::Value(is_method_call);
+    check_generic_arg_count(cx, def_id, seg, generics, gen_pos, generics.has_own_self())
 }
 
 /// Checks that the correct number of generic arguments have been provided.
@@ -429,14 +419,7 @@ pub(crate) fn check_generic_arg_count(
         .filter(|param| matches!(param.kind, ty::GenericParamDefKind::Type { synthetic: true, .. }))
         .count();
     let named_type_param_count = param_counts.types - has_self as usize - synth_type_param_count;
-    let synth_const_param_count = gen_params
-        .own_params
-        .iter()
-        .filter(|param| {
-            matches!(param.kind, ty::GenericParamDefKind::Const { synthetic: true, .. })
-        })
-        .count();
-    let named_const_param_count = param_counts.consts - synth_const_param_count;
+    let named_const_param_count = param_counts.consts;
     let infer_lifetimes =
         (gen_pos != GenericArgPosition::Type || seg.infer_args) && !gen_args.has_lifetime_params();
 
@@ -539,8 +522,7 @@ pub(crate) fn check_generic_arg_count(
             // ```
             let parent_is_impl_block = cx
                 .tcx()
-                .hir()
-                .parent_owner_iter(seg.hir_id)
+                .hir_parent_owner_iter(seg.hir_id)
                 .next()
                 .is_some_and(|(_, owner_node)| owner_node.is_impl_block());
             if parent_is_impl_block {
@@ -553,9 +535,26 @@ pub(crate) fn check_generic_arg_count(
                     .map(|param| param.name)
                     .collect();
                 if constraint_names == param_names {
+                    let has_assoc_ty_with_same_name =
+                        if let DefKind::Trait = cx.tcx().def_kind(def_id) {
+                            gen_args.constraints.iter().any(|constraint| {
+                                traits::supertrait_def_ids(cx.tcx(), def_id).any(|trait_did| {
+                                    cx.probe_trait_that_defines_assoc_item(
+                                        trait_did,
+                                        ty::AssocTag::Type,
+                                        constraint.ident,
+                                    )
+                                })
+                            })
+                        } else {
+                            false
+                        };
                     // We set this to true and delay emitting `WrongNumberOfGenericArgs`
-                    // to provide a succinct error for cases like issue #113073
-                    all_params_are_binded = true;
+                    // to provide a succinct error for cases like issue #113073,
+                    // but only if when we don't have any assoc type with the same name with a
+                    // generic arg. Otherwise it will cause an ICE due to a delayed error because we
+                    // don't have any error other than `WrongNumberOfGenericArgs`.
+                    all_params_are_binded = !has_assoc_ty_with_same_name;
                 };
             }
 
@@ -581,7 +580,7 @@ pub(crate) fn check_generic_arg_count(
                     gen_args,
                     def_id,
                 ))
-                .emit_unless(all_params_are_binded)
+                .emit_unless_delay(all_params_are_binded)
         });
 
         Err(reported)
@@ -626,20 +625,28 @@ pub(crate) fn prohibit_explicit_late_bound_lifetimes(
     args: &hir::GenericArgs<'_>,
     position: GenericArgPosition,
 ) -> ExplicitLateBound {
-    let param_counts = def.own_counts();
-    let infer_lifetimes = position != GenericArgPosition::Type && !args.has_lifetime_params();
-
-    if infer_lifetimes {
-        return ExplicitLateBound::No;
+    struct LifetimeArgsIssue {
+        msg: &'static str,
     }
 
-    if let Some(span_late) = def.has_late_bound_regions {
+    impl<'a> Diagnostic<'a, ()> for LifetimeArgsIssue {
+        fn into_diag(self, dcx: DiagCtxtHandle<'a>, level: Level) -> Diag<'a, ()> {
+            let Self { msg } = self;
+            Diag::new(dcx, level, msg)
+        }
+    }
+
+    let param_counts = def.own_counts();
+
+    if let Some(span_late) = def.has_late_bound_regions
+        && args.has_lifetime_params()
+    {
         let msg = "cannot specify lifetime arguments explicitly \
                        if late bound lifetime parameters are present";
         let note = "the late bound lifetime parameter is introduced here";
         let span = args.args[0].span();
 
-        if position == GenericArgPosition::Value
+        if position == GenericArgPosition::Value(IsMethodCall::No)
             && args.num_lifetime_params() != param_counts.lifetimes
         {
             struct_span_code_err!(cx.dcx(), span, E0794, "{}", msg)
@@ -648,13 +655,11 @@ pub(crate) fn prohibit_explicit_late_bound_lifetimes(
         } else {
             let mut multispan = MultiSpan::from_span(span);
             multispan.push_span_label(span_late, note);
-            cx.tcx().node_span_lint(
+            cx.tcx().emit_node_span_lint(
                 LATE_BOUND_LIFETIME_ARGUMENTS,
                 args.args[0].hir_id(),
                 multispan,
-                |lint| {
-                    lint.primary_message(msg);
-                },
+                LifetimeArgsIssue { msg },
             );
         }
 

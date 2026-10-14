@@ -1,34 +1,41 @@
 use clippy_utils::diagnostics::span_lint_and_then;
-use clippy_utils::ty::{implements_trait, is_must_use_ty, match_type};
+use clippy_utils::ty::{implements_trait, is_must_use_ty};
 use clippy_utils::{is_from_proc_macro, is_must_use_func_call, paths};
 use rustc_hir::{LetStmt, LocalSource, PatKind};
 use rustc_lint::{LateContext, LateLintPass};
-use rustc_middle::lint::in_external_macro;
 use rustc_middle::ty::{GenericArgKind, IsSuggestable};
 use rustc_session::declare_lint_pass;
 use rustc_span::{BytePos, Span};
 
 declare_clippy_lint! {
     /// ### What it does
-    /// Checks for `let _ = <expr>` where expr is `#[must_use]`
+    /// Checks for `let _ = <expr>` where the resulting type of expr implements `Future`
     ///
-    /// ### Why restrict this?
-    /// To ensure that all `#[must_use]` types are used rather than ignored.
+    /// ### Why is this bad?
+    /// Futures must be polled for work to be done. The original intention was most likely to await the future
+    /// and ignore the resulting value.
     ///
     /// ### Example
     /// ```no_run
-    /// fn f() -> Result<u32, u32> {
-    ///     Ok(0)
+    /// async fn foo() -> Result<(), ()> {
+    ///     Ok(())
     /// }
-    ///
-    /// let _ = f();
-    /// // is_ok() is marked #[must_use]
-    /// let _ = f().is_ok();
+    /// let _ = foo();
     /// ```
-    #[clippy::version = "1.42.0"]
-    pub LET_UNDERSCORE_MUST_USE,
-    restriction,
-    "non-binding `let` on a `#[must_use]` expression"
+    ///
+    /// Use instead:
+    /// ```no_run
+    /// # async fn context() {
+    /// async fn foo() -> Result<(), ()> {
+    ///     Ok(())
+    /// }
+    /// let _ = foo().await;
+    /// # }
+    /// ```
+    #[clippy::version = "1.67.0"]
+    pub LET_UNDERSCORE_FUTURE,
+    suspicious,
+    "non-binding `let` on a future"
 }
 
 declare_clippy_lint! {
@@ -61,33 +68,25 @@ declare_clippy_lint! {
 
 declare_clippy_lint! {
     /// ### What it does
-    /// Checks for `let _ = <expr>` where the resulting type of expr implements `Future`
+    /// Checks for `let _ = <expr>` where expr is `#[must_use]`
     ///
-    /// ### Why is this bad?
-    /// Futures must be polled for work to be done. The original intention was most likely to await the future
-    /// and ignore the resulting value.
+    /// ### Why restrict this?
+    /// To ensure that all `#[must_use]` types are used rather than ignored.
     ///
     /// ### Example
     /// ```no_run
-    /// async fn foo() -> Result<(), ()> {
-    ///     Ok(())
+    /// fn f() -> Result<u32, u32> {
+    ///     Ok(0)
     /// }
-    /// let _ = foo();
-    /// ```
     ///
-    /// Use instead:
-    /// ```no_run
-    /// # async fn context() {
-    /// async fn foo() -> Result<(), ()> {
-    ///     Ok(())
-    /// }
-    /// let _ = foo().await;
-    /// # }
+    /// let _ = f();
+    /// // is_ok() is marked #[must_use]
+    /// let _ = f().is_ok();
     /// ```
-    #[clippy::version = "1.67.0"]
-    pub LET_UNDERSCORE_FUTURE,
-    suspicious,
-    "non-binding `let` on a future"
+    #[clippy::version = "1.42.0"]
+    pub LET_UNDERSCORE_MUST_USE,
+    restriction,
+    "non-binding `let` on a `#[must_use]` expression"
 }
 
 declare_clippy_lint! {
@@ -128,24 +127,25 @@ declare_clippy_lint! {
     "non-binding `let` without a type annotation"
 }
 
-declare_lint_pass!(LetUnderscore => [LET_UNDERSCORE_MUST_USE, LET_UNDERSCORE_LOCK, LET_UNDERSCORE_FUTURE, LET_UNDERSCORE_UNTYPED]);
-
-const SYNC_GUARD_PATHS: [&[&str]; 3] = [
-    &paths::PARKING_LOT_MUTEX_GUARD,
-    &paths::PARKING_LOT_RWLOCK_READ_GUARD,
-    &paths::PARKING_LOT_RWLOCK_WRITE_GUARD,
-];
+declare_lint_pass!(LetUnderscore => [
+    LET_UNDERSCORE_FUTURE,
+    LET_UNDERSCORE_LOCK,
+    LET_UNDERSCORE_MUST_USE,
+    LET_UNDERSCORE_UNTYPED,
+]);
 
 impl<'tcx> LateLintPass<'tcx> for LetUnderscore {
     fn check_local(&mut self, cx: &LateContext<'tcx>, local: &LetStmt<'tcx>) {
         if matches!(local.source, LocalSource::Normal)
             && let PatKind::Wild = local.pat.kind
             && let Some(init) = local.init
-            && !in_external_macro(cx.tcx.sess, local.span)
+            && !local.span.in_external_macro(cx.tcx.sess.source_map())
         {
             let init_ty = cx.typeck_results().expr_ty(init);
-            let contains_sync_guard = init_ty.walk().any(|inner| match inner.unpack() {
-                GenericArgKind::Type(inner_ty) => SYNC_GUARD_PATHS.iter().any(|path| match_type(cx, inner_ty, path)),
+            let contains_sync_guard = init_ty.walk().any(|inner| match inner.kind() {
+                GenericArgKind::Type(inner_ty) => inner_ty
+                    .ty_adt_def()
+                    .is_some_and(|adt| paths::PARKING_LOT_GUARDS.iter().any(|path| path.matches(cx, adt.did()))),
                 GenericArgKind::Lifetime(_) | GenericArgKind::Const(_) => false,
             });
             if contains_sync_guard {

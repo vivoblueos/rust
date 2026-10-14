@@ -4,30 +4,26 @@ use std::ops::Range;
 use std::{cmp, fmt, mem};
 
 use rustc_data_structures::fx::FxHashMap;
-use rustc_data_structures::sync::Lrc;
 use rustc_data_structures::undo_log::UndoLogs;
 use rustc_data_structures::unify as ut;
 use rustc_index::IndexVec;
 use rustc_macros::{TypeFoldable, TypeVisitable};
-use rustc_middle::infer::unify_key::{RegionVariableValue, RegionVidKey};
 use rustc_middle::ty::{self, ReBound, ReStatic, ReVar, Region, RegionVid, Ty, TyCtxt};
 use rustc_middle::{bug, span_bug};
-use rustc_span::Span;
 use tracing::{debug, instrument};
 
 use self::CombineMapType::*;
 use self::UndoLog::*;
-use super::{MiscVariable, RegionVariableOrigin, Rollback, SubregionOrigin};
+use super::{RegionVariableOrigin, Rollback, SubregionOrigin};
 use crate::infer::snapshot::undo_log::{InferCtxtUndoLogs, Snapshot};
+use crate::infer::unify_key::{RegionVariableValue, RegionVidKey};
 
 mod leak_check;
-
-pub use rustc_middle::infer::MemberConstraint;
 
 #[derive(Clone, Default)]
 pub struct RegionConstraintStorage<'tcx> {
     /// For each `RegionVid`, the corresponding `RegionVariableOrigin`.
-    pub(super) var_infos: IndexVec<RegionVid, RegionVariableInfo>,
+    pub(super) var_infos: IndexVec<RegionVid, RegionVariableInfo<'tcx>>,
 
     pub(super) data: RegionConstraintData<'tcx>,
 
@@ -61,7 +57,7 @@ pub struct RegionConstraintCollector<'a, 'tcx> {
     undo_log: &'a mut InferCtxtUndoLogs<'tcx>,
 }
 
-pub type VarInfos = IndexVec<RegionVid, RegionVariableInfo>;
+pub type VarInfos<'tcx> = IndexVec<RegionVid, RegionVariableInfo<'tcx>>;
 
 /// The full set of region constraints gathered up by the collector.
 /// Describes constraints between the region variables and other
@@ -72,11 +68,6 @@ pub struct RegionConstraintData<'tcx> {
     /// Constraints of the form `A <= B`, where either `A` or `B` can
     /// be a region variable (or neither, as it happens).
     pub constraints: Vec<(Constraint<'tcx>, SubregionOrigin<'tcx>)>,
-
-    /// Constraints of the form `R0 member of [R1, ..., Rn]`, meaning that
-    /// `R0` must be equal to one of the regions `R1..Rn`. These occur
-    /// with `impl Trait` quite frequently.
-    pub member_constraints: Vec<MemberConstraint<'tcx>>,
 
     /// A "verify" is something that we need to verify after inference
     /// is done, but which does not directly affect inference in any
@@ -89,31 +80,37 @@ pub struct RegionConstraintData<'tcx> {
 
 /// Represents a constraint that influences the inference process.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
-pub enum Constraint<'tcx> {
+pub enum ConstraintKind {
     /// A region variable is a subregion of another.
-    VarSubVar(RegionVid, RegionVid),
+    VarSubVar,
 
     /// A concrete region is a subregion of region variable.
-    RegSubVar(Region<'tcx>, RegionVid),
+    RegSubVar,
 
     /// A region variable is a subregion of a concrete region. This does not
     /// directly affect inference, but instead is checked after
     /// inference is complete.
-    VarSubReg(RegionVid, Region<'tcx>),
+    VarSubReg,
 
     /// A constraint where neither side is a variable. This does not
     /// directly affect inference, but instead is checked after
     /// inference is complete.
-    RegSubReg(Region<'tcx>, Region<'tcx>),
+    RegSubReg,
+}
+
+/// Represents a constraint that influences the inference process.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
+pub struct Constraint<'tcx> {
+    pub kind: ConstraintKind,
+    // If `kind` is `VarSubVar` or `VarSubReg`, this must be a `ReVar`.
+    pub sub: Region<'tcx>,
+    // If `kind` is `VarSubVar` or `RegSubVar`, this must be a `ReVar`.
+    pub sup: Region<'tcx>,
 }
 
 impl Constraint<'_> {
     pub fn involves_placeholders(&self) -> bool {
-        match self {
-            Constraint::VarSubVar(_, _) => false,
-            Constraint::VarSubReg(_, r) | Constraint::RegSubVar(r, _) => r.is_placeholder(),
-            Constraint::RegSubReg(r, s) => r.is_placeholder() || s.is_placeholder(),
-        }
+        self.sub.is_placeholder() || self.sup.is_placeholder()
     }
 }
 
@@ -128,7 +125,7 @@ pub struct Verify<'tcx> {
 #[derive(Copy, Clone, PartialEq, Eq, Hash, TypeFoldable, TypeVisitable)]
 pub enum GenericKind<'tcx> {
     Param(ty::ParamTy),
-    Placeholder(ty::PlaceholderType),
+    Placeholder(ty::PlaceholderType<'tcx>),
     Alias(ty::AliasTy<'tcx>),
 }
 
@@ -272,8 +269,8 @@ pub(crate) enum CombineMapType {
 type CombineMap<'tcx> = FxHashMap<TwoRegions<'tcx>, RegionVid>;
 
 #[derive(Debug, Clone, Copy)]
-pub struct RegionVariableInfo {
-    pub origin: RegionVariableOrigin,
+pub struct RegionVariableInfo<'tcx> {
+    pub origin: RegionVariableOrigin<'tcx>,
     // FIXME: This is only necessary for `fn take_and_reset_data` and
     // `lexical_region_resolve`. We should rework `lexical_region_resolve`
     // in the near/medium future anyways and could move the unverse info
@@ -306,10 +303,6 @@ impl<'tcx> RegionConstraintStorage<'tcx> {
 impl<'tcx> RegionConstraintCollector<'_, 'tcx> {
     pub fn num_region_vars(&self) -> usize {
         self.storage.var_infos.len()
-    }
-
-    pub fn region_constraint_data(&self) -> &RegionConstraintData<'tcx> {
-        &self.storage.data
     }
 
     /// Takes (and clears) the current set of constraints. Note that
@@ -381,7 +374,7 @@ impl<'tcx> RegionConstraintCollector<'_, 'tcx> {
     pub(super) fn new_region_var(
         &mut self,
         universe: ty::UniverseIndex,
-        origin: RegionVariableOrigin,
+        origin: RegionVariableOrigin<'tcx>,
     ) -> RegionVid {
         let vid = self.storage.var_infos.push(RegionVariableInfo { origin, universe });
 
@@ -393,7 +386,7 @@ impl<'tcx> RegionConstraintCollector<'_, 'tcx> {
     }
 
     /// Returns the origin for the given variable.
-    pub(super) fn var_origin(&self, vid: RegionVid) -> RegionVariableOrigin {
+    pub(super) fn var_origin(&self, vid: RegionVid) -> RegionVariableOrigin<'tcx> {
         self.storage.var_infos[vid].origin
     }
 
@@ -466,29 +459,6 @@ impl<'tcx> RegionConstraintCollector<'_, 'tcx> {
         }
     }
 
-    pub(super) fn member_constraint(
-        &mut self,
-        key: ty::OpaqueTypeKey<'tcx>,
-        definition_span: Span,
-        hidden_ty: Ty<'tcx>,
-        member_region: ty::Region<'tcx>,
-        choice_regions: Lrc<Vec<ty::Region<'tcx>>>,
-    ) {
-        debug!("member_constraint({:?} in {:#?})", member_region, choice_regions);
-
-        if choice_regions.iter().any(|&r| r == member_region) {
-            return;
-        }
-
-        self.storage.data.member_constraints.push(MemberConstraint {
-            key,
-            definition_span,
-            hidden_ty,
-            member_region,
-            choice_regions,
-        });
-    }
-
     #[instrument(skip(self, origin), level = "debug")]
     pub(super) fn make_subregion(
         &mut self,
@@ -499,7 +469,7 @@ impl<'tcx> RegionConstraintCollector<'_, 'tcx> {
         // cannot add constraints once regions are resolved
         debug!("origin = {:#?}", origin);
 
-        match (*sub, *sup) {
+        match (sub.kind(), sup.kind()) {
             (ReBound(..), _) | (_, ReBound(..)) => {
                 span_bug!(origin.span(), "cannot relate bound region: {:?} <= {:?}", sub, sup);
             }
@@ -507,16 +477,24 @@ impl<'tcx> RegionConstraintCollector<'_, 'tcx> {
                 // all regions are subregions of static, so we can ignore this
             }
             (ReVar(sub_id), ReVar(sup_id)) => {
-                self.add_constraint(Constraint::VarSubVar(sub_id, sup_id), origin);
+                if sub_id != sup_id {
+                    self.add_constraint(
+                        Constraint { kind: ConstraintKind::VarSubVar, sub, sup },
+                        origin,
+                    );
+                }
             }
-            (_, ReVar(sup_id)) => {
-                self.add_constraint(Constraint::RegSubVar(sub, sup_id), origin);
-            }
-            (ReVar(sub_id), _) => {
-                self.add_constraint(Constraint::VarSubReg(sub_id, sup), origin);
-            }
+            (_, ReVar(_)) => self
+                .add_constraint(Constraint { kind: ConstraintKind::RegSubVar, sub, sup }, origin),
+            (ReVar(_), _) => self
+                .add_constraint(Constraint { kind: ConstraintKind::VarSubReg, sub, sup }, origin),
             _ => {
-                self.add_constraint(Constraint::RegSubReg(sub, sup), origin);
+                if sub != sup {
+                    self.add_constraint(
+                        Constraint { kind: ConstraintKind::RegSubReg, sub, sup },
+                        origin,
+                    )
+                }
             }
         }
     }
@@ -616,7 +594,7 @@ impl<'tcx> RegionConstraintCollector<'_, 'tcx> {
         let a_universe = self.universe(a);
         let b_universe = self.universe(b);
         let c_universe = cmp::max(a_universe, b_universe);
-        let c = self.new_region_var(c_universe, MiscVariable(origin.span()));
+        let c = self.new_region_var(c_universe, RegionVariableOrigin::Misc(origin.span()));
         self.combine_map(t).insert(vars, c);
         self.undo_log.push(AddCombination(t, vars));
         let new_r = ty::Region::new_var(tcx, c);
@@ -631,7 +609,7 @@ impl<'tcx> RegionConstraintCollector<'_, 'tcx> {
     }
 
     pub fn universe(&mut self, region: Region<'tcx>) -> ty::UniverseIndex {
-        match *region {
+        match region.kind() {
             ty::ReStatic
             | ty::ReErased
             | ty::ReLateParam(..)
@@ -646,17 +624,15 @@ impl<'tcx> RegionConstraintCollector<'_, 'tcx> {
         }
     }
 
-    pub fn vars_since_snapshot(
-        &self,
+    pub fn vars_since_snapshot<'a>(
+        &'a self,
         value_count: usize,
-    ) -> (Range<RegionVid>, Vec<RegionVariableOrigin>) {
+    ) -> (Range<RegionVid>, Vec<RegionVariableOrigin<'tcx>>) {
         let range =
             RegionVid::from(value_count)..RegionVid::from(self.storage.unification_table.len());
         (
             range.clone(),
-            (range.start.index()..range.end.index())
-                .map(|index| self.storage.var_infos[ty::RegionVid::from(index)].origin)
-                .collect(),
+            (range.start..range.end).map(|index| self.storage.var_infos[index].origin).collect(),
         )
     }
 
@@ -693,7 +669,7 @@ impl<'tcx> fmt::Display for GenericKind<'tcx> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match *self {
             GenericKind::Param(ref p) => write!(f, "{p}"),
-            GenericKind::Placeholder(ref p) => write!(f, "{p:?}"),
+            GenericKind::Placeholder(ref p) => write!(f, "{p}"),
             GenericKind::Alias(ref p) => write!(f, "{p}"),
         }
     }
@@ -745,8 +721,8 @@ impl<'tcx> RegionConstraintData<'tcx> {
     /// Returns `true` if this region constraint data contains no constraints, and `false`
     /// otherwise.
     pub fn is_empty(&self) -> bool {
-        let RegionConstraintData { constraints, member_constraints, verifys } = self;
-        constraints.is_empty() && member_constraints.is_empty() && verifys.is_empty()
+        let RegionConstraintData { constraints, verifys } = self;
+        constraints.is_empty() && verifys.is_empty()
     }
 }
 

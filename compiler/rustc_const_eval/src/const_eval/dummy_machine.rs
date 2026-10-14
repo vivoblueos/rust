@@ -1,9 +1,11 @@
 use rustc_middle::mir::interpret::{AllocId, ConstAllocation, InterpResult};
 use rustc_middle::mir::*;
 use rustc_middle::query::TyCtxtAt;
+use rustc_middle::ty::Ty;
 use rustc_middle::ty::layout::TyAndLayout;
 use rustc_middle::{bug, span_bug, ty};
 use rustc_span::def_id::DefId;
+use rustc_target::callconv::FnAbi;
 
 use crate::interpret::{
     self, HasStaticRootDefId, ImmTy, Immediate, InterpCx, PointerArithmetic, interp_ok,
@@ -23,17 +25,8 @@ pub macro throw_machine_stop_str($($tt:tt)*) {{
             write!(f, $($tt)*)
         }
     }
+    impl rustc_middle::mir::interpret::MachineStopType for Zst {}
 
-    impl rustc_middle::mir::interpret::MachineStopType for Zst {
-        fn diagnostic_message(&self) -> rustc_errors::DiagMessage {
-            self.to_string().into()
-        }
-
-        fn add_args(
-            self: Box<Self>,
-            _: &mut dyn FnMut(rustc_errors::DiagArgName, rustc_errors::DiagArgValue),
-        ) {}
-    }
     throw_machine_stop!(Zst)
 }}
 
@@ -47,7 +40,6 @@ impl HasStaticRootDefId for DummyMachine {
 
 impl<'tcx> interpret::Machine<'tcx> for DummyMachine {
     interpret::compile_time_machine!(<'tcx>);
-    type MemoryKind = !;
     const PANIC_ON_ALLOC_FAIL: bool = true;
 
     // We want to just eval random consts in the program, so `eval_mir_const` can fail.
@@ -86,9 +78,9 @@ impl<'tcx> interpret::Machine<'tcx> for DummyMachine {
     fn find_mir_or_eval_fn(
         _ecx: &mut InterpCx<'tcx, Self>,
         _instance: ty::Instance<'tcx>,
-        _abi: rustc_abi::ExternAbi,
+        _abi: &FnAbi<'tcx, Ty<'tcx>>,
         _args: &[interpret::FnArg<'tcx, Self::Provenance>],
-        _destination: &interpret::MPlaceTy<'tcx, Self::Provenance>,
+        _destination: &interpret::PlaceTy<'tcx, Self::Provenance>,
         _target: Option<BasicBlock>,
         _unwind: UnwindAction,
     ) -> interpret::InterpResult<'tcx, Option<(&'tcx Body<'tcx>, ty::Instance<'tcx>)>> {
@@ -106,7 +98,7 @@ impl<'tcx> interpret::Machine<'tcx> for DummyMachine {
         _ecx: &mut InterpCx<'tcx, Self>,
         _instance: ty::Instance<'tcx>,
         _args: &[interpret::OpTy<'tcx, Self::Provenance>],
-        _destination: &interpret::MPlaceTy<'tcx, Self::Provenance>,
+        _destination: &interpret::PlaceTy<'tcx, Self::Provenance>,
         _target: Option<BasicBlock>,
         _unwind: UnwindAction,
     ) -> interpret::InterpResult<'tcx, Option<ty::Instance<'tcx>>> {
@@ -119,6 +111,13 @@ impl<'tcx> interpret::Machine<'tcx> for DummyMachine {
         _unwind: UnwindAction,
     ) -> interpret::InterpResult<'tcx> {
         unimplemented!()
+    }
+
+    #[inline(always)]
+    fn runtime_checks(_ecx: &InterpCx<'tcx, Self>, r: RuntimeChecks) -> InterpResult<'tcx, bool> {
+        // Runtime checks have different value depending on the crate they are codegenned in.
+        // Verify we aren't trying to evaluate them in mir-optimizations.
+        panic!("compiletime machine evaluated {r:?}")
     }
 
     fn binary_ptr_op(
@@ -168,9 +167,9 @@ impl<'tcx> interpret::Machine<'tcx> for DummyMachine {
         })
     }
 
-    fn expose_ptr(
-        _ecx: &mut InterpCx<'tcx, Self>,
-        _ptr: interpret::Pointer<Self::Provenance>,
+    fn expose_provenance(
+        _ecx: &InterpCx<'tcx, Self>,
+        _provenance: Self::Provenance,
     ) -> interpret::InterpResult<'tcx> {
         unimplemented!()
     }
@@ -194,5 +193,10 @@ impl<'tcx> interpret::Machine<'tcx> for DummyMachine {
         _ecx: &'a mut InterpCx<'tcx, Self>,
     ) -> &'a mut Vec<interpret::Frame<'tcx, Self::Provenance, Self::FrameExtra>> {
         unimplemented!()
+    }
+
+    fn get_default_alloc_params(
+        &self,
+    ) -> <Self::Bytes as rustc_middle::mir::interpret::AllocBytes>::AllocParams {
     }
 }

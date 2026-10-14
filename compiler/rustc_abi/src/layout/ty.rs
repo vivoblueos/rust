@@ -1,68 +1,24 @@
 use std::fmt;
 use std::ops::Deref;
 
-use Float::*;
-use Primitive::*;
 use rustc_data_structures::intern::Interned;
 use rustc_macros::HashStable_Generic;
 
+use crate::layout::{FieldIdx, VariantIdx};
+use crate::{
+    AbiAlign, Align, BackendRepr, FieldsShape, Float, HasDataLayout, LayoutData, Niche,
+    PointeeInfo, Primitive, Size, Variants,
+};
+
 // Explicitly import `Float` to avoid ambiguity with `Primitive::Float`.
-use crate::{Float, *};
 
-rustc_index::newtype_index! {
-    /// The *source-order* index of a field in a variant.
-    ///
-    /// This is how most code after type checking refers to fields, rather than
-    /// using names (as names have hygiene complications and more complex lookup).
-    ///
-    /// Particularly for `repr(Rust)` types, this may not be the same as *layout* order.
-    /// (It is for `repr(C)` `struct`s, however.)
-    ///
-    /// For example, in the following types,
-    /// ```rust
-    /// # enum Never {}
-    /// # #[repr(u16)]
-    /// enum Demo1 {
-    ///    Variant0 { a: Never, b: i32 } = 100,
-    ///    Variant1 { c: u8, d: u64 } = 10,
-    /// }
-    /// struct Demo2 { e: u8, f: u16, g: u8 }
-    /// ```
-    /// `b` is `FieldIdx(1)` in `VariantIdx(0)`,
-    /// `d` is `FieldIdx(1)` in `VariantIdx(1)`, and
-    /// `f` is `FieldIdx(1)` in `VariantIdx(0)`.
-    #[derive(HashStable_Generic)]
-    #[encodable]
-    #[orderable]
-    pub struct FieldIdx {}
-}
-
-rustc_index::newtype_index! {
-    /// The *source-order* index of a variant in a type.
-    ///
-    /// For enums, these are always `0..variant_count`, regardless of any
-    /// custom discriminants that may have been defined, and including any
-    /// variants that may end up uninhabited due to field types.  (Some of the
-    /// variants may not be present in a monomorphized ABI [`Variants`], but
-    /// those skipped variants are always counted when determining the *index*.)
-    ///
-    /// `struct`s, `tuples`, and `unions`s are considered to have a single variant
-    /// with variant index zero, aka [`FIRST_VARIANT`].
-    #[derive(HashStable_Generic)]
-    #[encodable]
-    #[orderable]
-    pub struct VariantIdx {
-        /// Equivalent to `VariantIdx(0)`.
-        const FIRST_VARIANT = 0;
-    }
-}
 #[derive(Copy, Clone, PartialEq, Eq, Hash, HashStable_Generic)]
 #[rustc_pass_by_value]
 pub struct Layout<'a>(pub Interned<'a, LayoutData<FieldIdx, VariantIdx>>);
 
 impl<'a> fmt::Debug for Layout<'a> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // See comment on `<LayoutS as Debug>::fmt` above.
+        // See comment on `<LayoutData as Debug>::fmt` above.
         self.0.0.fmt(f)
     }
 }
@@ -91,7 +47,7 @@ impl<'a> Layout<'a> {
         self.0.0.largest_niche
     }
 
-    pub fn align(self) -> AbiAndPrefAlign {
+    pub fn align(self) -> AbiAlign {
         self.0.0.align
     }
 
@@ -105,16 +61,6 @@ impl<'a> Layout<'a> {
 
     pub fn unadjusted_abi_align(self) -> Align {
         self.0.0.unadjusted_abi_align
-    }
-
-    /// Whether the layout is from a type that implements [`std::marker::PointerLike`].
-    ///
-    /// Currently, that means that the type is pointer-sized, pointer-aligned,
-    /// and has a initialized (non-union), scalar ABI.
-    pub fn is_pointer_like(self, data_layout: &TargetDataLayout) -> bool {
-        self.size() == data_layout.pointer_size
-            && self.align().abi == data_layout.pointer_align.abi
-            && matches!(self.backend_repr(), BackendRepr::Scalar(Scalar::Initialized { .. }))
     }
 }
 
@@ -148,9 +94,15 @@ impl<'a, Ty> Deref for TyAndLayout<'a, Ty> {
     }
 }
 
+impl<'a, Ty> AsRef<LayoutData<FieldIdx, VariantIdx>> for TyAndLayout<'a, Ty> {
+    fn as_ref(&self) -> &LayoutData<FieldIdx, VariantIdx> {
+        &*self.layout.0.0
+    }
+}
+
 /// Trait that needs to be implemented by the higher-level type representation
 /// (e.g. `rustc_middle::ty::Ty`), to provide `rustc_target::abi` functionality.
-pub trait TyAbiInterface<'a, C>: Sized + std::fmt::Debug {
+pub trait TyAbiInterface<'a, C>: Sized + std::fmt::Debug + std::fmt::Display {
     fn ty_and_layout_for_variant(
         this: TyAndLayout<'a, Self>,
         cx: &C,
@@ -167,6 +119,9 @@ pub trait TyAbiInterface<'a, C>: Sized + std::fmt::Debug {
     fn is_tuple(this: TyAndLayout<'a, Self>) -> bool;
     fn is_unit(this: TyAndLayout<'a, Self>) -> bool;
     fn is_transparent(this: TyAndLayout<'a, Self>) -> bool;
+    fn is_scalable_vector(this: TyAndLayout<'a, Self>) -> bool;
+    /// See [`TyAndLayout::pass_indirectly_in_non_rustic_abis`] for details.
+    fn is_pass_indirectly_in_non_rustic_abis_flag_set(this: TyAndLayout<'a, Self>) -> bool;
 }
 
 impl<'a, Ty> TyAndLayout<'a, Ty> {
@@ -197,7 +152,9 @@ impl<'a, Ty> TyAndLayout<'a, Ty> {
         C: HasDataLayout,
     {
         match self.backend_repr {
-            BackendRepr::Scalar(scalar) => matches!(scalar.primitive(), Float(F32 | F64)),
+            BackendRepr::Scalar(scalar) => {
+                matches!(scalar.primitive(), Primitive::Float(Float::F32 | Float::F64))
+            }
             BackendRepr::Memory { .. } => {
                 if self.fields.count() == 1 && self.fields.offset(0).bytes() == 0 {
                     self.field(cx, 0).is_single_fp_element(cx)
@@ -215,7 +172,7 @@ impl<'a, Ty> TyAndLayout<'a, Ty> {
         C: HasDataLayout,
     {
         match self.backend_repr {
-            BackendRepr::Vector { .. } => self.size == expected_size,
+            BackendRepr::SimdVector { .. } => self.size == expected_size,
             BackendRepr::Memory { .. } => {
                 if self.fields.count() == 1 && self.fields.offset(0).bytes() == 0 {
                     self.field(cx, 0).is_single_vector_element(cx, expected_size)
@@ -262,9 +219,52 @@ impl<'a, Ty> TyAndLayout<'a, Ty> {
         Ty::is_transparent(self)
     }
 
+    pub fn is_scalable_vector<C>(self) -> bool
+    where
+        Ty: TyAbiInterface<'a, C>,
+    {
+        Ty::is_scalable_vector(self)
+    }
+
+    /// If this method returns `true`, then this type should always have a `PassMode` of
+    /// `Indirect { on_stack: false, .. }` when being used as the argument type of a function with a
+    /// non-Rustic ABI (this is true for structs annotated with the
+    /// `#[rustc_pass_indirectly_in_non_rustic_abis]` attribute).
+    ///
+    /// This is used to replicate some of the behaviour of C array-to-pointer decay; however unlike
+    /// C any changes the caller makes to the passed value will not be reflected in the callee, so
+    /// the attribute is only useful for types where observing the value in the caller after the
+    /// function call isn't allowed (a.k.a. `va_list`).
+    ///
+    /// This function handles transparent types automatically.
+    pub fn pass_indirectly_in_non_rustic_abis<C>(self, cx: &C) -> bool
+    where
+        Ty: TyAbiInterface<'a, C> + Copy,
+    {
+        let base = self.peel_transparent_wrappers(cx);
+        Ty::is_pass_indirectly_in_non_rustic_abis_flag_set(base)
+    }
+
+    /// Recursively peel away transparent wrappers, returning the inner value.
+    ///
+    /// The return value is not `repr(transparent)` and/or does
+    /// not have a non-1zst field.
+    pub fn peel_transparent_wrappers<C>(mut self, cx: &C) -> Self
+    where
+        Ty: TyAbiInterface<'a, C> + Copy,
+    {
+        while self.is_transparent()
+            && let Some((_, field)) = self.non_1zst_field(cx)
+        {
+            self = field;
+        }
+
+        self
+    }
+
     /// Finds the one field that is not a 1-ZST.
     /// Returns `None` if there are multiple non-1-ZST fields or only 1-ZST-fields.
-    pub fn non_1zst_field<C>(&self, cx: &C) -> Option<(usize, Self)>
+    pub fn non_1zst_field<C>(&self, cx: &C) -> Option<(FieldIdx, Self)>
     where
         Ty: TyAbiInterface<'a, C> + Copy,
     {
@@ -278,7 +278,7 @@ impl<'a, Ty> TyAndLayout<'a, Ty> {
                 // More than one non-1-ZST field.
                 return None;
             }
-            found = Some((field_idx, field));
+            found = Some((FieldIdx::from_usize(field_idx), field));
         }
         found
     }

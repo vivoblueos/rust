@@ -1,5 +1,6 @@
+use crate::bstr::ByteStr;
 use crate::ffi::OsStr;
-#[cfg(any(doc, target_os = "android", target_os = "linux"))]
+#[cfg(any(doc, target_os = "android", target_os = "linux", target_os = "cygwin"))]
 use crate::os::net::linux_ext;
 use crate::os::unix::ffi::OsStrExt;
 use crate::path::Path;
@@ -30,14 +31,14 @@ pub(super) fn sockaddr_un(path: &Path) -> io::Result<(libc::sockaddr_un, libc::s
     let bytes = path.as_os_str().as_bytes();
 
     if bytes.contains(&0) {
-        return Err(io::const_io_error!(
+        return Err(io::const_error!(
             io::ErrorKind::InvalidInput,
             "paths must not contain interior null bytes",
         ));
     }
 
     if bytes.len() >= addr.sun_path.len() {
-        return Err(io::const_io_error!(
+        return Err(io::const_error!(
             io::ErrorKind::InvalidInput,
             "path must be shorter than SUN_LEN",
         ));
@@ -61,7 +62,7 @@ pub(super) fn sockaddr_un(path: &Path) -> io::Result<(libc::sockaddr_un, libc::s
 enum AddressKind<'a> {
     Unnamed,
     Pathname(&'a Path),
-    Abstract(&'a [u8]),
+    Abstract(&'a ByteStr),
 }
 
 /// An address associated with a Unix socket.
@@ -94,7 +95,7 @@ impl SocketAddr {
     {
         unsafe {
             let mut addr: libc::sockaddr_un = mem::zeroed();
-            let mut len = mem::size_of::<libc::sockaddr_un>() as libc::socklen_t;
+            let mut len = size_of::<libc::sockaddr_un>() as libc::socklen_t;
             cvt(f((&raw mut addr) as *mut _, &mut len))?;
             SocketAddr::from_parts(addr, len)
         }
@@ -119,7 +120,7 @@ impl SocketAddr {
             // linux returns zero bytes of address
             len = SUN_PATH_OFFSET as libc::socklen_t; // i.e., zero-length address
         } else if addr.sun_family != libc::AF_UNIX as libc::sa_family_t {
-            return Err(io::const_io_error!(
+            return Err(io::const_error!(
                 io::ErrorKind::InvalidInput,
                 "file descriptor did not correspond to a Unix socket",
             ));
@@ -240,12 +241,12 @@ impl SocketAddr {
 
         // macOS seems to return a len of 16 and a zeroed sun_path for unnamed addresses
         if len == 0
-            || (cfg!(not(any(target_os = "linux", target_os = "android")))
+            || (cfg!(not(any(target_os = "linux", target_os = "android", target_os = "cygwin")))
                 && self.addr.sun_path[0] == 0)
         {
             AddressKind::Unnamed
         } else if self.addr.sun_path[0] == 0 {
-            AddressKind::Abstract(&path[1..len])
+            AddressKind::Abstract(ByteStr::from_bytes(&path[1..len]))
         } else {
             AddressKind::Pathname(OsStr::from_bytes(&path[..len - 1]).as_ref())
         }
@@ -255,15 +256,15 @@ impl SocketAddr {
 #[stable(feature = "unix_socket_abstract", since = "1.70.0")]
 impl Sealed for SocketAddr {}
 
-#[doc(cfg(any(target_os = "android", target_os = "linux")))]
-#[cfg(any(doc, target_os = "android", target_os = "linux"))]
+#[doc(cfg(any(target_os = "android", target_os = "linux", target_os = "cygwin")))]
+#[cfg(any(doc, target_os = "android", target_os = "linux", target_os = "cygwin"))]
 #[stable(feature = "unix_socket_abstract", since = "1.70.0")]
 impl linux_ext::addr::SocketAddrExt for SocketAddr {
     fn as_abstract_name(&self) -> Option<&[u8]> {
-        if let AddressKind::Abstract(name) = self.address() { Some(name) } else { None }
+        if let AddressKind::Abstract(name) = self.address() { Some(name.as_bytes()) } else { None }
     }
 
-    fn from_abstract_name<N>(name: N) -> crate::io::Result<Self>
+    fn from_abstract_name<N>(name: N) -> io::Result<Self>
     where
         N: AsRef<[u8]>,
     {
@@ -273,7 +274,7 @@ impl linux_ext::addr::SocketAddrExt for SocketAddr {
             addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
 
             if name.len() + 1 > addr.sun_path.len() {
-                return Err(io::const_io_error!(
+                return Err(io::const_error!(
                     io::ErrorKind::InvalidInput,
                     "abstract socket name must be shorter than SUN_LEN",
                 ));
@@ -295,7 +296,7 @@ impl fmt::Debug for SocketAddr {
     fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.address() {
             AddressKind::Unnamed => write!(fmt, "(unnamed)"),
-            AddressKind::Abstract(name) => write!(fmt, "\"{}\" (abstract)", name.escape_ascii()),
+            AddressKind::Abstract(name) => write!(fmt, "{name:?} (abstract)"),
             AddressKind::Pathname(path) => write!(fmt, "{path:?} (pathname)"),
         }
     }

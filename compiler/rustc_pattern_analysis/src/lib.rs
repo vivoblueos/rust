@@ -3,12 +3,10 @@
 //! [`rustc`] module.
 
 // tidy-alphabetical-start
-#![allow(rustc::diagnostic_outside_of_impl)]
-#![allow(rustc::untranslatable_diagnostic)]
-#![cfg_attr(feature = "rustc", feature(let_chains))]
-#![warn(unreachable_pub)]
+#![allow(unused_crate_dependencies)]
 // tidy-alphabetical-end
 
+pub(crate) mod checks;
 pub mod constructor;
 #[cfg(feature = "rustc")]
 pub mod errors;
@@ -19,9 +17,6 @@ pub mod pat_column;
 #[cfg(feature = "rustc")]
 pub mod rustc;
 pub mod usefulness;
-
-#[cfg(feature = "rustc")]
-rustc_fluent_macro::fluent_messages! { "../messages.ftl" }
 
 use std::fmt;
 
@@ -57,15 +52,22 @@ pub trait PatCx: Sized + fmt::Debug {
 
     fn is_exhaustive_patterns_feature_on(&self) -> bool;
 
+    /// Whether to ensure the non-exhaustiveness witnesses we report for a complete set. This is
+    /// `false` by default to avoid some exponential blowup cases such as
+    /// <https://github.com/rust-lang/rust/issues/118437>.
+    fn exhaustive_witnesses(&self) -> bool {
+        false
+    }
+
     /// The number of fields for this constructor.
     fn ctor_arity(&self, ctor: &Constructor<Self>, ty: &Self::Ty) -> usize;
 
     /// The types of the fields for this constructor. The result must contain `ctor_arity()` fields.
-    fn ctor_sub_tys<'a>(
-        &'a self,
-        ctor: &'a Constructor<Self>,
-        ty: &'a Self::Ty,
-    ) -> impl Iterator<Item = (Self::Ty, PrivateUninhabitedField)> + ExactSizeIterator + Captures<'a>;
+    fn ctor_sub_tys(
+        &self,
+        ctor: &Constructor<Self>,
+        ty: &Self::Ty,
+    ) -> impl Iterator<Item = (Self::Ty, PrivateUninhabitedField)> + ExactSizeIterator;
 
     /// The set of all the constructors for `ty`.
     ///
@@ -108,6 +110,20 @@ pub trait PatCx: Sized + fmt::Debug {
         _gapped_with: &[&DeconstructedPat<Self>],
     ) {
     }
+
+    /// Check if we may need to perform additional deref-pattern-specific validation.
+    fn match_may_contain_deref_pats(&self) -> bool {
+        true
+    }
+
+    /// The current implementation of deref patterns requires that they can't match on the same
+    /// place as a normal constructor. Since this isn't caught by type-checking, we check it in the
+    /// `PatCx` before running the analysis. This reports an error if the check fails.
+    fn report_mixed_deref_pat_ctors(
+        &self,
+        deref_pat: &DeconstructedPat<Self>,
+        normal_pat: &DeconstructedPat<Self>,
+    ) -> Self::Error;
 }
 
 /// The arm of a match expression.
@@ -120,7 +136,7 @@ pub struct MatchArm<'p, Cx: PatCx> {
 
 impl<'p, Cx: PatCx> Clone for MatchArm<'p, Cx> {
     fn clone(&self) -> Self {
-        Self { pat: self.pat, has_guard: self.has_guard, arm_data: self.arm_data }
+        *self
     }
 }
 

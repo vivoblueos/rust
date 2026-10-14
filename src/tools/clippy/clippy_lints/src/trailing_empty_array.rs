@@ -1,5 +1,5 @@
 use clippy_utils::diagnostics::span_lint_and_help;
-use clippy_utils::has_repr_attr;
+use clippy_utils::{has_repr_attr, is_in_test};
 use rustc_hir::{Item, ItemKind};
 use rustc_lint::{LateContext, LateLintPass};
 use rustc_middle::ty;
@@ -33,11 +33,15 @@ declare_clippy_lint! {
     nursery,
     "struct with a trailing zero-sized array but without `#[repr(C)]` or another `repr` attribute"
 }
+
 declare_lint_pass!(TrailingEmptyArray => [TRAILING_EMPTY_ARRAY]);
 
 impl<'tcx> LateLintPass<'tcx> for TrailingEmptyArray {
     fn check_item(&mut self, cx: &LateContext<'tcx>, item: &'tcx Item<'tcx>) {
-        if is_struct_with_trailing_zero_sized_array(cx, item) && !has_repr_attr(cx, item.hir_id()) {
+        if is_struct_with_trailing_zero_sized_array(cx, item)
+            && !has_repr_attr(cx, item.hir_id())
+            && !is_in_test(cx.tcx, item.hir_id())
+        {
             span_lint_and_help(
                 cx,
                 TRAILING_EMPTY_ARRAY,
@@ -54,11 +58,12 @@ impl<'tcx> LateLintPass<'tcx> for TrailingEmptyArray {
 }
 
 fn is_struct_with_trailing_zero_sized_array<'tcx>(cx: &LateContext<'tcx>, item: &Item<'tcx>) -> bool {
-    if let ItemKind::Struct(data, _) = &item.kind
+    if let ItemKind::Struct(_, _, data) = &item.kind
         && let Some(last_field) = data.fields().last()
-        && let field_ty = cx
-            .tcx
-            .normalize_erasing_regions(cx.typing_env(), cx.tcx.type_of(last_field.def_id).instantiate_identity())
+        && let field_ty = cx.tcx.normalize_erasing_regions(
+            cx.typing_env(),
+            cx.tcx.type_of(last_field.def_id).instantiate_identity(),
+        )
         && let ty::Array(_, array_len) = *field_ty.kind()
         && let Some(0) = array_len.try_to_target_usize(cx.tcx)
     {

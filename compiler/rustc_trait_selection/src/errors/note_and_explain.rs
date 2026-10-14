@@ -1,12 +1,11 @@
-use rustc_errors::{Diag, EmissionGuarantee, IntoDiagArg, SubdiagMessageOp, Subdiagnostic};
+use rustc_errors::formatting::DiagMessageAddArg;
+use rustc_errors::{Diag, EmissionGuarantee, IntoDiagArg, Subdiagnostic, msg};
 use rustc_hir::def_id::LocalDefId;
 use rustc_middle::bug;
 use rustc_middle::ty::{self, TyCtxt};
-use rustc_span::Span;
-use rustc_span::symbol::kw;
+use rustc_span::{Span, kw};
 
 use crate::error_reporting::infer::nice_region_error::find_anon_type;
-use crate::fluent_generated as fluent;
 
 struct DescriptionCtx<'a> {
     span: Option<Span>,
@@ -21,37 +20,36 @@ impl<'a> DescriptionCtx<'a> {
         region: ty::Region<'tcx>,
         alt_span: Option<Span>,
     ) -> Option<Self> {
-        let (span, kind, arg) = match *region {
+        let (span, kind, arg) = match region.kind() {
             ty::ReEarlyParam(br) => {
                 let scope = tcx
                     .parent(tcx.generics_of(generic_param_scope).region_param(br, tcx).def_id)
                     .expect_local();
                 let span = if let Some(param) =
-                    tcx.hir().get_generics(scope).and_then(|generics| generics.get_named(br.name))
+                    tcx.hir_get_generics(scope).and_then(|generics| generics.get_named(br.name))
                 {
                     param.span
                 } else {
                     tcx.def_span(scope)
                 };
-                if br.has_name() {
+                if br.is_named() {
                     (Some(span), "as_defined", br.name.to_string())
                 } else {
                     (Some(span), "as_defined_anon", String::new())
                 }
             }
             ty::ReLateParam(ref fr) => {
-                if !fr.bound_region.is_named()
-                    && let Some((ty, _)) =
-                        find_anon_type(tcx, generic_param_scope, region, &fr.bound_region)
+                if !fr.kind.is_named(tcx)
+                    && let Some((ty, _)) = find_anon_type(tcx, generic_param_scope, region)
                 {
                     (Some(ty.span), "defined_here", String::new())
                 } else {
                     let scope = fr.scope.expect_local();
-                    match fr.bound_region {
-                        ty::BoundRegionKind::Named(_, name) => {
+                    match fr.kind {
+                        ty::LateParamRegionKind::Named(def_id) => {
+                            let name = tcx.item_name(def_id);
                             let span = if let Some(param) = tcx
-                                .hir()
-                                .get_generics(scope)
+                                .hir_get_generics(scope)
                                 .and_then(|generics| generics.get_named(name))
                             {
                                 param.span
@@ -64,7 +62,7 @@ impl<'a> DescriptionCtx<'a> {
                                 (Some(span), "as_defined", name.to_string())
                             }
                         }
-                        ty::BoundRegionKind::Anon => {
+                        ty::LateParamRegionKind::Anon(_) => {
                             let span = Some(tcx.def_span(scope));
                             (span, "defined_here", String::new())
                         }
@@ -108,7 +106,7 @@ pub enum SuffixKind {
 }
 
 impl IntoDiagArg for PrefixKind {
-    fn into_diag_arg(self) -> rustc_errors::DiagArgValue {
+    fn into_diag_arg(self, _: &mut Option<std::path::PathBuf>) -> rustc_errors::DiagArgValue {
         let kind = match self {
             Self::Empty => "empty",
             Self::RefValidFor => "ref_valid_for",
@@ -130,7 +128,7 @@ impl IntoDiagArg for PrefixKind {
 }
 
 impl IntoDiagArg for SuffixKind {
-    fn into_diag_arg(self) -> rustc_errors::DiagArgValue {
+    fn into_diag_arg(self, _: &mut Option<std::path::PathBuf>) -> rustc_errors::DiagArgValue {
         let kind = match self {
             Self::Empty => "empty",
             Self::Continues => "continues",
@@ -165,17 +163,48 @@ impl RegionExplanation<'_> {
 }
 
 impl Subdiagnostic for RegionExplanation<'_> {
-    fn add_to_diag_with<G: EmissionGuarantee, F: SubdiagMessageOp<G>>(
-        self,
-        diag: &mut Diag<'_, G>,
-        f: &F,
-    ) {
-        diag.arg("pref_kind", self.prefix);
-        diag.arg("suff_kind", self.suffix);
-        diag.arg("desc_kind", self.desc.kind);
-        diag.arg("desc_arg", self.desc.arg);
+    fn add_to_diag<G: EmissionGuarantee>(self, diag: &mut Diag<'_, G>) {
+        let msg = msg!(
+            "{$pref_kind ->
+                *[should_not_happen] [{$pref_kind}]
+                [ref_valid_for] ...the reference is valid for
+                [content_valid_for] ...but the borrowed content is only valid for
+                [type_obj_valid_for] object type is valid for
+                [source_pointer_valid_for] source pointer is only valid for
+                [type_satisfy] type must satisfy
+                [type_outlive] type must outlive
+                [lf_param_instantiated_with] lifetime parameter instantiated with
+                [lf_param_must_outlive] but lifetime parameter must outlive
+                [lf_instantiated_with] lifetime instantiated with
+                [lf_must_outlive] but lifetime must outlive
+                [pointer_valid_for] the pointer is valid for
+                [data_valid_for] but the referenced data is only valid for
+                [empty] {\"\"}
+            }{$pref_kind ->
+                [empty] {\"\"}
+                *[other] {\" \"}
+            }{$desc_kind ->
+                *[should_not_happen] [{$desc_kind}]
+                [restatic] the static lifetime
+                [revar] lifetime {$desc_arg}
+                [as_defined] the lifetime `{$desc_arg}` as defined here
+                [as_defined_anon] the anonymous lifetime as defined here
+                [defined_here] the anonymous lifetime defined here
+                [defined_here_reg] the lifetime `{$desc_arg}` as defined here
+                }{$suff_kind ->
+                *[should_not_happen] [{$suff_kind}]
+                [empty]{\"\"}
+                [continues] ...
+                [req_by_binding] {\" \"}as required by this binding
+            }"
+        )
+        .arg("pref_kind", self.prefix)
+        .arg("suff_kind", self.suffix)
+        .arg("desc_kind", self.desc.kind)
+        .arg("desc_arg", self.desc.arg)
+        .format();
 
-        let msg = f(diag, fluent::trait_selection_region_explanation.into());
+        // diag.restore_args();
         if let Some(span) = self.desc.span {
             diag.span_note(span, msg);
         } else {

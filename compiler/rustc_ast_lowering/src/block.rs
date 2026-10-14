@@ -1,10 +1,12 @@
 use rustc_ast::{Block, BlockCheckMode, Local, LocalKind, Stmt, StmtKind};
 use rustc_hir as hir;
+use rustc_hir::Target;
+use rustc_span::sym;
 use smallvec::SmallVec;
 
-use crate::{ImplTraitContext, ImplTraitPosition, LoweringContext};
+use crate::{ImplTraitContext, ImplTraitPosition, LoweringContext, ResolverAstLoweringExt};
 
-impl<'a, 'hir> LoweringContext<'a, 'hir> {
+impl<'hir, R: ResolverAstLoweringExt<'hir>> LoweringContext<'_, 'hir, R> {
     pub(super) fn lower_block(
         &mut self,
         b: &Block,
@@ -25,7 +27,7 @@ impl<'a, 'hir> LoweringContext<'a, 'hir> {
         hir::Block { hir_id, stmts, expr, rules, span: self.lower_span(b.span), targeted_by_break }
     }
 
-    fn lower_stmts(
+    pub(super) fn lower_stmts(
         &mut self,
         mut ast_stmts: &[Stmt],
     ) -> (&'hir [hir::Stmt<'hir>], Option<&'hir hir::Expr<'hir>>) {
@@ -82,11 +84,22 @@ impl<'a, 'hir> LoweringContext<'a, 'hir> {
         (self.arena.alloc_from_iter(stmts), expr)
     }
 
+    /// Return an `ImplTraitContext` that allows impl trait in bindings if
+    /// the feature gate is enabled, or issues a feature error if it is not.
+    fn impl_trait_in_bindings_ctxt(&self, position: ImplTraitPosition) -> ImplTraitContext {
+        if self.tcx.features().impl_trait_in_bindings() {
+            ImplTraitContext::InBinding
+        } else {
+            ImplTraitContext::FeatureGated(position, sym::impl_trait_in_bindings)
+        }
+    }
+
     fn lower_local(&mut self, l: &Local) -> &'hir hir::LetStmt<'hir> {
-        let ty = l
-            .ty
-            .as_ref()
-            .map(|t| self.lower_ty(t, ImplTraitContext::Disallowed(ImplTraitPosition::Variable)));
+        // Let statements are allowed to have impl trait in bindings.
+        let super_ = l.super_.map(|span| self.lower_span(span));
+        let ty = l.ty.as_ref().map(|t| {
+            self.lower_ty_alloc(t, self.impl_trait_in_bindings_ctxt(ImplTraitPosition::Variable))
+        });
         let init = l.kind.init().map(|init| self.lower_expr(init));
         let hir_id = self.lower_node_id(l.id);
         let pat = self.lower_pat(&l.pat);
@@ -97,8 +110,8 @@ impl<'a, 'hir> LoweringContext<'a, 'hir> {
         };
         let span = self.lower_span(l.span);
         let source = hir::LocalSource::Normal;
-        self.lower_attrs(hir_id, &l.attrs);
-        self.arena.alloc(hir::LetStmt { hir_id, ty, pat, init, els, span, source })
+        self.lower_attrs(hir_id, &l.attrs, l.span, Target::Statement);
+        self.arena.alloc(hir::LetStmt { hir_id, super_, ty, pat, init, els, span, source })
     }
 
     fn lower_block_check_mode(&mut self, b: &BlockCheckMode) -> hir::BlockCheckMode {

@@ -1,5 +1,6 @@
 //@ run-pass
-//@ pretty-expanded FIXME #23616
+//@ reference: cfg.target_arch.def
+//@ reference: cfg.target_arch.values
 
 #[cfg(target_arch = "x86")]
 pub fn main() { }
@@ -38,4 +39,7 @@ pub fn main() { }
 pub fn main() { }
 
 #[cfg(target_arch = "loongarch64")]
+pub fn main() { }
+
+#[cfg(target_arch = "arm64ec")]
 pub fn main() { }

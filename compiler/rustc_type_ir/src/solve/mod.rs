@@ -1,62 +1,17 @@
 pub mod inspect;
 
-use std::fmt;
 use std::hash::Hash;
 
 use derive_where::derive_where;
 #[cfg(feature = "nightly")]
-use rustc_macros::{HashStable_NoContext, TyDecodable, TyEncodable};
-use rustc_type_ir_macros::{Lift_Generic, TypeFoldable_Generic, TypeVisitable_Generic};
+use rustc_macros::{Decodable_NoContext, Encodable_NoContext, HashStable_NoContext};
+use rustc_type_ir_macros::{
+    GenericTypeVisitable, Lift_Generic, TypeFoldable_Generic, TypeVisitable_Generic,
+};
 
+use crate::lang_items::SolverTraitLangItem;
+use crate::search_graph::PathKind;
 use crate::{self as ty, Canonical, CanonicalVarValues, Interner, Upcast};
-
-/// Depending on the stage of compilation, we want projection to be
-/// more or less conservative.
-#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "nightly", derive(TyDecodable, TyEncodable, HashStable_NoContext))]
-pub enum Reveal {
-    /// At type-checking time, we refuse to project any associated
-    /// type that is marked `default`. Non-`default` ("final") types
-    /// are always projected. This is necessary in general for
-    /// soundness of specialization. However, we *could* allow
-    /// projections in fully-monomorphic cases. We choose not to,
-    /// because we prefer for `default type` to force the type
-    /// definition to be treated abstractly by any consumers of the
-    /// impl. Concretely, that means that the following example will
-    /// fail to compile:
-    ///
-    /// ```compile_fail,E0308
-    /// #![feature(specialization)]
-    /// trait Assoc {
-    ///     type Output;
-    /// }
-    ///
-    /// impl<T> Assoc for T {
-    ///     default type Output = bool;
-    /// }
-    ///
-    /// fn main() {
-    ///     let x: <() as Assoc>::Output = true;
-    /// }
-    /// ```
-    ///
-    /// We also do not reveal the hidden type of opaque types during
-    /// type-checking.
-    UserFacing,
-
-    /// At codegen time, all monomorphic projections will succeed.
-    /// Also, `impl Trait` is normalized to the concrete type,
-    /// which has to be already collected by type-checking.
-    ///
-    /// NOTE: as `impl Trait`'s concrete type should *never*
-    /// be observable directly by the user, `Reveal::All`
-    /// should not be used by checks which may expose
-    /// type equality or type contents to the user.
-    /// There are some exceptions, e.g., around auto traits and
-    /// transmute-checking, which expose some details, but
-    /// not the whole concrete type of the `impl Trait`.
-    All,
-}
 
 pub type CanonicalInput<I, T = <I as Interner>::Predicate> =
     ty::CanonicalQueryInput<I, QueryInput<I, T>>;
@@ -78,18 +33,19 @@ pub struct NoSolution;
 ///
 /// Most of the time the `param_env` contains the `where`-bounds of the function
 /// we're currently typechecking while the `predicate` is some trait bound.
-#[derive_where(Clone; I: Interner, P: Clone)]
+#[derive_where(Clone, Hash, PartialEq, Debug; I: Interner, P)]
 #[derive_where(Copy; I: Interner, P: Copy)]
-#[derive_where(Hash; I: Interner, P: Hash)]
-#[derive_where(PartialEq; I: Interner, P: PartialEq)]
-#[derive_where(Eq; I: Interner, P: Eq)]
-#[derive_where(Debug; I: Interner, P: fmt::Debug)]
-#[derive(TypeVisitable_Generic, TypeFoldable_Generic, Lift_Generic)]
-#[cfg_attr(feature = "nightly", derive(TyDecodable, TyEncodable, HashStable_NoContext))]
+#[derive(TypeVisitable_Generic, GenericTypeVisitable, TypeFoldable_Generic, Lift_Generic)]
+#[cfg_attr(
+    feature = "nightly",
+    derive(Decodable_NoContext, Encodable_NoContext, HashStable_NoContext)
+)]
 pub struct Goal<I: Interner, P> {
     pub param_env: I::ParamEnv,
     pub predicate: P,
 }
+
+impl<I: Interner, P: Eq> Eq for Goal<I, P> {}
 
 impl<I: Interner, P> Goal<I, P> {
     pub fn new(cx: I, param_env: I::ParamEnv, predicate: impl Upcast<I, P>) -> Goal<I, P> {
@@ -105,48 +61,80 @@ impl<I: Interner, P> Goal<I, P> {
 /// Why a specific goal has to be proven.
 ///
 /// This is necessary as we treat nested goals different depending on
-/// their source. This is currently mostly used by proof tree visitors
-/// but will be used by cycle handling in the future.
+/// their source. This is used to decide whether a cycle is coinductive.
+/// See the documentation of `EvalCtxt::step_kind_for_source` for more details
+/// about this.
+///
+/// It is also used by proof tree visitors, e.g. for diagnostics purposes.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "nightly", derive(HashStable_NoContext))]
 pub enum GoalSource {
     Misc,
-    /// We're proving a where-bound of an impl.
+    /// A nested goal required to prove that types are equal/subtypes.
+    /// This is always an unproductive step.
     ///
-    /// FIXME(-Znext-solver=coinductive): Explain how and why this
-    /// changes whether cycles are coinductive.
+    /// This is also used for all `NormalizesTo` goals as we they are used
+    /// to relate types in `AliasRelate`.
+    TypeRelating,
+    /// We're proving a where-bound of an impl.
     ImplWhereBound,
-    /// Instantiating a higher-ranked goal and re-proving it.
-    InstantiateHigherRanked,
+    /// Const conditions that need to hold for `[const]` alias bounds to hold.
+    AliasBoundConstCondition,
     /// Predicate required for an alias projection to be well-formed.
-    /// This is used in two places: projecting to an opaque whose hidden type
-    /// is already registered in the opaque type storage, and for rigid projections.
+    /// This is used in three places:
+    /// 1. projecting to an opaque whose hidden type is already registered in
+    ///    the opaque type storage,
+    /// 2. for rigid projections's trait goal,
+    /// 3. for GAT where clauses.
     AliasWellFormed,
+    /// In case normalizing aliases in nested goals cycles, eagerly normalizing these
+    /// aliases in the context of the parent may incorrectly change the cycle kind.
+    /// Normalizing aliases in goals therefore tracks the original path kind for this
+    /// nested goal. See the comment of the `ReplaceAliasWithInfer` visitor for more
+    /// details.
+    NormalizeGoal(PathKind),
 }
 
-#[derive_where(Clone; I: Interner, Goal<I, P>: Clone)]
+#[derive_where(Clone, Hash, PartialEq, Debug; I: Interner, Goal<I, P>)]
 #[derive_where(Copy; I: Interner, Goal<I, P>: Copy)]
-#[derive_where(Hash; I: Interner, Goal<I, P>: Hash)]
-#[derive_where(PartialEq; I: Interner, Goal<I, P>: PartialEq)]
-#[derive_where(Eq; I: Interner, Goal<I, P>: Eq)]
-#[derive_where(Debug; I: Interner, Goal<I, P>: fmt::Debug)]
-#[derive(TypeVisitable_Generic, TypeFoldable_Generic)]
-#[cfg_attr(feature = "nightly", derive(TyDecodable, TyEncodable, HashStable_NoContext))]
+#[derive(TypeVisitable_Generic, GenericTypeVisitable, TypeFoldable_Generic)]
+#[cfg_attr(
+    feature = "nightly",
+    derive(Decodable_NoContext, Encodable_NoContext, HashStable_NoContext)
+)]
 pub struct QueryInput<I: Interner, P> {
     pub goal: Goal<I, P>,
     pub predefined_opaques_in_body: I::PredefinedOpaques,
 }
 
-/// Opaques that are defined in the inference context before a query is called.
-#[derive_where(Clone, Hash, PartialEq, Eq, Debug, Default; I: Interner)]
-#[derive(TypeVisitable_Generic, TypeFoldable_Generic)]
-#[cfg_attr(feature = "nightly", derive(TyDecodable, TyEncodable, HashStable_NoContext))]
-pub struct PredefinedOpaquesData<I: Interner> {
-    pub opaque_types: Vec<(ty::OpaqueTypeKey<I>, I::Ty)>,
+impl<I: Interner, P: Eq> Eq for QueryInput<I, P> {}
+
+/// Which trait candidates should be preferred over other candidates? By default, prefer where
+/// bounds over alias bounds. For marker traits, prefer alias bounds over where bounds.
+#[derive(Clone, Copy, Debug)]
+pub enum CandidatePreferenceMode {
+    /// Prefers where bounds over alias bounds
+    Default,
+    /// Prefers alias bounds over where bounds
+    Marker,
+}
+
+impl CandidatePreferenceMode {
+    /// Given `trait_def_id`, which candidate preference mode should be used?
+    pub fn compute<I: Interner>(cx: I, trait_id: I::TraitId) -> CandidatePreferenceMode {
+        let is_sizedness_or_auto_or_default_goal = cx.is_sizedness_trait(trait_id)
+            || cx.trait_is_auto(trait_id)
+            || cx.is_default_trait(trait_id);
+        if is_sizedness_or_auto_or_default_goal {
+            CandidatePreferenceMode::Marker
+        } else {
+            CandidatePreferenceMode::Default
+        }
+    }
 }
 
 /// Possible ways the given goal can be proven.
-#[derive_where(Clone, Copy, Hash, PartialEq, Eq, Debug; I: Interner)]
+#[derive_where(Clone, Copy, Hash, PartialEq, Debug; I: Interner)]
 pub enum CandidateSource<I: Interner> {
     /// A user written impl.
     ///
@@ -159,7 +147,7 @@ pub enum CandidateSource<I: Interner> {
     ///     let y = x.clone();
     /// }
     /// ```
-    Impl(I::DefId),
+    Impl(I::ImplId),
     /// A builtin impl generated by the compiler. When adding a new special
     /// trait, try to use actual impls whenever possible. Builtin impls should
     /// only be used in cases where the impl cannot be manually be written.
@@ -168,9 +156,8 @@ pub enum CandidateSource<I: Interner> {
     /// For a list of all traits with builtin impls, check out the
     /// `EvalCtxt::assemble_builtin_impl_candidates` method.
     BuiltinImpl(BuiltinImplSource),
-    /// An assumption from the environment.
-    ///
-    /// More precisely we've used the `n-th` assumption in the `param_env`.
+    /// An assumption from the environment. Stores a [`ParamEnvSource`], since we
+    /// prefer non-global param-env candidates in candidate assembly.
     ///
     /// ## Examples
     ///
@@ -181,7 +168,7 @@ pub enum CandidateSource<I: Interner> {
     ///     (x.clone(), x)
     /// }
     /// ```
-    ParamEnv(usize),
+    ParamEnv(ParamEnvSource),
     /// If the self type is an alias type, e.g. an opaque type or a projection,
     /// we know the bounds on that alias to hold even without knowing its concrete
     /// underlying type.
@@ -202,7 +189,7 @@ pub enum CandidateSource<I: Interner> {
     ///     let _y = x.clone();
     /// }
     /// ```
-    AliasBound,
+    AliasBound(AliasBoundKind),
     /// A candidate that is registered only during coherence to represent some
     /// yet-unknown impl that could be produced downstream without violating orphan
     /// rules.
@@ -210,9 +197,34 @@ pub enum CandidateSource<I: Interner> {
     CoherenceUnknowable,
 }
 
+impl<I: Interner> Eq for CandidateSource<I> {}
+
 #[derive(Clone, Copy, Hash, PartialEq, Eq, Debug)]
-#[cfg_attr(feature = "nightly", derive(HashStable_NoContext, TyEncodable, TyDecodable))]
+pub enum ParamEnvSource {
+    /// Preferred eagerly.
+    NonGlobal,
+    // Not considered unless there are non-global param-env candidates too.
+    Global,
+}
+
+#[derive(Clone, Copy, Hash, PartialEq, Eq, Debug)]
+#[derive(TypeVisitable_Generic, GenericTypeVisitable, TypeFoldable_Generic)]
+pub enum AliasBoundKind {
+    /// Alias bound from the self type of a projection
+    SelfBounds,
+    // Alias bound having recursed on the self type of a projection
+    NonSelfBounds,
+}
+
+#[derive(Clone, Copy, Hash, PartialEq, Eq, Debug)]
+#[cfg_attr(
+    feature = "nightly",
+    derive(HashStable_NoContext, Encodable_NoContext, Decodable_NoContext)
+)]
 pub enum BuiltinImplSource {
+    /// A built-in impl that is considered trivial, without any nested requirements. They
+    /// are preferred over where-clauses, and we want to track them explicitly.
+    Trivial,
     /// Some built-in impl we don't need to differentiate. This should be used
     /// unless more specific information is necessary.
     Misc,
@@ -220,18 +232,12 @@ pub enum BuiltinImplSource {
     Object(usize),
     /// A built-in implementation of `Upcast` for trait objects to other trait objects.
     ///
-    /// This can be removed when `feature(dyn_upcasting)` is stabilized, since we only
-    /// use it to detect when upcasting traits in hir typeck.
-    TraitUpcasting,
-    /// Unsizing a tuple like `(A, B, ..., X)` to `(A, B, ..., Y)` if `X` unsizes to `Y`.
-    ///
-    /// This can be removed when `feature(tuple_unsizing)` is stabilized, since we only
-    /// use it to detect when unsizing tuples in hir typeck.
-    TupleUnsizing,
+    /// The index is only used for winnowing.
+    TraitUpcasting(usize),
 }
 
-#[derive_where(Clone, Copy, Hash, PartialEq, Eq, Debug; I: Interner)]
-#[derive(TypeVisitable_Generic, TypeFoldable_Generic)]
+#[derive_where(Clone, Copy, Hash, PartialEq, Debug; I: Interner)]
+#[derive(TypeVisitable_Generic, GenericTypeVisitable, TypeFoldable_Generic)]
 #[cfg_attr(feature = "nightly", derive(HashStable_NoContext))]
 pub struct Response<I: Interner> {
     pub certainty: Certainty,
@@ -240,9 +246,11 @@ pub struct Response<I: Interner> {
     pub external_constraints: I::ExternalConstraints,
 }
 
+impl<I: Interner> Eq for Response<I> {}
+
 /// Additional constraints returned on success.
-#[derive_where(Clone, Hash, PartialEq, Eq, Debug, Default; I: Interner)]
-#[derive(TypeVisitable_Generic, TypeFoldable_Generic)]
+#[derive_where(Clone, Hash, PartialEq, Debug, Default; I: Interner)]
+#[derive(TypeVisitable_Generic, GenericTypeVisitable, TypeFoldable_Generic)]
 #[cfg_attr(feature = "nightly", derive(HashStable_NoContext))]
 pub struct ExternalConstraintsData<I: Interner> {
     pub region_constraints: Vec<ty::OutlivesPredicate<I, I::GenericArg>>,
@@ -250,10 +258,22 @@ pub struct ExternalConstraintsData<I: Interner> {
     pub normalization_nested_goals: NestedNormalizationGoals<I>,
 }
 
-#[derive_where(Clone, Hash, PartialEq, Eq, Debug, Default; I: Interner)]
-#[derive(TypeVisitable_Generic, TypeFoldable_Generic)]
+impl<I: Interner> Eq for ExternalConstraintsData<I> {}
+
+impl<I: Interner> ExternalConstraintsData<I> {
+    pub fn is_empty(&self) -> bool {
+        self.region_constraints.is_empty()
+            && self.opaque_types.is_empty()
+            && self.normalization_nested_goals.is_empty()
+    }
+}
+
+#[derive_where(Clone, Hash, PartialEq, Debug, Default; I: Interner)]
+#[derive(TypeVisitable_Generic, GenericTypeVisitable, TypeFoldable_Generic)]
 #[cfg_attr(feature = "nightly", derive(HashStable_NoContext))]
 pub struct NestedNormalizationGoals<I: Interner>(pub Vec<(GoalSource, Goal<I, I::Predicate>)>);
+
+impl<I: Interner> Eq for NestedNormalizationGoals<I> {}
 
 impl<I: Interner> NestedNormalizationGoals<I> {
     pub fn empty() -> Self {
@@ -269,11 +289,70 @@ impl<I: Interner> NestedNormalizationGoals<I> {
 #[cfg_attr(feature = "nightly", derive(HashStable_NoContext))]
 pub enum Certainty {
     Yes,
-    Maybe(MaybeCause),
+    Maybe { cause: MaybeCause, opaque_types_jank: OpaqueTypesJank },
+}
+
+/// Supporting not-yet-defined opaque types in HIR typeck is somewhat
+/// challenging. Ideally we'd normalize them to a new inference variable
+/// and just defer type inference which relies on the opaque until we've
+/// constrained the hidden type.
+///
+/// This doesn't work for method and function calls as we need to guide type
+/// inference for the function arguments. We treat not-yet-defined opaque types
+/// as if they were rigid instead in these places.
+///
+/// When we encounter a `?hidden_type_of_opaque: Trait<?var>` goal, we use the
+/// item bounds and blanket impls to guide inference by constraining other type
+/// variables, see `EvalCtxt::try_assemble_bounds_via_registered_opaques`. We
+/// always keep the certainty as `Maybe` so that we properly prove these goals
+/// once the hidden type has been constrained.
+///
+/// If we fail to prove the trait goal via item bounds or blanket impls, the
+/// goal would have errored if the opaque type were rigid. In this case, we
+/// set `OpaqueTypesJank::ErrorIfRigidSelfTy` in the [Certainty].
+///
+/// Places in HIR typeck where we want to treat not-yet-defined opaque types as if
+/// they were kind of rigid then use `fn root_goal_may_hold_opaque_types_jank` which
+/// returns `false` if the goal doesn't hold or if `OpaqueTypesJank::ErrorIfRigidSelfTy`
+/// is set (i.e. proving it required relies on some `?hidden_ty: NotInItemBounds` goal).
+///
+/// This is subtly different from actually treating not-yet-defined opaque types as
+/// rigid, e.g. it allows constraining opaque types if they are not the self-type of
+/// a goal. It is good enough for now and only matters for very rare type inference
+/// edge cases. We can improve this later on if necessary.
+#[derive(Clone, Copy, Hash, PartialEq, Eq, Debug)]
+#[cfg_attr(feature = "nightly", derive(HashStable_NoContext))]
+pub enum OpaqueTypesJank {
+    AllGood,
+    ErrorIfRigidSelfTy,
+}
+impl OpaqueTypesJank {
+    fn and(self, other: OpaqueTypesJank) -> OpaqueTypesJank {
+        match (self, other) {
+            (OpaqueTypesJank::AllGood, OpaqueTypesJank::AllGood) => OpaqueTypesJank::AllGood,
+            (OpaqueTypesJank::ErrorIfRigidSelfTy, _) | (_, OpaqueTypesJank::ErrorIfRigidSelfTy) => {
+                OpaqueTypesJank::ErrorIfRigidSelfTy
+            }
+        }
+    }
+
+    pub fn or(self, other: OpaqueTypesJank) -> OpaqueTypesJank {
+        match (self, other) {
+            (OpaqueTypesJank::ErrorIfRigidSelfTy, OpaqueTypesJank::ErrorIfRigidSelfTy) => {
+                OpaqueTypesJank::ErrorIfRigidSelfTy
+            }
+            (OpaqueTypesJank::AllGood, _) | (_, OpaqueTypesJank::AllGood) => {
+                OpaqueTypesJank::AllGood
+            }
+        }
+    }
 }
 
 impl Certainty {
-    pub const AMBIGUOUS: Certainty = Certainty::Maybe(MaybeCause::Ambiguity);
+    pub const AMBIGUOUS: Certainty = Certainty::Maybe {
+        cause: MaybeCause::Ambiguity,
+        opaque_types_jank: OpaqueTypesJank::AllGood,
+    };
 
     /// Use this function to merge the certainty of multiple nested subgoals.
     ///
@@ -287,17 +366,26 @@ impl Certainty {
     /// however matter for diagnostics. If `T: Foo` resulted in overflow and `T: Bar`
     /// in ambiguity without changing the inference state, we still want to tell the
     /// user that `T: Baz` results in overflow.
-    pub fn unify_with(self, other: Certainty) -> Certainty {
+    pub fn and(self, other: Certainty) -> Certainty {
         match (self, other) {
             (Certainty::Yes, Certainty::Yes) => Certainty::Yes,
-            (Certainty::Yes, Certainty::Maybe(_)) => other,
-            (Certainty::Maybe(_), Certainty::Yes) => self,
-            (Certainty::Maybe(a), Certainty::Maybe(b)) => Certainty::Maybe(a.unify_with(b)),
+            (Certainty::Yes, Certainty::Maybe { .. }) => other,
+            (Certainty::Maybe { .. }, Certainty::Yes) => self,
+            (
+                Certainty::Maybe { cause: a_cause, opaque_types_jank: a_jank },
+                Certainty::Maybe { cause: b_cause, opaque_types_jank: b_jank },
+            ) => Certainty::Maybe {
+                cause: a_cause.and(b_cause),
+                opaque_types_jank: a_jank.and(b_jank),
+            },
         }
     }
 
     pub const fn overflow(suggest_increasing_limit: bool) -> Certainty {
-        Certainty::Maybe(MaybeCause::Overflow { suggest_increasing_limit })
+        Certainty::Maybe {
+            cause: MaybeCause::Overflow { suggest_increasing_limit, keep_constraints: false },
+            opaque_types_jank: OpaqueTypesJank::AllGood,
+        }
     }
 }
 
@@ -310,19 +398,86 @@ pub enum MaybeCause {
     /// or we hit a case where we just don't bother, e.g. `?x: Trait` goals.
     Ambiguity,
     /// We gave up due to an overflow, most often by hitting the recursion limit.
-    Overflow { suggest_increasing_limit: bool },
+    Overflow { suggest_increasing_limit: bool, keep_constraints: bool },
 }
 
 impl MaybeCause {
-    fn unify_with(self, other: MaybeCause) -> MaybeCause {
+    fn and(self, other: MaybeCause) -> MaybeCause {
         match (self, other) {
             (MaybeCause::Ambiguity, MaybeCause::Ambiguity) => MaybeCause::Ambiguity,
             (MaybeCause::Ambiguity, MaybeCause::Overflow { .. }) => other,
             (MaybeCause::Overflow { .. }, MaybeCause::Ambiguity) => self,
             (
-                MaybeCause::Overflow { suggest_increasing_limit: a },
-                MaybeCause::Overflow { suggest_increasing_limit: b },
-            ) => MaybeCause::Overflow { suggest_increasing_limit: a || b },
+                MaybeCause::Overflow {
+                    suggest_increasing_limit: limit_a,
+                    keep_constraints: keep_a,
+                },
+                MaybeCause::Overflow {
+                    suggest_increasing_limit: limit_b,
+                    keep_constraints: keep_b,
+                },
+            ) => MaybeCause::Overflow {
+                suggest_increasing_limit: limit_a && limit_b,
+                keep_constraints: keep_a && keep_b,
+            },
         }
+    }
+
+    pub fn or(self, other: MaybeCause) -> MaybeCause {
+        match (self, other) {
+            (MaybeCause::Ambiguity, MaybeCause::Ambiguity) => MaybeCause::Ambiguity,
+
+            // When combining ambiguity + overflow, we can keep constraints.
+            (
+                MaybeCause::Ambiguity,
+                MaybeCause::Overflow { suggest_increasing_limit, keep_constraints: _ },
+            ) => MaybeCause::Overflow { suggest_increasing_limit, keep_constraints: true },
+            (
+                MaybeCause::Overflow { suggest_increasing_limit, keep_constraints: _ },
+                MaybeCause::Ambiguity,
+            ) => MaybeCause::Overflow { suggest_increasing_limit, keep_constraints: true },
+
+            (
+                MaybeCause::Overflow {
+                    suggest_increasing_limit: limit_a,
+                    keep_constraints: keep_a,
+                },
+                MaybeCause::Overflow {
+                    suggest_increasing_limit: limit_b,
+                    keep_constraints: keep_b,
+                },
+            ) => MaybeCause::Overflow {
+                suggest_increasing_limit: limit_a || limit_b,
+                keep_constraints: keep_a || keep_b,
+            },
+        }
+    }
+}
+
+/// Indicates that a `impl Drop for Adt` is `const` or not.
+#[derive(Debug)]
+pub enum AdtDestructorKind {
+    NotConst,
+    Const,
+}
+
+/// Which sizedness trait - `Sized`, `MetaSized`? `PointeeSized` is omitted as it is removed during
+/// lowering.
+#[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
+#[cfg_attr(feature = "nightly", derive(HashStable_NoContext))]
+pub enum SizedTraitKind {
+    /// `Sized` trait
+    Sized,
+    /// `MetaSized` trait
+    MetaSized,
+}
+
+impl SizedTraitKind {
+    /// Returns `DefId` of corresponding language item.
+    pub fn require_lang_item<I: Interner>(self, cx: I) -> I::TraitId {
+        cx.require_trait_lang_item(match self {
+            SizedTraitKind::Sized => SolverTraitLangItem::Sized,
+            SizedTraitKind::MetaSized => SolverTraitLangItem::MetaSized,
+        })
     }
 }

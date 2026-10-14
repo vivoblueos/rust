@@ -1,46 +1,66 @@
 use hir::db::ExpandDatabase;
-use hir::HirFileIdExt;
+use hir::{UnsafeLint, UnsafetyReason};
 use ide_db::text_edit::TextEdit;
 use ide_db::{assists::Assist, source_change::SourceChange};
-use syntax::{ast, SyntaxNode};
-use syntax::{match_ast, AstNode};
+use syntax::{AstNode, match_ast};
+use syntax::{SyntaxNode, ast};
 
-use crate::{fix, Diagnostic, DiagnosticCode, DiagnosticsContext};
+use crate::{Diagnostic, DiagnosticCode, DiagnosticsContext, fix};
 
 // Diagnostic: missing-unsafe
 //
 // This diagnostic is triggered if an operation marked as `unsafe` is used outside of an `unsafe` function or block.
 pub(crate) fn missing_unsafe(ctx: &DiagnosticsContext<'_>, d: &hir::MissingUnsafe) -> Diagnostic {
-    let code = if d.only_lint {
-        DiagnosticCode::RustcLint("unsafe_op_in_unsafe_fn")
-    } else {
-        DiagnosticCode::RustcHardError("E0133")
+    let code = match d.lint {
+        UnsafeLint::HardError => DiagnosticCode::RustcHardError("E0133"),
+        UnsafeLint::UnsafeOpInUnsafeFn => DiagnosticCode::RustcLint("unsafe_op_in_unsafe_fn"),
+        UnsafeLint::DeprecatedSafe2024 => DiagnosticCode::RustcLint("deprecated_safe_2024"),
     };
+    let operation = display_unsafety_reason(d.reason);
     Diagnostic::new_with_syntax_node_ptr(
         ctx,
         code,
-        "this operation is unsafe and requires an unsafe function or block",
-        d.expr.map(|it| it.into()),
+        format!("{operation} is unsafe and requires an unsafe function or block"),
+        d.node.map(|it| it.into()),
     )
+    .stable()
     .with_fixes(fixes(ctx, d))
+}
+
+fn display_unsafety_reason(reason: UnsafetyReason) -> &'static str {
+    match reason {
+        UnsafetyReason::UnionField => "access to union field",
+        UnsafetyReason::UnsafeFnCall => "call to unsafe function",
+        UnsafetyReason::InlineAsm => "use of inline assembly",
+        UnsafetyReason::RawPtrDeref => "dereference of raw pointer",
+        UnsafetyReason::MutableStatic => "use of mutable static",
+        UnsafetyReason::ExternStatic => "use of extern static",
+    }
 }
 
 fn fixes(ctx: &DiagnosticsContext<'_>, d: &hir::MissingUnsafe) -> Option<Vec<Assist>> {
     // The fixit will not work correctly for macro expansions, so we don't offer it in that case.
-    if d.expr.file_id.is_macro() {
+    if d.node.file_id.is_macro() {
         return None;
     }
 
-    let root = ctx.sema.db.parse_or_expand(d.expr.file_id);
-    let node = d.expr.value.to_node(&root);
+    let root = ctx.sema.db.parse_or_expand(d.node.file_id);
+    let node = d.node.value.to_node(&root);
     let expr = node.syntax().ancestors().find_map(ast::Expr::cast)?;
 
     let node_to_add_unsafe_block = pick_best_node_to_add_unsafe_block(&expr)?;
 
-    let replacement = format!("unsafe {{ {} }}", node_to_add_unsafe_block.text());
+    let mut replacement = format!("unsafe {{ {} }}", node_to_add_unsafe_block.text());
+    if let Some(expr) = ast::Expr::cast(node_to_add_unsafe_block.clone())
+        && needs_parentheses(&expr)
+    {
+        replacement = format!("({replacement})");
+    }
     let edit = TextEdit::replace(node_to_add_unsafe_block.text_range(), replacement);
-    let source_change =
-        SourceChange::from_text_edit(d.expr.file_id.original_file(ctx.sema.db), edit);
+    let source_change = SourceChange::from_text_edit(
+        d.node.file_id.original_file(ctx.sema.db).file_id(ctx.sema.db),
+        edit,
+    );
     Some(vec![fix("add_unsafe", "Add unsafe block", source_change, expr.syntax().text_range())])
 }
 
@@ -97,6 +117,17 @@ fn pick_best_node_to_add_unsafe_block(unsafe_expr: &ast::Expr) -> Option<SyntaxN
     None
 }
 
+fn needs_parentheses(expr: &ast::Expr) -> bool {
+    let node = expr.syntax();
+    node.ancestors()
+        .skip(1)
+        .take_while(|it| it.text_range().start() == node.text_range().start())
+        .map_while(ast::Expr::cast)
+        .last()
+        .and_then(|it| Some(it.syntax().parent()?.kind()))
+        .is_some_and(|kind| ast::ExprStmt::can_cast(kind) || ast::StmtList::can_cast(kind))
+}
+
 #[cfg(test)]
 mod tests {
     use crate::tests::{check_diagnostics, check_fix, check_no_fix};
@@ -110,7 +141,7 @@ fn main() {
     let x = &5_usize as *const usize;
     unsafe { let _y = *x; }
     let _z = *x;
-}          //^^💡 error: this operation is unsafe and requires an unsafe function or block
+}          //^^💡 error: dereference of raw pointer is unsafe and requires an unsafe function or block
 "#,
         )
     }
@@ -125,20 +156,20 @@ struct HasUnsafe;
 impl HasUnsafe {
     unsafe fn unsafe_fn(&self) {
         let x = &5_usize as *const usize;
-        let _y = *x;
+        let _y = unsafe {*x};
     }
 }
 
 unsafe fn unsafe_fn() {
     let x = &5_usize as *const usize;
-    let _y = *x;
+    let _y = unsafe {*x};
 }
 
 fn main() {
     unsafe_fn();
-  //^^^^^^^^^^^💡 error: this operation is unsafe and requires an unsafe function or block
+  //^^^^^^^^^^^💡 error: call to unsafe function is unsafe and requires an unsafe function or block
     HasUnsafe.unsafe_fn();
-  //^^^^^^^^^^^^^^^^^^^^^💡 error: this operation is unsafe and requires an unsafe function or block
+  //^^^^^^^^^^^^^^^^^^^^^💡 error: call to unsafe function is unsafe and requires an unsafe function or block
     unsafe {
         unsafe_fn();
         HasUnsafe.unsafe_fn();
@@ -162,7 +193,7 @@ static mut STATIC_MUT: Ty = Ty { a: 0 };
 
 fn main() {
     let _x = STATIC_MUT.a;
-           //^^^^^^^^^^💡 error: this operation is unsafe and requires an unsafe function or block
+           //^^^^^^^^^^💡 error: use of mutable static is unsafe and requires an unsafe function or block
     unsafe {
         let _x = STATIC_MUT.a;
     }
@@ -184,9 +215,9 @@ extern "C" {
 
 fn main() {
     let _x = EXTERN;
-           //^^^^^^💡 error: this operation is unsafe and requires an unsafe function or block
+           //^^^^^^💡 error: use of extern static is unsafe and requires an unsafe function or block
     let _x = EXTERN_MUT;
-           //^^^^^^^^^^💡 error: this operation is unsafe and requires an unsafe function or block
+           //^^^^^^^^^^💡 error: use of mutable static is unsafe and requires an unsafe function or block
     unsafe {
         let _x = EXTERN;
         let _x = EXTERN_MUT;
@@ -225,6 +256,24 @@ fn main() {
     fn no_missing_unsafe_diagnostic_with_safe_intrinsic() {
         check_diagnostics(
             r#"
+#[rustc_intrinsic]
+pub fn bitreverse(x: u32) -> u32; // Safe intrinsic
+#[rustc_intrinsic]
+pub unsafe fn floorf32(x: f32) -> f32; // Unsafe intrinsic
+
+fn main() {
+    let _ = bitreverse(12);
+    let _ = floorf32(12.0);
+          //^^^^^^^^^^^^^^💡 error: call to unsafe function is unsafe and requires an unsafe function or block
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn no_missing_unsafe_diagnostic_with_legacy_safe_intrinsic() {
+        check_diagnostics(
+            r#"
 extern "rust-intrinsic" {
     #[rustc_safe_intrinsic]
     pub fn bitreverse(x: u32) -> u32; // Safe intrinsic
@@ -234,7 +283,7 @@ extern "rust-intrinsic" {
 fn main() {
     let _ = bitreverse(12);
     let _ = floorf32(12.0);
-          //^^^^^^^^^^^^^^💡 error: this operation is unsafe and requires an unsafe function or block
+          //^^^^^^^^^^^^^^💡 error: call to unsafe function is unsafe and requires an unsafe function or block
 }
 "#,
         );
@@ -247,8 +296,12 @@ fn main() {
 #[rustc_deprecated_safe_2024]
 fn set_var() {}
 
+#[rustc_deprecated_safe_2024(audit_that = "something")]
+fn set_var2() {}
+
 fn main() {
     set_var();
+    set_var2();
 }
 "#,
         );
@@ -307,7 +360,7 @@ struct S(usize);
 impl S {
     unsafe fn func(&self) {
         let x = &self.0 as *const usize;
-        let _z = *x;
+        let _z = unsafe { *x };
     }
 }
 fn main() {
@@ -320,7 +373,7 @@ struct S(usize);
 impl S {
     unsafe fn func(&self) {
         let x = &self.0 as *const usize;
-        let _z = *x;
+        let _z = unsafe { *x };
     }
 }
 fn main() {
@@ -403,6 +456,49 @@ unsafe fn foo() -> String {
 
 fn main() {
     unsafe { foo().len() };
+}
+"#,
+        )
+    }
+
+    #[test]
+    fn raw_deref_on_union_field() {
+        check_diagnostics(
+            r#"
+fn main() {
+
+    union U {
+        a: u8
+    }
+    let x = U { a: 3 };
+
+    let a = &raw mut x.a;
+
+    union U1 {
+        a: u8
+    }
+    let x = U1 { a: 3 };
+
+    let a = x.a;
+         // ^^^ 💡 error: access to union field is unsafe and requires an unsafe function or block
+
+
+    let b = &raw const x.a;
+
+    let tmp = Vec::from([1, 2, 3]);
+
+    let c = &raw const tmp[x.a];
+                        // ^^^ 💡 error: access to union field is unsafe and requires an unsafe function or block
+
+    union URef {
+        p: &'static mut i32,
+    }
+
+    fn deref_union_field(u: URef) {
+        // Not an assignment but an access to the union field!
+        *(u.p) = 13;
+       // ^^^ 💡 error: access to union field is unsafe and requires an unsafe function or block
+    }
 }
 "#,
         )
@@ -495,6 +591,27 @@ fn main() {
     }
 
     #[test]
+    fn needs_parentheses_for_unambiguous() {
+        check_fix(
+            r#"
+//- minicore: copy
+static mut STATIC_MUT: u8 = 0;
+
+fn foo() -> u8 {
+    STATIC_MUT$0 * 2
+}
+"#,
+            r#"
+static mut STATIC_MUT: u8 = 0;
+
+fn foo() -> u8 {
+    (unsafe { STATIC_MUT }) * 2
+}
+"#,
+        )
+    }
+
+    #[test]
     fn ref_to_unsafe_expr() {
         check_fix(
             r#"
@@ -555,33 +672,111 @@ fn main() {
             r#"
 //- /ed2021.rs crate:ed2021 edition:2021
 #[rustc_deprecated_safe_2024]
-unsafe fn safe() -> u8 {
+unsafe fn deprecated_safe() -> u8 {
     0
 }
+
 //- /ed2024.rs crate:ed2024 edition:2024
 #[rustc_deprecated_safe_2024]
-unsafe fn not_safe() -> u8 {
+unsafe fn deprecated_safe() -> u8 {
     0
 }
-//- /main.rs crate:main deps:ed2021,ed2024
+
+//- /dep1.rs crate:dep1 deps:ed2021,ed2024 edition:2021
 fn main() {
-    ed2021::safe();
-    ed2024::not_safe();
-  //^^^^^^^^^^^^^^^^^^💡 error: this operation is unsafe and requires an unsafe function or block
+    ed2021::deprecated_safe();
+    ed2024::deprecated_safe();
+}
+
+//- /dep2.rs crate:dep2 deps:ed2021,ed2024 edition:2024
+fn main() {
+    ed2021::deprecated_safe();
+ // ^^^^^^^^^^^^^^^^^^^^^^^^^💡 error: call to unsafe function is unsafe and requires an unsafe function or block
+    ed2024::deprecated_safe();
+ // ^^^^^^^^^^^^^^^^^^^^^^^^^💡 error: call to unsafe function is unsafe and requires an unsafe function or block
+}
+
+//- /dep3.rs crate:dep3 deps:ed2021,ed2024 edition:2021
+#![warn(deprecated_safe)]
+
+fn main() {
+    ed2021::deprecated_safe();
+ // ^^^^^^^^^^^^^^^^^^^^^^^^^💡 warn: call to unsafe function is unsafe and requires an unsafe function or block
+    ed2024::deprecated_safe();
+ // ^^^^^^^^^^^^^^^^^^^^^^^^^💡 warn: call to unsafe function is unsafe and requires an unsafe function or block
 }
             "#,
         )
     }
 
     #[test]
-    fn unsafe_op_in_unsafe_fn_allowed_by_default() {
+    fn orphan_unsafe_format_args() {
+        // Checks that we don't place orphan arguments for formatting under an unsafe block.
         check_diagnostics(
             r#"
+//- minicore: fmt_before_1_89_0
+fn foo() {
+    let p = 0xDEADBEEF as *const i32;
+    format_args!("", *p);
+                  // ^^ error: dereference of raw pointer is unsafe and requires an unsafe function or block
+}
+        "#,
+        );
+
+        check_diagnostics(
+            r#"
+//- minicore: fmt
+fn foo() {
+    let p = 0xDEADBEEF as *const i32;
+    format_args!("", *p);
+                  // ^^ error: dereference of raw pointer is unsafe and requires an unsafe function or block
+}
+        "#,
+        );
+    }
+
+    #[test]
+    fn unsafe_op_in_unsafe_fn_allowed_by_default_in_edition_2021() {
+        check_diagnostics(
+            r#"
+//- /lib.rs crate:foo edition:2021
 unsafe fn foo(p: *mut i32) {
     *p = 123;
 }
             "#,
-        )
+        );
+        check_diagnostics(
+            r#"
+//- /lib.rs crate:foo edition:2021
+#![deny(warnings)]
+unsafe fn foo(p: *mut i32) {
+    *p = 123;
+}
+            "#,
+        );
+    }
+
+    #[test]
+    fn unsafe_op_in_unsafe_fn_warn_by_default_in_edition_2024() {
+        check_diagnostics(
+            r#"
+//- /lib.rs crate:foo edition:2024
+unsafe fn foo(p: *mut i32) {
+    *p = 123;
+  //^^💡 warn: dereference of raw pointer is unsafe and requires an unsafe function or block
+}
+            "#,
+        );
+        check_diagnostics(
+            r#"
+//- /lib.rs crate:foo edition:2024
+#![deny(warnings)]
+unsafe fn foo(p: *mut i32) {
+    *p = 123;
+  //^^💡 error: dereference of raw pointer is unsafe and requires an unsafe function or block
+}
+            "#,
+        );
     }
 
     #[test]
@@ -591,7 +786,7 @@ unsafe fn foo(p: *mut i32) {
 #![warn(unsafe_op_in_unsafe_fn)]
 unsafe fn foo(p: *mut i32) {
     *p = 123;
-  //^^💡 warn: this operation is unsafe and requires an unsafe function or block
+  //^^💡 warn: dereference of raw pointer is unsafe and requires an unsafe function or block
 }
             "#,
         )
@@ -618,17 +813,304 @@ unsafe extern {
 fn main() {
     f();
     g();
-  //^^^💡 error: this operation is unsafe and requires an unsafe function or block
+  //^^^💡 error: call to unsafe function is unsafe and requires an unsafe function or block
     h();
-  //^^^💡 error: this operation is unsafe and requires an unsafe function or block
+  //^^^💡 error: call to unsafe function is unsafe and requires an unsafe function or block
 
     let _ = S1;
     let _ = S2;
-          //^^💡 error: this operation is unsafe and requires an unsafe function or block
+          //^^💡 error: use of extern static is unsafe and requires an unsafe function or block
     let _ = S3;
-          //^^💡 error: this operation is unsafe and requires an unsafe function or block
+          //^^💡 error: use of extern static is unsafe and requires an unsafe function or block
 }
 "#,
+        );
+    }
+
+    #[test]
+    fn no_unsafe_diagnostic_when_destructuring_union_with_wildcard() {
+        check_diagnostics(
+            r#"
+union Union { field: i32 }
+fn foo(v: &Union) {
+    let Union { field: _ } = v;
+    let Union { field: _ | _ } = v;
+    Union { field: _ } = *v;
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn union_destructuring() {
+        check_diagnostics(
+            r#"
+union Union { field: u8 }
+fn foo(v @ Union { field: _field }: &Union) {
+                       // ^^^^^^ error: access to union field is unsafe and requires an unsafe function or block
+    let Union { mut field } = v;
+             // ^^^^^^^^^💡 error: access to union field is unsafe and requires an unsafe function or block
+    let Union { field: 0..=255 } = v;
+                    // ^^^^^^^💡 error: access to union field is unsafe and requires an unsafe function or block
+    let Union { field: 0
+                    // ^💡 error: access to union field is unsafe and requires an unsafe function or block
+        | 1..=255 } = v;
+       // ^^^^^^^💡 error: access to union field is unsafe and requires an unsafe function or block
+    Union { field } = *v;
+         // ^^^^^💡 error: access to union field is unsafe and requires an unsafe function or block
+    match v {
+        Union { field: _field } => {}
+                    // ^^^^^^💡 error: access to union field is unsafe and requires an unsafe function or block
+    }
+    if let Union { field: _field } = v {}
+                       // ^^^^^^💡 error: access to union field is unsafe and requires an unsafe function or block
+    (|&Union { field }| { _ = field; })(v);
+            // ^^^^^💡 error: access to union field is unsafe and requires an unsafe function or block
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn union_field_access() {
+        check_diagnostics(
+            r#"
+union Union { field: u8 }
+fn foo(v: &Union) {
+    v.field;
+ // ^^^^^^^💡 error: access to union field is unsafe and requires an unsafe function or block
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn inline_asm() {
+        check_diagnostics(
+            r#"
+//- minicore: asm
+fn foo() {
+    core::arch::asm!("");
+                 // ^^^^ error: use of inline assembly is unsafe and requires an unsafe function or block
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn unsafe_op_in_unsafe_fn_dismissed_in_signature() {
+        check_diagnostics(
+            r#"
+#![warn(unsafe_op_in_unsafe_fn)]
+union Union { field: u32 }
+unsafe fn foo(Union { field: _field }: Union) {}
+            "#,
+        )
+    }
+
+    #[test]
+    fn union_assignment_allowed() {
+        check_diagnostics(
+            r#"
+union Union { field: u32 }
+fn foo(mut v: Union) {
+    v.field = 123;
+    (v.field,) = (123,);
+    *&mut v.field = 123;
+       // ^^^^^^^💡 error: access to union field is unsafe and requires an unsafe function or block
+}
+struct Struct { field: u32 }
+union Union2 { field: Struct }
+fn bar(mut v: Union2) {
+    v.field.field = 123;
+}
+
+            "#,
+        )
+    }
+
+    #[test]
+    fn raw_ref_reborrow_is_safe() {
+        check_diagnostics(
+            r#"
+fn main() {
+    let ptr: *mut i32;
+    let _addr = &raw const *ptr;
+
+    let local = 1;
+    let ptr = &local as *const i32;
+    let _addr = &raw const *ptr;
+}
+"#,
+        )
+    }
+
+    #[test]
+    fn target_feature() {
+        check_diagnostics(
+            r#"
+#[target_feature(enable = "avx")]
+fn foo() {}
+
+#[target_feature(enable = "avx2")]
+fn bar() {
+    foo();
+}
+
+fn baz() {
+    foo();
+ // ^^^^^ 💡 error: call to unsafe function is unsafe and requires an unsafe function or block
+}
+        "#,
+        );
+    }
+
+    #[test]
+    fn unsafe_fn_ptr_call() {
+        check_diagnostics(
+            r#"
+fn f(it: unsafe fn()){
+    it();
+ // ^^^^ 💡 error: call to unsafe function is unsafe and requires an unsafe function or block
+}
+        "#,
+        );
+    }
+
+    #[test]
+    fn unsafe_call_in_const_expr() {
+        check_diagnostics(
+            r#"
+unsafe fn f() {}
+fn main() {
+    const { f(); };
+         // ^^^ 💡 error: call to unsafe function is unsafe and requires an unsafe function or block
+}
+        "#,
+        );
+    }
+
+    #[test]
+    fn asm_label() {
+        check_diagnostics(
+            r#"
+//- minicore: asm
+fn foo() {
+    unsafe {
+        core::arch::asm!(
+            "jmp {}",
+            label {
+                let p = 0xDEADBEAF as *mut u8;
+                *p = 3;
+             // ^^ error: dereference of raw pointer is unsafe and requires an unsafe function or block
+            },
+        );
+    }
+}
+            "#,
+        );
+    }
+
+    #[test]
+    fn regression_19823() {
+        check_diagnostics(
+            r#"
+pub trait FooTrait {
+    unsafe fn method1();
+    unsafe fn method2();
+}
+
+unsafe fn some_unsafe_fn() {}
+
+macro_rules! impl_foo {
+    () => {
+        unsafe fn method1() {
+            some_unsafe_fn();
+        }
+        unsafe fn method2() {
+            some_unsafe_fn();
+        }
+    };
+}
+
+pub struct S1;
+#[allow(unsafe_op_in_unsafe_fn)]
+impl FooTrait for S1 {
+    unsafe fn method1() {
+        some_unsafe_fn();
+    }
+
+    unsafe fn method2() {
+        some_unsafe_fn();
+    }
+}
+
+pub struct S2;
+#[allow(unsafe_op_in_unsafe_fn)]
+impl FooTrait for S2 {
+    impl_foo!();
+}
+        "#,
+        );
+    }
+
+    #[test]
+    fn no_false_positive_on_format_args_since_1_89_0() {
+        check_diagnostics(
+            r#"
+//- minicore: fmt
+fn test() {
+    let foo = 10;
+    let bar = true;
+    let _x = format_args!("{} {0} {} {last}", foo, bar, last = "!");
+}
+            "#,
+        );
+    }
+
+    #[test]
+    fn naked_asm_is_safe() {
+        check_diagnostics(
+            r#"
+#[rustc_builtin_macro]
+macro_rules! naked_asm { () => {} }
+
+#[unsafe(naked)]
+extern "C" fn naked() {
+    naked_asm!("");
+}
+        "#,
+        );
+    }
+
+    #[test]
+    fn target_feature_safe_on_wasm() {
+        check_diagnostics(
+            r#"
+//- target_arch: wasm32
+
+#[target_feature(enable = "simd128")]
+fn requires_target_feature() {}
+
+fn main() {
+    requires_target_feature();
+}
+            "#,
+        );
+    }
+
+    #[test]
+    fn multiple_target_feature_enable() {
+        check_diagnostics(
+            r#"
+#[target_feature(enable = "avx2,fma")]
+fn foo() {}
+
+#[target_feature(enable = "avx2", enable = "fma")]
+fn bar() {
+    foo();
+}
+        "#,
         );
     }
 }

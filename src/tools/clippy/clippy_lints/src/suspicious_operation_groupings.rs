@@ -7,9 +7,8 @@ use rustc_data_structures::fx::FxHashSet;
 use rustc_errors::Applicability;
 use rustc_lint::{EarlyContext, EarlyLintPass};
 use rustc_session::declare_lint_pass;
-use rustc_span::Span;
-use rustc_span::source_map::Spanned;
 use rustc_span::symbol::Ident;
+use rustc_span::{Span, Spanned};
 
 declare_clippy_lint! {
     /// ### What it does
@@ -64,7 +63,9 @@ declare_clippy_lint! {
     "groupings of binary operations that look suspiciously like typos"
 }
 
-declare_lint_pass!(SuspiciousOperationGroupings => [SUSPICIOUS_OPERATION_GROUPINGS]);
+declare_lint_pass!(SuspiciousOperationGroupings => [
+    SUSPICIOUS_OPERATION_GROUPINGS,
+]);
 
 impl EarlyLintPass for SuspiciousOperationGroupings {
     fn check_expr(&mut self, cx: &EarlyContext<'_>, expr: &Expr) {
@@ -545,7 +546,7 @@ fn ident_difference_expr_with_base_location(
         | (Field(_, _), Field(_, _))
         | (AssignOp(_, _, _), AssignOp(_, _, _))
         | (Assign(_, _, _), Assign(_, _, _))
-        | (TryBlock(_), TryBlock(_))
+        | (TryBlock(_, _), TryBlock(_, _))
         | (Await(_, _), Await(_, _))
         | (Gen(_, _, _, _), Gen(_, _, _, _))
         | (Block(_, _), Block(_, _))

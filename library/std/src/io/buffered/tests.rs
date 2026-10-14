@@ -172,7 +172,7 @@ fn test_buffered_reader_stream_position_panic() {
     // cause internal buffer to be filled but read only partially
     let mut buffer = [0, 0];
     assert!(reader.read_exact(&mut buffer).is_ok());
-    // rewinding the internal reader will cause buffer to loose sync
+    // rewinding the internal reader will cause buffer to lose sync
     let inner = reader.get_mut();
     assert!(inner.seek(SeekFrom::Start(0)).is_ok());
     // overflow when subtracting the remaining buffer size from current position
@@ -391,16 +391,16 @@ fn test_read_until() {
     let mut v = Vec::new();
     reader.read_until(0, &mut v).unwrap();
     assert_eq!(v, [0]);
-    v.truncate(0);
+    v.clear();
     reader.read_until(2, &mut v).unwrap();
     assert_eq!(v, [1, 2]);
-    v.truncate(0);
+    v.clear();
     reader.read_until(1, &mut v).unwrap();
     assert_eq!(v, [1]);
-    v.truncate(0);
+    v.clear();
     reader.read_until(8, &mut v).unwrap();
     assert_eq!(v, [0]);
-    v.truncate(0);
+    v.clear();
     reader.read_until(9, &mut v).unwrap();
     assert_eq!(v, []);
 }
@@ -429,13 +429,13 @@ fn test_read_line() {
     let mut s = String::new();
     reader.read_line(&mut s).unwrap();
     assert_eq!(s, "a\n");
-    s.truncate(0);
+    s.clear();
     reader.read_line(&mut s).unwrap();
     assert_eq!(s, "b\n");
-    s.truncate(0);
+    s.clear();
     reader.read_line(&mut s).unwrap();
     assert_eq!(s, "c");
-    s.truncate(0);
+    s.clear();
     reader.read_line(&mut s).unwrap();
     assert_eq!(s, "");
 }
@@ -847,8 +847,7 @@ fn long_line_flushed() {
 }
 
 /// Test that, given a very long partial line *after* successfully
-/// flushing a complete line, the very long partial line is buffered
-/// unconditionally, and no additional writes take place. This assures
+/// flushing a complete line, no additional writes take place. This assures
 /// the property that `write` should make at-most-one attempt to write
 /// new data.
 #[test]
@@ -856,13 +855,22 @@ fn line_long_tail_not_flushed() {
     let writer = ProgrammableSink::default();
     let mut writer = LineWriter::with_capacity(5, writer);
 
-    // Assert that Line 1\n is flushed, and 01234 is buffered
-    assert_eq!(writer.write(b"Line 1\n0123456789").unwrap(), 12);
+    // Assert that Line 1\n is flushed and the long tail isn't.
+    let bytes = b"Line 1\n0123456789";
+    writer.write(bytes).unwrap();
     assert_eq!(&writer.get_ref().buffer, b"Line 1\n");
+}
+
+// Test that appending to a full buffer emits a single write, flushing the buffer.
+#[test]
+fn line_full_buffer_flushed() {
+    let writer = ProgrammableSink::default();
+    let mut writer = LineWriter::with_capacity(5, writer);
+    assert_eq!(writer.write(b"01234").unwrap(), 5);
 
     // Because the buffer is full, this subsequent write will flush it
     assert_eq!(writer.write(b"5").unwrap(), 1);
-    assert_eq!(&writer.get_ref().buffer, b"Line 1\n01234");
+    assert_eq!(&writer.get_ref().buffer, b"01234");
 }
 
 /// Test that, if an attempt to pre-flush buffered data returns Ok(0),
@@ -1059,13 +1067,13 @@ fn bufreader_full_initialize() {
     }
     let mut reader = BufReader::new(OneByteReader);
     // Nothing is initialized yet.
-    assert_eq!(reader.initialized(), 0);
+    assert!(!reader.initialized());
 
     let buf = reader.fill_buf().unwrap();
     // We read one byte...
     assert_eq!(buf.len(), 1);
     // But we initialized the whole buffer!
-    assert_eq!(reader.initialized(), reader.capacity());
+    assert!(reader.initialized());
 }
 
 /// This is a regression test for https://github.com/rust-lang/rust/issues/127584.

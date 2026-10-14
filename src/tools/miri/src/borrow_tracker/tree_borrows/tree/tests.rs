@@ -9,8 +9,12 @@ use crate::borrow_tracker::tree_borrows::exhaustive::{Exhaustive, precondition};
 impl Exhaustive for LocationState {
     fn exhaustive() -> Box<dyn Iterator<Item = Self>> {
         // We keep `latest_foreign_access` at `None` as that's just a cache.
-        Box::new(<(Permission, bool)>::exhaustive().map(|(permission, initialized)| {
-            Self { permission, initialized, latest_foreign_access: None }
+        Box::new(<(Permission, bool)>::exhaustive().map(|(permission, accessed)| {
+            Self {
+                permission,
+                accessed,
+                idempotent_foreign_access: IdempotentForeignAccess::default(),
+            }
         }))
     }
 }
@@ -57,8 +61,7 @@ fn all_read_accesses_commute() {
                 // ... and produce the same final result.
                 assert_eq!(
                     loc12, loc21,
-                    "Read accesses {:?} followed by {:?} do not commute !",
-                    rel1, rel2
+                    "Read accesses {rel1:?} followed by {rel2:?} do not commute !"
                 );
             }
         }
@@ -73,8 +76,8 @@ fn as_protected(b: bool) -> &'static str {
     if b { " (protected)" } else { "" }
 }
 
-fn as_lazy_or_init(b: bool) -> &'static str {
-    if b { "initialized" } else { "lazy" }
+fn as_lazy_or_accessed(b: bool) -> &'static str {
+    if b { "accessed" } else { "lazy" }
 }
 
 /// Test that tree compacting (as performed by the GC) is sound.
@@ -103,7 +106,7 @@ fn tree_compacting_is_sound() {
                         as_foreign_or_child(rel),
                         kind,
                         parent.permission(),
-                        as_lazy_or_init(child.is_initialized()),
+                        as_lazy_or_accessed(child.accessed()),
                         child.permission(),
                         as_protected(child_protected),
                         np.permission(),
@@ -119,7 +122,7 @@ fn tree_compacting_is_sound() {
                         as_foreign_or_child(rel),
                         kind,
                         parent.permission(),
-                        as_lazy_or_init(child.is_initialized()),
+                        as_lazy_or_accessed(child.accessed()),
                         child.permission(),
                         as_protected(child_protected),
                         nc.permission()
@@ -260,15 +263,15 @@ mod spurious_read {
             match xy_rel {
                 RelPosXY::MutuallyForeign =>
                     match self {
-                        PtrSelector::X => (This, DistantAccess),
-                        PtrSelector::Y => (DistantAccess, This),
-                        PtrSelector::Other => (DistantAccess, DistantAccess),
+                        PtrSelector::X => (LocalAccess, ForeignAccess),
+                        PtrSelector::Y => (ForeignAccess, LocalAccess),
+                        PtrSelector::Other => (ForeignAccess, ForeignAccess),
                     },
                 RelPosXY::XChildY =>
                     match self {
-                        PtrSelector::X => (This, StrictChildAccess),
-                        PtrSelector::Y => (AncestorAccess, This),
-                        PtrSelector::Other => (DistantAccess, DistantAccess),
+                        PtrSelector::X => (LocalAccess, LocalAccess),
+                        PtrSelector::Y => (ForeignAccess, LocalAccess),
+                        PtrSelector::Other => (ForeignAccess, ForeignAccess),
                     },
             }
         }
@@ -372,7 +375,7 @@ mod spurious_read {
 
     impl LocStateProt {
         fn is_initial(&self) -> bool {
-            self.state.is_initial()
+            self.state.permission().is_initial()
         }
 
         fn perform_access(&self, kind: AccessKind, rel: AccessRelatedness) -> Result<Self, ()> {
@@ -417,7 +420,7 @@ mod spurious_read {
     /// `(LocStateProt, LocStateProt)` where the two states are not guaranteed
     /// to be updated at the same time.
     /// Some `LocStateProtPair` may be unreachable through normal means
-    /// such as `x: Active, y: Active` in the case of mutually foreign pointers.
+    /// such as `x: Unique, y: Unique` in the case of mutually foreign pointers.
     struct LocStateProtPair {
         xy_rel: RelPosXY,
         x: LocStateProt,
@@ -432,19 +435,19 @@ mod spurious_read {
             Ok(Self { x, y, ..self })
         }
 
-        /// Perform a read on the given pointer if its state is `initialized`.
+        /// Perform a read on the given pointer if its state is `accessed`.
         /// Must be called just after reborrowing a pointer, and just after
         /// removing a protector.
-        fn read_if_initialized(self, ptr: PtrSelector) -> Result<Self, ()> {
-            let initialized = match ptr {
-                PtrSelector::X => self.x.state.initialized,
-                PtrSelector::Y => self.y.state.initialized,
+        fn read_if_accessed(self, ptr: PtrSelector) -> Result<Self, ()> {
+            let accessed = match ptr {
+                PtrSelector::X => self.x.state.accessed,
+                PtrSelector::Y => self.y.state.accessed,
                 PtrSelector::Other =>
                     panic!(
-                        "the `initialized` status of `PtrSelector::Other` is unknown, do not pass it to `read_if_initialized`"
+                        "the `accessed` status of `PtrSelector::Other` is unknown, do not pass it to `read_if_accessed`"
                     ),
             };
-            if initialized {
+            if accessed {
                 self.perform_test_access(&TestAccess { ptr, kind: AccessKind::Read })
             } else {
                 Ok(self)
@@ -454,13 +457,13 @@ mod spurious_read {
         /// Remove the protector of `x`, including the implicit read on function exit.
         fn end_protector_x(self) -> Result<Self, ()> {
             let x = self.x.end_protector();
-            Self { x, ..self }.read_if_initialized(PtrSelector::X)
+            Self { x, ..self }.read_if_accessed(PtrSelector::X)
         }
 
         /// Remove the protector of `y`, including the implicit read on function exit.
         fn end_protector_y(self) -> Result<Self, ()> {
             let y = self.y.end_protector();
-            Self { y, ..self }.read_if_initialized(PtrSelector::Y)
+            Self { y, ..self }.read_if_accessed(PtrSelector::Y)
         }
 
         fn retag_y(self, new_y: LocStateProt) -> Result<Self, ()> {
@@ -470,7 +473,7 @@ mod spurious_read {
             }
             // `xy_rel` changes to "mutually foreign" now: `y` can no longer be a parent of `x`.
             Self { y: new_y, xy_rel: RelPosXY::MutuallyForeign, ..self }
-                .read_if_initialized(PtrSelector::Y)
+                .read_if_accessed(PtrSelector::Y)
         }
 
         fn perform_test_event<RetX, RetY>(self, evt: &TestEvent<RetX, RetY>) -> Result<Self, ()> {
@@ -598,13 +601,18 @@ mod spurious_read {
         let source = LocStateProtPair {
             xy_rel: RelPosXY::MutuallyForeign,
             x: LocStateProt {
-                state: LocationState::new_init(Permission::new_frozen()),
+                // For the tests, the strongest idempotent foreign access does not matter, so we use `Default::default`
+                state: LocationState::new_accessed(
+                    Permission::new_frozen(),
+                    IdempotentForeignAccess::default(),
+                ),
                 prot: true,
             },
             y: LocStateProt {
-                state: LocationState::new_uninit(Permission::new_reserved(
-                    /* freeze */ true, /* protected */ true,
-                )),
+                state: LocationState::new_non_accessed(
+                    Permission::new_reserved_frz(),
+                    IdempotentForeignAccess::default(),
+                ),
                 prot: true,
             },
         };
@@ -642,8 +650,8 @@ mod spurious_read {
             for xy_rel in RelPosXY::exhaustive() {
                 for (x_retag_perm, y_current_perm) in <(LocationState, LocationState)>::exhaustive()
                 {
-                    // We can only do spurious reads for initialized locations anyway.
-                    precondition!(x_retag_perm.initialized);
+                    // We can only do spurious reads for accessed locations anyway.
+                    precondition!(x_retag_perm.accessed);
                     // And `x` just got retagged, so it must be initial.
                     precondition!(x_retag_perm.permission.is_initial());
                     // As stated earlier, `x` is always protected in the patterns we consider here.
@@ -665,8 +673,8 @@ mod spurious_read {
         fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
             let (x, y) = self.retag_permissions();
             write!(f, "{}; ", self.xy_rel)?;
-            write!(f, "y: ({}); ", y,)?;
-            write!(f, "retag x ({}); ", x)?;
+            write!(f, "y: ({y}); ")?;
+            write!(f, "retag x ({x}); ")?;
 
             write!(f, "<arbitrary code>; <spurious read x>;")?;
             Ok(())
@@ -688,7 +696,7 @@ mod spurious_read {
         fn initial_state(&self) -> Result<LocStateProtPair, ()> {
             let (x, y) = self.retag_permissions();
             let state = LocStateProtPair { xy_rel: self.xy_rel, x, y };
-            state.read_if_initialized(PtrSelector::X)
+            state.read_if_accessed(PtrSelector::X)
         }
     }
 
@@ -701,7 +709,7 @@ mod spurious_read {
         let mut err = 0;
         for pat in Pattern::exhaustive() {
             let Ok(initial_source) = pat.initial_state() else {
-                // Failed to retag `x` in the source (e.g. `y` was protected Active)
+                // Failed to retag `x` in the source (e.g. `y` was protected Unique)
                 continue;
             };
             // `x` must stay protected, but the function protecting `y` might return here
@@ -721,19 +729,19 @@ mod spurious_read {
                         // protector.
                         final_source
                             .distinguishable::</*X*/ AllowRet, /*Y*/ AllowRet>(&final_target)
-                            .then_some(format!("{}", final_target))
+                            .then_some(format!("{final_target}"))
                     } else {
                         Some(format!("UB"))
                     }
                 };
                 if let Some(final_target) = distinguishable {
                     eprintln!(
-                        "For pattern '{}', inserting a spurious read through x makes the final state '{}' instead of '{}' which is observable",
-                        pat, final_target, final_source
+                        "For pattern '{pat}', inserting a spurious read through x makes the final state '{final_target}' \
+                        instead of '{final_source}' which is observable"
                     );
-                    eprintln!("  (arbitrary code instanciated with '{}')", opaque);
+                    eprintln!("  (arbitrary code instanciated with '{opaque}')");
                     err += 1;
-                    // We found an instanciation of the opaque code that makes this Pattern
+                    // We found an instantiation of the opaque code that makes this Pattern
                     // fail, we don't really need to check the rest.
                     break;
                 }

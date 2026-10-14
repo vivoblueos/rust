@@ -47,11 +47,15 @@ impl RiscVInlineAsmRegClass {
                     types! { _: I8, I16, I32, F16, F32; }
                 }
             }
-            // FIXME(f16_f128): Add `q: F128;` once LLVM support the `Q` extension.
+            // FIXME(f128): Add `q: F128;` once LLVM support the `Q` extension.
             Self::freg => types! { f: F16, F32; d: F64; },
             Self::vreg => &[],
         }
     }
+}
+
+pub(crate) fn is_e(target_features: &FxIndexSet<Symbol>) -> bool {
+    target_features.contains(&sym::character('e'))
 }
 
 fn not_e(
@@ -61,7 +65,7 @@ fn not_e(
     _target: &Target,
     _is_clobber: bool,
 ) -> Result<(), &'static str> {
-    if target_features.contains(&sym::e) {
+    if is_e(target_features) {
         Err("register can't be used with the `e` target feature")
     } else {
         Ok(())

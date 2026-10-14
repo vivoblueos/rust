@@ -1,6 +1,5 @@
-use std::ffi::{CStr, c_char};
+use std::ffi::CStr;
 use std::marker::PhantomData;
-use std::ops::Deref;
 use std::ptr::NonNull;
 
 use rustc_data_structures::small_c_str::SmallCStr;
@@ -17,7 +16,7 @@ pub struct OwnedTargetMachine {
 }
 
 impl OwnedTargetMachine {
-    pub fn new(
+    pub(crate) fn new(
         triple: &CStr,
         cpu: &CStr,
         features: &CStr,
@@ -25,7 +24,7 @@ impl OwnedTargetMachine {
         model: llvm::CodeModel,
         reloc: llvm::RelocModel,
         level: llvm::CodeGenOptLevel,
-        use_soft_fp: bool,
+        float_abi: llvm::FloatAbi,
         function_sections: bool,
         data_sections: bool,
         unique_section_names: bool,
@@ -37,16 +36,11 @@ impl OwnedTargetMachine {
         use_init_array: bool,
         split_dwarf_file: &CStr,
         output_obj_file: &CStr,
-        debug_info_compression: &CStr,
+        debug_info_compression: llvm::CompressionKind,
         use_emulated_tls: bool,
-        args_cstr_buff: &[u8],
+        use_wasm_eh: bool,
+        large_data_threshold: u64,
     ) -> Result<Self, LlvmError<'static>> {
-        assert!(args_cstr_buff.len() > 0);
-        assert!(
-            *args_cstr_buff.last().unwrap() == 0,
-            "The last character must be a null terminator."
-        );
-
         // SAFETY: llvm::LLVMRustCreateTargetMachine copies pointed to data
         let tm_ptr = unsafe {
             llvm::LLVMRustCreateTargetMachine(
@@ -57,7 +51,7 @@ impl OwnedTargetMachine {
                 model,
                 reloc,
                 level,
-                use_soft_fp,
+                float_abi,
                 function_sections,
                 data_sections,
                 unique_section_names,
@@ -69,10 +63,10 @@ impl OwnedTargetMachine {
                 use_init_array,
                 split_dwarf_file.as_ptr(),
                 output_obj_file.as_ptr(),
-                debug_info_compression.as_ptr(),
+                debug_info_compression,
                 use_emulated_tls,
-                args_cstr_buff.as_ptr() as *const c_char,
-                args_cstr_buff.len(),
+                use_wasm_eh,
+                large_data_threshold,
             )
         };
 
@@ -80,12 +74,12 @@ impl OwnedTargetMachine {
             .map(|tm_unique| Self { tm_unique, phantom: PhantomData })
             .ok_or_else(|| LlvmError::CreateTargetMachine { triple: SmallCStr::from(triple) })
     }
-}
 
-impl Deref for OwnedTargetMachine {
-    type Target = llvm::TargetMachine;
-
-    fn deref(&self) -> &Self::Target {
+    /// Returns inner `llvm::TargetMachine` type.
+    ///
+    /// This could be a `Deref` implementation, but `llvm::TargetMachine` is an extern type and
+    /// `Deref::Target: ?Sized`.
+    pub fn raw(&self) -> &llvm::TargetMachine {
         // SAFETY: constructing ensures we have a valid pointer created by
         // llvm::LLVMRustCreateTargetMachine.
         unsafe { self.tm_unique.as_ref() }
@@ -97,8 +91,6 @@ impl Drop for OwnedTargetMachine {
         // SAFETY: constructing ensures we have a valid pointer created by
         // llvm::LLVMRustCreateTargetMachine OwnedTargetMachine is not copyable so there is no
         // double free or use after free.
-        unsafe {
-            llvm::LLVMRustDisposeTargetMachine(self.tm_unique.as_mut());
-        }
+        unsafe { llvm::LLVMDisposeTargetMachine(self.tm_unique) };
     }
 }

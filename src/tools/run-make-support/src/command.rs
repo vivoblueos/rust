@@ -6,7 +6,7 @@ use std::{ffi, panic};
 
 use build_helper::drop_bomb::DropBomb;
 
-use crate::util::handle_failed_output;
+use crate::util::{handle_failed_output, verbose_print_command};
 use crate::{
     assert_contains, assert_contains_regex, assert_equals, assert_not_contains,
     assert_not_contains_regex,
@@ -46,6 +46,8 @@ pub struct Command {
     // Emulate linear type semantics.
     drop_bomb: DropBomb,
     already_executed: bool,
+
+    context: String,
 }
 
 impl Command {
@@ -60,7 +62,24 @@ impl Command {
             stdout: None,
             stderr: None,
             already_executed: false,
+            context: String::new(),
         }
+    }
+
+    // Internal-only.
+    pub(crate) fn into_raw_command(mut self) -> std::process::Command {
+        self.drop_bomb.defuse();
+        self.cmd
+    }
+
+    pub(crate) fn get_context(&self) -> &str {
+        &self.context
+    }
+
+    /// Appends context to the command, to provide a better error message if the command fails.
+    pub fn context(&mut self, ctx: &str) -> &mut Self {
+        self.context.push_str(&format!("{ctx}\n"));
+        self
     }
 
     /// Specify a stdin input buffer. This is a convenience helper,
@@ -137,7 +156,7 @@ impl Command {
 
     /// Inspect what the underlying [`std::process::Command`] is up to the
     /// current construction.
-    pub fn inspect<I>(&mut self, inspector: I) -> &mut Self
+    pub fn inspect<I>(&self, inspector: I) -> &Self
     where
         I: FnOnce(&StdCommand),
     {
@@ -151,6 +170,61 @@ impl Command {
         self
     }
 
+    /// Set an auxiliary stream passed to the process, besides the stdio streams.
+    ///
+    /// # Notes
+    ///
+    /// Use with caution! Ideally, only set one aux fd; if there are multiple, their old `fd` may
+    /// overlap with another's `new_fd`, and may break. The caller must make sure this is not the
+    /// case. This function is only "safe" because the safety requirements are practically not
+    /// possible to uphold.
+    #[cfg(unix)]
+    pub fn set_aux_fd<F: Into<std::os::fd::OwnedFd>>(
+        &mut self,
+        new_fd: std::os::fd::RawFd,
+        fd: F,
+    ) -> &mut Self {
+        use std::mem;
+        // NOTE: If more than 1 auxiliary file descriptor is needed, this function should be
+        // rewritten.
+        use std::os::fd::AsRawFd;
+        use std::os::unix::process::CommandExt;
+
+        let cvt = |x| if x == -1 { Err(std::io::Error::last_os_error()) } else { Ok(()) };
+
+        // Ensure fd stays open until the fork.
+        let fd = mem::ManuallyDrop::new(fd.into());
+        let fd = fd.as_raw_fd();
+
+        if fd == new_fd {
+            // If the new file descriptor is already the same as fd, just turn off `FD_CLOEXEC`.
+            let fd_flags = {
+                let ret = unsafe { libc::fcntl(fd, libc::F_GETFD, 0) };
+                if ret < 0 {
+                    panic!("failed to read fd flags: {}", std::io::Error::last_os_error());
+                }
+                ret
+            };
+            // Clear `FD_CLOEXEC`.
+            let fd_flags = fd_flags & !libc::FD_CLOEXEC;
+
+            // SAFETY(io-safety): `fd` is already owned.
+            cvt(unsafe { libc::fcntl(fd, libc::F_SETFD, fd_flags as libc::c_int) })
+                .expect("disabling CLOEXEC failed");
+        }
+        let pre_exec = move || {
+            if fd.as_raw_fd() != new_fd {
+                // SAFETY(io-safety): it's the caller's responsibility that we won't override the
+                // target fd.
+                cvt(unsafe { libc::dup2(fd, new_fd) })?;
+            }
+            Ok(())
+        };
+        // SAFETY(pre-exec-safe): `dup2` is pre-exec-safe.
+        unsafe { self.cmd.pre_exec(pre_exec) };
+        self
+    }
+
     /// Run the constructed command and assert that it is successfully run.
     ///
     /// By default, std{in,out,err} are [`Stdio::piped()`].
@@ -159,6 +233,8 @@ impl Command {
         let output = self.command_output();
         if !output.status().success() {
             handle_failed_output(&self, output, panic::Location::caller().line());
+        } else {
+            verbose_print_command(self, &output);
         }
         output
     }
@@ -171,6 +247,8 @@ impl Command {
         let output = self.command_output();
         if output.status().success() {
             handle_failed_output(&self, output, panic::Location::caller().line());
+        } else {
+            verbose_print_command(self, &output);
         }
         output
     }
@@ -326,16 +404,27 @@ impl CompletedProcess {
         self
     }
 
-    /// Checks that `stderr` does not contain the regex pattern `unexpected`.
+    /// Checks that `stderr` doesn't contain the Internal Compiler Error message.
     #[track_caller]
-    pub fn assert_stderr_not_contains_regex<S: AsRef<str>>(&self, unexpected: S) -> &Self {
-        assert_not_contains_regex(&self.stdout_utf8(), unexpected);
+    pub fn assert_not_ice(&self) -> &Self {
+        self.assert_stderr_not_contains("error: the compiler unexpectedly panicked. this is a bug");
         self
     }
 
+    /// Checks that `stderr` does not contain the regex pattern `unexpected`.
+    #[track_caller]
+    pub fn assert_stderr_not_contains_regex<S: AsRef<str>>(&self, unexpected: S) -> &Self {
+        assert_not_contains_regex(&self.stderr_utf8(), unexpected);
+        self
+    }
+
+    /// Check the **exit status** of the process. On Unix, this is *not* the **wait status**.
+    ///
+    /// See [`std::process::ExitStatus::code`]. This is not to be confused with
+    /// [`std::process::ExitCode`].
     #[track_caller]
     pub fn assert_exit_code(&self, code: i32) -> &Self {
-        assert!(self.output.status.code() == Some(code));
+        assert_eq!(self.output.status.code(), Some(code));
         self
     }
 }

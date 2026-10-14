@@ -1,59 +1,13 @@
 use clippy_utils::diagnostics::span_lint_and_then;
-use clippy_utils::get_parent_as_impl;
 use clippy_utils::source::snippet;
 use clippy_utils::ty::{deref_chain, get_adt_inherent_method, implements_trait, make_normalized_projection};
+use clippy_utils::{get_parent_as_impl, sym};
 use rustc_ast::Mutability;
 use rustc_errors::Applicability;
 use rustc_hir::{FnRetTy, ImplItemKind, ImplicitSelfKind, ItemKind, TyKind};
 use rustc_lint::{LateContext, LateLintPass, LintContext};
-use rustc_middle::lint::in_external_macro;
 use rustc_middle::ty::{self, Ty};
 use rustc_session::declare_lint_pass;
-use rustc_span::sym;
-
-declare_clippy_lint! {
-    /// ### What it does
-    /// Looks for `iter` and `iter_mut` methods without an associated `IntoIterator for (&|&mut) Type` implementation.
-    ///
-    /// ### Why is this bad?
-    /// It's not bad, but having them is idiomatic and allows the type to be used in for loops directly
-    /// (`for val in &iter {}`), without having to first call `iter()` or `iter_mut()`.
-    ///
-    /// ### Limitations
-    /// This lint focuses on providing an idiomatic API. Therefore, it will only
-    /// lint on types which are accessible outside of the crate. For internal types,
-    /// the `IntoIterator` trait can be implemented on demand if it is actually needed.
-    ///
-    /// ### Example
-    /// ```no_run
-    /// struct MySlice<'a>(&'a [u8]);
-    /// impl<'a> MySlice<'a> {
-    ///     pub fn iter(&self) -> std::slice::Iter<'a, u8> {
-    ///         self.0.iter()
-    ///     }
-    /// }
-    /// ```
-    /// Use instead:
-    /// ```no_run
-    /// struct MySlice<'a>(&'a [u8]);
-    /// impl<'a> MySlice<'a> {
-    ///     pub fn iter(&self) -> std::slice::Iter<'a, u8> {
-    ///         self.0.iter()
-    ///     }
-    /// }
-    /// impl<'a> IntoIterator for &MySlice<'a> {
-    ///     type Item = &'a u8;
-    ///     type IntoIter = std::slice::Iter<'a, u8>;
-    ///     fn into_iter(self) -> Self::IntoIter {
-    ///         self.iter()
-    ///     }
-    /// }
-    /// ```
-    #[clippy::version = "1.75.0"]
-    pub ITER_WITHOUT_INTO_ITER,
-    pedantic,
-    "implementing `iter(_mut)` without an associated `IntoIterator for (&|&mut) Type` impl"
-}
 
 declare_clippy_lint! {
     /// ### What it does
@@ -107,7 +61,54 @@ declare_clippy_lint! {
     "implementing `IntoIterator for (&|&mut) Type` without an inherent `iter(_mut)` method"
 }
 
-declare_lint_pass!(IterWithoutIntoIter => [ITER_WITHOUT_INTO_ITER, INTO_ITER_WITHOUT_ITER]);
+declare_clippy_lint! {
+    /// ### What it does
+    /// Looks for `iter` and `iter_mut` methods without an associated `IntoIterator for (&|&mut) Type` implementation.
+    ///
+    /// ### Why is this bad?
+    /// It's not bad, but having them is idiomatic and allows the type to be used in for loops directly
+    /// (`for val in &iter {}`), without having to first call `iter()` or `iter_mut()`.
+    ///
+    /// ### Limitations
+    /// This lint focuses on providing an idiomatic API. Therefore, it will only
+    /// lint on types which are accessible outside of the crate. For internal types,
+    /// the `IntoIterator` trait can be implemented on demand if it is actually needed.
+    ///
+    /// ### Example
+    /// ```no_run
+    /// struct MySlice<'a>(&'a [u8]);
+    /// impl<'a> MySlice<'a> {
+    ///     pub fn iter(&self) -> std::slice::Iter<'a, u8> {
+    ///         self.0.iter()
+    ///     }
+    /// }
+    /// ```
+    /// Use instead:
+    /// ```no_run
+    /// struct MySlice<'a>(&'a [u8]);
+    /// impl<'a> MySlice<'a> {
+    ///     pub fn iter(&self) -> std::slice::Iter<'a, u8> {
+    ///         self.0.iter()
+    ///     }
+    /// }
+    /// impl<'a> IntoIterator for &MySlice<'a> {
+    ///     type Item = &'a u8;
+    ///     type IntoIter = std::slice::Iter<'a, u8>;
+    ///     fn into_iter(self) -> Self::IntoIter {
+    ///         self.iter()
+    ///     }
+    /// }
+    /// ```
+    #[clippy::version = "1.75.0"]
+    pub ITER_WITHOUT_INTO_ITER,
+    pedantic,
+    "implementing `iter(_mut)` without an associated `IntoIterator for (&|&mut) Type` impl"
+}
+
+declare_lint_pass!(IterWithoutIntoIter => [
+    INTO_ITER_WITHOUT_ITER,
+    ITER_WITHOUT_INTO_ITER,
+]);
 
 /// Checks if a given type is nameable in a trait (impl).
 /// RPIT is stable, but impl Trait in traits is not (yet), so when we have
@@ -127,11 +128,12 @@ impl LateLintPass<'_> for IterWithoutIntoIter {
     fn check_item(&mut self, cx: &LateContext<'_>, item: &rustc_hir::Item<'_>) {
         if let ItemKind::Impl(imp) = item.kind
             && let TyKind::Ref(_, self_ty_without_ref) = &imp.self_ty.kind
-            && let Some(trait_ref) = imp.of_trait
-            && trait_ref
+            && let Some(of_trait) = imp.of_trait
+            && of_trait
+                .trait_ref
                 .trait_def_id()
                 .is_some_and(|did| cx.tcx.is_diagnostic_item(sym::IntoIterator, did))
-            && !in_external_macro(cx.sess(), item.span)
+            && !item.span.in_external_macro(cx.sess().source_map())
             && let &ty::Ref(_, ty, mtbl) = cx.tcx.type_of(item.owner_id).instantiate_identity().kind()
             && let expected_method_name = match mtbl {
                 Mutability::Mut => sym::iter_mut,
@@ -141,13 +143,18 @@ impl LateLintPass<'_> for IterWithoutIntoIter {
                 // We can't check inherent impls for slices, but we know that they have an `iter(_mut)` method
                 ty.peel_refs().is_slice() || get_adt_inherent_method(cx, ty, expected_method_name).is_some()
             })
-            && let Some(iter_assoc_span) = imp.items.iter().find_map(|item| {
-                if item.ident.name.as_str() == "IntoIter" {
-                    Some(cx.tcx.hir().impl_item(item.id).expect_type().span)
-                } else {
-                    None
-                }
-            })
+            && let Some(iter_assoc_span) = cx
+                .tcx
+                .associated_items(item.owner_id)
+                .filter_by_name_unhygienic_and_kind(sym::IntoIter, ty::AssocTag::Type)
+                .next()
+                .map(|assoc_item| {
+                    cx.tcx
+                        .hir_node_by_def_id(assoc_item.def_id.expect_local())
+                        .expect_impl_item()
+                        .expect_type()
+                        .span
+                })
             && is_ty_exported(cx, ty)
         {
             span_lint_and_then(
@@ -193,7 +200,7 @@ impl {self_ty_without_ref} {{
             _ => return,
         };
 
-        if !in_external_macro(cx.sess(), item.span)
+        if !item.span.in_external_macro(cx.sess().source_map())
             && let ImplItemKind::Fn(sig, _) = item.kind
             && let FnRetTy::Return(ret) = sig.decl.output
             && is_nameable_in_impl_trait(ret)

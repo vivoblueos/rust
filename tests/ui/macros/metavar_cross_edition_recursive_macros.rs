@@ -1,4 +1,4 @@
-//@ compile-flags: --edition=2024 -Z unstable-options
+//@ edition: 2024
 //@ aux-build: metavar_2018.rs
 //@ known-bug: #130484
 //@ run-pass
@@ -6,7 +6,6 @@
 // This test captures the behavior of macro-generating-macros with fragment
 // specifiers across edition boundaries.
 
-#![feature(macro_metavar_expr)]
 #![allow(incomplete_features)]
 
 extern crate metavar_2018;

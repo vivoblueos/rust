@@ -16,7 +16,7 @@ pub trait PointerArithmetic: HasDataLayout {
 
     #[inline(always)]
     fn pointer_size(&self) -> Size {
-        self.data_layout().pointer_size
+        self.data_layout().pointer_size()
     }
 
     #[inline(always)]
@@ -56,7 +56,7 @@ impl<T: HasDataLayout> PointerArithmetic for T {}
 /// mostly opaque; the `Machine` trait extends it with some more operations that also have access to
 /// some global state.
 /// The `Debug` rendering is used to display bare provenance, and for the default impl of `fmt`.
-pub trait Provenance: Copy + fmt::Debug + 'static {
+pub trait Provenance: Copy + PartialEq + fmt::Debug + 'static {
     /// Says whether the `offset` field of `Pointer`s with this provenance is the actual physical address.
     /// - If `false`, the offset *must* be relative. This means the bytes representing a pointer are
     ///   different from what the Abstract Machine prescribes, so the interpreter must prevent any
@@ -66,6 +66,9 @@ pub trait Provenance: Copy + fmt::Debug + 'static {
     ///   pointer, and implement ptr-to-int transmutation by stripping provenance.
     const OFFSET_IS_ADDR: bool;
 
+    /// If wildcard provenance is implemented, contains the unique, general wildcard provenance variant.
+    const WILDCARD: Option<Self>;
+
     /// Determines how a pointer should be printed.
     fn fmt(ptr: &Pointer<Self>, f: &mut fmt::Formatter<'_>) -> fmt::Result;
 
@@ -74,9 +77,6 @@ pub trait Provenance: Copy + fmt::Debug + 'static {
     /// Otherwise this function is best-effort (but must agree with `Machine::ptr_get_alloc`).
     /// (Identifying the offset in that allocation, however, is harder -- use `Memory::ptr_get_alloc` for that.)
     fn get_alloc_id(self) -> Option<AllocId>;
-
-    /// Defines the 'join' of provenance: what happens when doing a pointer load and different bytes have different provenance.
-    fn join(left: Option<Self>, right: Option<Self>) -> Option<Self>;
 }
 
 /// The type of provenance in the compile-time interpreter.
@@ -164,9 +164,12 @@ impl CtfeProvenance {
 }
 
 impl Provenance for CtfeProvenance {
-    // With the `AllocId` as provenance, the `offset` is interpreted *relative to the allocation*,
+    // With the `CtfeProvenance` as provenance, the `offset` is interpreted *relative to the allocation*,
     // so ptr-to-int casts are not possible (since we do not know the global physical offset).
     const OFFSET_IS_ADDR: bool = false;
+
+    // `CtfeProvenance` does not implement wildcard provenance.
+    const WILDCARD: Option<Self> = None;
 
     fn fmt(ptr: &Pointer<Self>, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // Print AllocId.
@@ -185,10 +188,6 @@ impl Provenance for CtfeProvenance {
     fn get_alloc_id(self) -> Option<AllocId> {
         Some(self.alloc_id())
     }
-
-    fn join(_left: Option<Self>, _right: Option<Self>) -> Option<Self> {
-        panic!("merging provenance is not supported when `OFFSET_IS_ADDR` is false")
-    }
 }
 
 // We also need this impl so that one can debug-print `Pointer<AllocId>`
@@ -196,6 +195,9 @@ impl Provenance for AllocId {
     // With the `AllocId` as provenance, the `offset` is interpreted *relative to the allocation*,
     // so ptr-to-int casts are not possible (since we do not know the global physical offset).
     const OFFSET_IS_ADDR: bool = false;
+
+    // `AllocId` does not implement wildcard provenance.
+    const WILDCARD: Option<Self> = None;
 
     fn fmt(ptr: &Pointer<Self>, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // Forward `alternate` flag to `alloc_id` printing.
@@ -213,10 +215,6 @@ impl Provenance for AllocId {
 
     fn get_alloc_id(self) -> Option<AllocId> {
         Some(self)
-    }
-
-    fn join(_left: Option<Self>, _right: Option<Self>) -> Option<Self> {
-        panic!("merging provenance is not supported when `OFFSET_IS_ADDR` is false")
     }
 }
 
@@ -238,6 +236,12 @@ static_assert_size!(Pointer<Option<CtfeProvenance>>, 16);
 // We want the `Debug` output to be readable as it is used by `derive(Debug)` for
 // all the Miri types.
 impl<Prov: Provenance> fmt::Debug for Pointer<Prov> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        Provenance::fmt(self, f)
+    }
+}
+
+impl<Prov: Provenance> fmt::Display for Pointer<Prov> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         Provenance::fmt(self, f)
     }
@@ -279,7 +283,7 @@ impl From<CtfeProvenance> for Pointer {
 impl<Prov> From<Pointer<Prov>> for Pointer<Option<Prov>> {
     #[inline(always)]
     fn from(ptr: Pointer<Prov>) -> Self {
-        let (prov, offset) = ptr.into_parts();
+        let (prov, offset) = ptr.into_raw_parts();
         Pointer::new(Some(prov), offset)
     }
 }
@@ -305,19 +309,17 @@ impl<Prov> Pointer<Option<Prov>> {
         assert!(Prov::OFFSET_IS_ADDR);
         self.offset
     }
-}
 
-impl<Prov> Pointer<Option<Prov>> {
     /// Creates a pointer to the given address, with invalid provenance (i.e., cannot be used for
     /// any memory access).
     #[inline(always)]
-    pub fn from_addr_invalid(addr: u64) -> Self {
+    pub fn without_provenance(addr: u64) -> Self {
         Pointer { provenance: None, offset: Size::from_bytes(addr) }
     }
 
     #[inline(always)]
     pub fn null() -> Self {
-        Pointer::from_addr_invalid(0)
+        Pointer::without_provenance(0)
     }
 }
 
@@ -327,11 +329,11 @@ impl<Prov> Pointer<Prov> {
         Pointer { provenance, offset }
     }
 
-    /// Obtain the constituents of this pointer. Not that the meaning of the offset depends on the type `Prov`!
-    /// This function must only be used in the implementation of `Machine::ptr_get_alloc`,
-    /// and when a `Pointer` is taken apart to be stored efficiently in an `Allocation`.
+    /// Obtain the constituents of this pointer. Note that the meaning of the offset depends on the
+    /// type `Prov`! This is a low-level function that should only be used when absolutely
+    /// necessary. Prefer `prov_and_relative_offset` if possible.
     #[inline(always)]
-    pub fn into_parts(self) -> (Prov, Size) {
+    pub fn into_raw_parts(self) -> (Prov, Size) {
         (self.provenance, self.offset)
     }
 
@@ -350,5 +352,14 @@ impl<Prov> Pointer<Prov> {
     pub fn wrapping_signed_offset(self, i: i64, cx: &impl HasDataLayout) -> Self {
         // It's wrapping anyway, so we can just cast to `u64`.
         self.wrapping_offset(Size::from_bytes(i as u64), cx)
+    }
+}
+
+impl Pointer<CtfeProvenance> {
+    /// Return the provenance and relative offset stored in this pointer. Safer alternative to
+    /// `into_raw_parts` since the type ensures that the offset is indeed relative.
+    #[inline(always)]
+    pub fn prov_and_relative_offset(self) -> (CtfeProvenance, Size) {
+        (self.provenance, self.offset)
     }
 }

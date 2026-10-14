@@ -3,15 +3,16 @@
 #![allow(clippy::zero_ptr)]
 #![allow(clippy::transmute_ptr_to_ref)]
 #![allow(clippy::eq_op, clippy::missing_transmute_annotations)]
+#![allow(clippy::manual_dangling_ptr)]
 
 // Easy to lint because these only span one line.
 fn one_liners() {
     unsafe {
         let _: &u64 = std::mem::transmute(0 as *const u64);
-        //~^ ERROR: transmuting a known null pointer into a reference
-        //~| NOTE: `-D clippy::transmuting-null` implied by `-D warnings`
+        //~^ transmuting_null
+
         let _: &u64 = std::mem::transmute(std::ptr::null::<u64>());
-        //~^ ERROR: transmuting a known null pointer into a reference
+        //~^ transmuting_null
     }
 }
 
@@ -22,13 +23,38 @@ fn transmute_const() {
     unsafe {
         // Should raise a lint.
         let _: &u64 = std::mem::transmute(ZPTR);
-        //~^ ERROR: transmuting a known null pointer into a reference
+        //~^ transmuting_null
+
         // Should NOT raise a lint.
         let _: &u64 = std::mem::transmute(NOT_ZPTR);
     }
 }
 
-fn main() {
-    one_liners();
-    transmute_const();
+fn transmute_const_int() {
+    unsafe {
+        let _: &u64 = std::mem::transmute(u64::MIN as *const u64);
+        //~^ transmuting_null
+    }
 }
+
+fn transumute_single_expr_blocks() {
+    unsafe {
+        let _: &u64 = std::mem::transmute({ 0 as *const u64 });
+        //~^ transmuting_null
+
+        let _: &u64 = std::mem::transmute(const { u64::MIN as *const u64 });
+        //~^ transmuting_null
+    }
+}
+
+fn transmute_pointer_creators() {
+    unsafe {
+        let _: &u64 = std::mem::transmute(std::ptr::without_provenance::<u64>(0));
+        //~^ transmuting_null
+
+        let _: &u64 = std::mem::transmute(std::ptr::without_provenance_mut::<u64>(0));
+        //~^ transmuting_null
+    }
+}
+
+fn main() {}

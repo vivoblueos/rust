@@ -20,6 +20,7 @@ mod navigation_target;
 
 mod annotations;
 mod call_hierarchy;
+mod child_modules;
 mod doc_links;
 mod expand_macro;
 mod extend_selection;
@@ -48,7 +49,6 @@ mod ssr;
 mod static_index;
 mod status;
 mod syntax_highlighting;
-mod syntax_tree;
 mod test_explorer;
 mod typing;
 mod view_crate_graph;
@@ -56,24 +56,27 @@ mod view_hir;
 mod view_item_tree;
 mod view_memory_layout;
 mod view_mir;
+mod view_syntax_tree;
 
-use std::{iter, panic::UnwindSafe};
+use std::panic::{AssertUnwindSafe, UnwindSafe};
 
 use cfg::CfgOptions;
 use fetch_crates::CrateInfo;
-use hir::{sym, ChangeWithProcMacros};
+use hir::{ChangeWithProcMacros, EditionedFileId, crate_def_map, sym};
+use ide_db::base_db::relevant_crates;
+use ide_db::ra_fixture::RaFixtureAnalysis;
 use ide_db::{
+    FxHashMap, FxIndexSet, LineIndexDatabase,
     base_db::{
-        ra_salsa::{self, ParallelDatabase},
-        CrateOrigin, CrateWorkspaceData, Env, FileLoader, FileSet, SourceDatabase,
-        SourceRootDatabase, VfsPath,
+        CrateOrigin, CrateWorkspaceData, Env, FileSet, SourceDatabase, VfsPath,
+        salsa::{Cancelled, Database},
     },
-    prime_caches, symbol_index, FxHashMap, FxIndexSet, LineIndexDatabase,
+    prime_caches, symbol_index,
 };
-use span::EditionedFileId;
-use syntax::SourceFile;
+use macros::UpmapFromRaFixture;
+use syntax::{AstNode, SourceFile, ast};
 use triomphe::Arc;
-use view_memory_layout::{view_memory_layout, RecursiveMemoryLayout};
+use view_memory_layout::{RecursiveMemoryLayout, view_memory_layout};
 
 use crate::navigation_target::ToNav;
 
@@ -81,36 +84,39 @@ pub use crate::{
     annotations::{Annotation, AnnotationConfig, AnnotationKind, AnnotationLocation},
     call_hierarchy::{CallHierarchyConfig, CallItem},
     expand_macro::ExpandedMacro,
-    file_structure::{StructureNode, StructureNodeKind},
+    file_structure::{FileStructureConfig, StructureNode, StructureNodeKind},
     folding_ranges::{Fold, FoldKind},
+    goto_definition::GotoDefinitionConfig,
+    goto_implementation::GotoImplementationConfig,
     highlight_related::{HighlightRelatedConfig, HighlightedRange},
     hover::{
         HoverAction, HoverConfig, HoverDocFormat, HoverGotoTypeData, HoverResult,
-        MemoryLayoutHoverConfig, MemoryLayoutHoverRenderKind,
+        MemoryLayoutHoverConfig, MemoryLayoutHoverRenderKind, SubstTyLen,
     },
     inlay_hints::{
         AdjustmentHints, AdjustmentHintsMode, ClosureReturnTypeHints, DiscriminantHints,
         GenericParameterHints, InlayFieldsToResolve, InlayHint, InlayHintLabel, InlayHintLabelPart,
-        InlayHintPosition, InlayHintsConfig, InlayKind, InlayTooltip, LifetimeElisionHints,
+        InlayHintPosition, InlayHintsConfig, InlayKind, InlayTooltip, LazyProperty,
+        LifetimeElisionHints, TypeHintsPlacement,
     },
     join_lines::JoinLinesConfig,
     markup::Markup,
     moniker::{
-        MonikerDescriptorKind, MonikerKind, MonikerResult, PackageInformation,
-        SymbolInformationKind,
+        Moniker, MonikerDescriptorKind, MonikerIdentifier, MonikerKind, MonikerResult,
+        PackageInformation, SymbolInformationKind,
     },
     move_item::Direction,
     navigation_target::{NavigationTarget, TryToNav, UpmappingResult},
-    references::ReferenceSearchResult,
-    rename::RenameError,
-    runnables::{Runnable, RunnableKind, TestId},
+    references::{FindAllRefsConfig, ReferenceSearchResult},
+    rename::{RenameConfig, RenameError},
+    runnables::{Runnable, RunnableKind, TestId, UpdateTest},
     signature_help::SignatureHelp,
     static_index::{
         StaticIndex, StaticIndexedFile, TokenId, TokenStaticData, VendoredLibrariesConfig,
     },
     syntax_highlighting::{
-        tags::{Highlight, HlMod, HlMods, HlOperator, HlPunct, HlTag},
         HighlightConfig, HlRange,
+        tags::{Highlight, HlMod, HlMods, HlOperator, HlPunct, HlTag},
     },
     test_explorer::{TestItem, TestItemKind},
 };
@@ -120,23 +126,23 @@ pub use ide_assists::{
 };
 pub use ide_completion::{
     CallableSnippets, CompletionConfig, CompletionFieldsToResolve, CompletionItem,
-    CompletionItemKind, CompletionRelevance, Snippet, SnippetScope,
+    CompletionItemKind, CompletionItemRefMode, CompletionRelevance, Snippet, SnippetScope,
 };
-pub use ide_db::text_edit::{Indel, TextEdit};
 pub use ide_db::{
-    base_db::{Cancelled, CrateGraph, CrateId, FileChange, SourceRoot, SourceRootId},
+    FileId, FilePosition, FileRange, RootDatabase, Severity, SymbolKind,
+    assists::ExprFillDefaultMode,
+    base_db::{Crate, CrateGraphBuilder, FileChange, SourceRoot, SourceRootId},
     documentation::Documentation,
     label::Label,
     line_index::{LineCol, LineIndex},
     prime_caches::ParallelPrimeCachesProgress,
+    ra_fixture::RaFixtureConfig,
     search::{ReferenceCategory, SearchScope},
     source_change::{FileSystemEdit, SnippetEdit, SourceChange},
     symbol_index::Query,
-    FileId, FilePosition, FileRange, RootDatabase, SymbolKind,
+    text_edit::{Indel, TextEdit},
 };
-pub use ide_diagnostics::{
-    Diagnostic, DiagnosticCode, DiagnosticsConfig, ExprFillDefaultMode, Severity,
-};
+pub use ide_diagnostics::{Diagnostic, DiagnosticCode, DiagnosticsConfig};
 pub use ide_ssr::SsrError;
 pub use span::Edition;
 pub use syntax::{TextRange, TextSize};
@@ -144,7 +150,7 @@ pub use syntax::{TextRange, TextSize};
 pub type Cancellable<T> = Result<T, Cancelled>;
 
 /// Info associated with a text range.
-#[derive(Debug)]
+#[derive(Debug, UpmapFromRaFixture)]
 pub struct RangeInfo<T> {
     pub range: TextRange,
     pub info: T,
@@ -182,7 +188,7 @@ impl AnalysisHost {
     /// Returns a snapshot of the current state, which you can query for
     /// semantic information.
     pub fn analysis(&self) -> Analysis {
-        Analysis { db: self.db.snapshot() }
+        Analysis { db: self.db.clone() }
     }
 
     /// Applies changes to the current state of the world. If there are
@@ -195,8 +201,13 @@ impl AnalysisHost {
     pub fn per_query_memory_usage(&mut self) -> Vec<(String, profile::Bytes, usize)> {
         self.db.per_query_memory_usage()
     }
-    pub fn request_cancellation(&mut self) {
-        self.db.request_cancellation();
+    pub fn trigger_cancellation(&mut self) {
+        self.db.trigger_cancellation();
+    }
+    pub fn trigger_garbage_collection(&mut self) {
+        self.db.trigger_lru_eviction();
+        // SAFETY: `trigger_lru_eviction` triggers cancellation, so all running queries were canceled.
+        unsafe { hir::collect_ty_garbage() };
     }
     pub fn raw_database(&self) -> &RootDatabase {
         &self.db
@@ -218,7 +229,7 @@ impl Default for AnalysisHost {
 /// `Analysis` are canceled (most method return `Err(Canceled)`).
 #[derive(Debug)]
 pub struct Analysis {
-    db: ra_salsa::Snapshot<RootDatabase>,
+    db: RootDatabase,
 }
 
 // As a general design guideline, `Analysis` API are intended to be independent
@@ -238,37 +249,64 @@ impl Analysis {
         file_set.insert(file_id, VfsPath::new_virtual_path("/main.rs".to_owned()));
         let source_root = SourceRoot::new_local(file_set);
 
-        let mut change = ChangeWithProcMacros::new();
+        let mut change = ChangeWithProcMacros::default();
         change.set_roots(vec![source_root]);
-        let mut crate_graph = CrateGraph::default();
+        let mut crate_graph = CrateGraphBuilder::default();
         // FIXME: cfg options
         // Default to enable test for single file.
         let mut cfg_options = CfgOptions::default();
-        cfg_options.insert_atom(sym::test.clone());
+
+        // FIXME: This is less than ideal
+        let proc_macro_cwd = Arc::new(
+            TryFrom::try_from(&*std::env::current_dir().unwrap().as_path().to_string_lossy())
+                .unwrap(),
+        );
+        let crate_attrs = Vec::new();
+        cfg_options.insert_atom(sym::test);
         crate_graph.add_crate_root(
             file_id,
             Edition::CURRENT,
             None,
             None,
-            Arc::new(cfg_options),
+            cfg_options,
             None,
             Env::default(),
-            false,
             CrateOrigin::Local { repo: None, name: None },
+            crate_attrs,
+            false,
+            proc_macro_cwd,
+            Arc::new(CrateWorkspaceData {
+                target: Err("fixture has no layout".into()),
+                toolchain: None,
+            }),
         );
         change.change_file(file_id, Some(text));
-        let ws_data = crate_graph
-            .iter()
-            .zip(iter::repeat(Arc::new(CrateWorkspaceData {
-                proc_macro_cwd: None,
-                data_layout: Err("fixture has no layout".into()),
-                toolchain: None,
-            })))
-            .collect();
-        change.set_crate_graph(crate_graph, ws_data);
+        change.set_crate_graph(crate_graph);
 
         host.apply_change(change);
         (host.analysis(), file_id)
+    }
+
+    pub(crate) fn from_ra_fixture(
+        sema: &Semantics<'_, RootDatabase>,
+        literal: ast::String,
+        expanded: &ast::String,
+        config: &RaFixtureConfig<'_>,
+    ) -> Option<(Analysis, RaFixtureAnalysis)> {
+        Self::from_ra_fixture_with_on_cursor(sema, literal, expanded, config, &mut |_| {})
+    }
+
+    /// Like [`Analysis::from_ra_fixture()`], but also calls `on_cursor` with the cursor position.
+    pub(crate) fn from_ra_fixture_with_on_cursor(
+        sema: &Semantics<'_, RootDatabase>,
+        literal: ast::String,
+        expanded: &ast::String,
+        config: &RaFixtureConfig<'_>,
+        on_cursor: &mut dyn FnMut(TextRange),
+    ) -> Option<(Analysis, RaFixtureAnalysis)> {
+        let analysis =
+            RaFixtureAnalysis::analyze_ra_fixture(sema, literal, expanded, config, on_cursor)?;
+        Some((Analysis { db: analysis.db.clone() }, analysis))
     }
 
     /// Debug info about the current state of the analysis.
@@ -277,12 +315,12 @@ impl Analysis {
     }
 
     pub fn source_root_id(&self, file_id: FileId) -> Cancellable<SourceRootId> {
-        self.with_db(|db| db.file_source_root(file_id))
+        self.with_db(|db| db.file_source_root(file_id).source_root_id(db))
     }
 
     pub fn is_local_source_root(&self, source_root_id: SourceRootId) -> Cancellable<bool> {
         self.with_db(|db| {
-            let sr = db.source_root(source_root_id);
+            let sr = db.source_root(source_root_id).source_root(db);
             !sr.is_library
         })
     }
@@ -296,18 +334,25 @@ impl Analysis {
 
     /// Gets the text of the source file.
     pub fn file_text(&self, file_id: FileId) -> Cancellable<Arc<str>> {
-        self.with_db(|db| SourceDatabase::file_text(db, file_id))
+        self.with_db(|db| SourceDatabase::file_text(db, file_id).text(db).clone())
     }
 
     /// Gets the syntax tree of the file.
     pub fn parse(&self, file_id: FileId) -> Cancellable<SourceFile> {
-        // FIXME editiojn
-        self.with_db(|db| db.parse(EditionedFileId::current_edition(file_id)).tree())
+        // FIXME edition
+        self.with_db(|db| {
+            let editioned_file_id_wrapper = EditionedFileId::current_edition(&self.db, file_id);
+
+            editioned_file_id_wrapper.parse(db).tree()
+        })
     }
 
     /// Returns true if this file belongs to an immutable library.
     pub fn is_library_file(&self, file_id: FileId) -> Cancellable<bool> {
-        self.with_db(|db| db.source_root(db.file_source_root(file_id)).is_library)
+        self.with_db(|db| {
+            let source_root = db.file_source_root(file_id).source_root_id(db);
+            db.source_root(source_root).source_root(db).is_library
+        })
     }
 
     /// Gets the file's `LineIndex`: data structure to convert between absolute
@@ -325,20 +370,15 @@ impl Analysis {
     /// supported).
     pub fn matching_brace(&self, position: FilePosition) -> Cancellable<Option<TextSize>> {
         self.with_db(|db| {
-            let parse = db.parse(EditionedFileId::current_edition(position.file_id));
+            let file_id = EditionedFileId::current_edition(&self.db, position.file_id);
+            let parse = file_id.parse(db);
             let file = parse.tree();
             matching_brace::matching_brace(&file, position.offset)
         })
     }
 
-    /// Returns a syntax tree represented as `String`, for debug purposes.
-    // FIXME: use a better name here.
-    pub fn syntax_tree(
-        &self,
-        file_id: FileId,
-        text_range: Option<TextRange>,
-    ) -> Cancellable<String> {
-        self.with_db(|db| syntax_tree::syntax_tree(db, file_id, text_range))
+    pub fn view_syntax_tree(&self, file_id: FileId) -> Cancellable<String> {
+        self.with_db(|db| view_syntax_tree::view_syntax_tree(db, file_id))
     }
 
     pub fn view_hir(&self, position: FilePosition) -> Cancellable<String> {
@@ -365,7 +405,7 @@ impl Analysis {
         self.with_db(|db| test_explorer::discover_tests_in_crate_by_test_id(db, crate_id))
     }
 
-    pub fn discover_tests_in_crate(&self, crate_id: CrateId) -> Cancellable<Vec<TestItem>> {
+    pub fn discover_tests_in_crate(&self, crate_id: Crate) -> Cancellable<Vec<TestItem>> {
         self.with_db(|db| test_explorer::discover_tests_in_crate(db, crate_id))
     }
 
@@ -374,7 +414,7 @@ impl Analysis {
     }
 
     /// Renders the crate graph to GraphViz "dot" syntax.
-    pub fn view_crate_graph(&self, full: bool) -> Cancellable<Result<String, String>> {
+    pub fn view_crate_graph(&self, full: bool) -> Cancellable<String> {
         self.with_db(|db| view_crate_graph::view_crate_graph(db, full))
     }
 
@@ -390,7 +430,9 @@ impl Analysis {
     /// stuff like trailing commas.
     pub fn join_lines(&self, config: &JoinLinesConfig, frange: FileRange) -> Cancellable<TextEdit> {
         self.with_db(|db| {
-            let parse = db.parse(EditionedFileId::current_edition(frange.file_id));
+            let editioned_file_id_wrapper =
+                EditionedFileId::current_edition(&self.db, frange.file_id);
+            let parse = editioned_file_id_wrapper.parse(db);
             join_lines::join_lines(config, &parse.tree(), frange.range)
         })
     }
@@ -402,6 +444,8 @@ impl Analysis {
         self.with_db(|db| typing::on_enter(db, position))
     }
 
+    pub const SUPPORTED_TRIGGER_CHARS: &[char] = typing::TRIGGER_CHARS;
+
     /// Returns an edit which should be applied after a character was typed.
     ///
     /// This is useful for some on-the-fly fixups, like adding `;` to `let =`
@@ -410,13 +454,9 @@ impl Analysis {
         &self,
         position: FilePosition,
         char_typed: char,
-        autoclose: bool,
     ) -> Cancellable<Option<SourceChange>> {
         // Fast path to not even parse the file.
-        if !typing::TRIGGER_CHARS.contains(char_typed) {
-            return Ok(None);
-        }
-        if char_typed == '<' && !autoclose {
+        if !typing::TRIGGER_CHARS.contains(&char_typed) {
             return Ok(None);
         }
 
@@ -425,19 +465,23 @@ impl Analysis {
 
     /// Returns a tree representation of symbols in the file. Useful to draw a
     /// file outline.
-    pub fn file_structure(&self, file_id: FileId) -> Cancellable<Vec<StructureNode>> {
+    pub fn file_structure(
+        &self,
+        config: &FileStructureConfig,
+        file_id: FileId,
+    ) -> Cancellable<Vec<StructureNode>> {
         // FIXME: Edition
         self.with_db(|db| {
-            file_structure::file_structure(
-                &db.parse(EditionedFileId::current_edition(file_id)).tree(),
-            )
+            let editioned_file_id_wrapper = EditionedFileId::current_edition(&self.db, file_id);
+            let source_file = editioned_file_id_wrapper.parse(db).tree();
+            file_structure::file_structure(&source_file, config)
         })
     }
 
     /// Returns a list of the places in the file where type hints can be displayed.
     pub fn inlay_hints(
         &self,
-        config: &InlayHintsConfig,
+        config: &InlayHintsConfig<'_>,
         file_id: FileId,
         range: Option<TextRange>,
     ) -> Cancellable<Vec<InlayHint>> {
@@ -445,7 +489,7 @@ impl Analysis {
     }
     pub fn inlay_hints_resolve(
         &self,
-        config: &InlayHintsConfig,
+        config: &InlayHintsConfig<'_>,
         file_id: FileId,
         resolve_range: TextRange,
         hash: u64,
@@ -457,23 +501,31 @@ impl Analysis {
     }
 
     /// Returns the set of folding ranges.
-    pub fn folding_ranges(&self, file_id: FileId) -> Cancellable<Vec<Fold>> {
+    pub fn folding_ranges(&self, file_id: FileId, collapsed_text: bool) -> Cancellable<Vec<Fold>> {
         self.with_db(|db| {
+            let editioned_file_id_wrapper = EditionedFileId::current_edition(&self.db, file_id);
+
             folding_ranges::folding_ranges(
-                &db.parse(EditionedFileId::current_edition(file_id)).tree(),
+                &editioned_file_id_wrapper.parse(db).tree(),
+                collapsed_text,
             )
         })
     }
 
     /// Fuzzy searches for a symbol.
     pub fn symbol_search(&self, query: Query, limit: usize) -> Cancellable<Vec<NavigationTarget>> {
-        self.with_db(|db| {
-            symbol_index::world_symbols(db, query)
-                .into_iter() // xx: should we make this a par iter?
-                .filter_map(|s| s.try_to_nav(db))
-                .take(limit)
-                .map(UpmappingResult::call_site)
-                .collect::<Vec<_>>()
+        // `world_symbols` currently clones the database to run stuff in parallel, which will make any query panic
+        // if we were to attach it here.
+        Cancelled::catch(|| {
+            let symbols = symbol_index::world_symbols(&self.db, query);
+            hir::attach_db(&self.db, || {
+                symbols
+                    .into_iter()
+                    .filter_map(|s| s.try_to_nav(&Semantics::new(&self.db)))
+                    .take(limit)
+                    .map(UpmappingResult::call_site)
+                    .collect::<Vec<_>>()
+            })
         })
     }
 
@@ -481,24 +533,27 @@ impl Analysis {
     pub fn goto_definition(
         &self,
         position: FilePosition,
+        config: &GotoDefinitionConfig<'_>,
     ) -> Cancellable<Option<RangeInfo<Vec<NavigationTarget>>>> {
-        self.with_db(|db| goto_definition::goto_definition(db, position))
+        self.with_db(|db| goto_definition::goto_definition(db, position, config))
     }
 
     /// Returns the declaration from the symbol at `position`.
     pub fn goto_declaration(
         &self,
         position: FilePosition,
+        config: &GotoDefinitionConfig<'_>,
     ) -> Cancellable<Option<RangeInfo<Vec<NavigationTarget>>>> {
-        self.with_db(|db| goto_declaration::goto_declaration(db, position))
+        self.with_db(|db| goto_declaration::goto_declaration(db, position, config))
     }
 
     /// Returns the impls from the symbol at `position`.
     pub fn goto_implementation(
         &self,
+        config: &GotoImplementationConfig,
         position: FilePosition,
     ) -> Cancellable<Option<RangeInfo<Vec<NavigationTarget>>>> {
-        self.with_db(|db| goto_implementation::goto_implementation(db, position))
+        self.with_db(|db| goto_implementation::goto_implementation(db, config, position))
     }
 
     /// Returns the type definitions for the symbol at `position`.
@@ -509,19 +564,19 @@ impl Analysis {
         self.with_db(|db| goto_type_definition::goto_type_definition(db, position))
     }
 
-    /// Finds all usages of the reference at point.
     pub fn find_all_refs(
         &self,
         position: FilePosition,
-        search_scope: Option<SearchScope>,
+        config: &FindAllRefsConfig<'_>,
     ) -> Cancellable<Option<Vec<ReferenceSearchResult>>> {
-        self.with_db(|db| references::find_all_refs(&Semantics::new(db), position, search_scope))
+        let config = AssertUnwindSafe(config);
+        self.with_db(|db| references::find_all_refs(&Semantics::new(db), position, &config))
     }
 
     /// Returns a short text describing element at position.
     pub fn hover(
         &self,
-        config: &HoverConfig,
+        config: &HoverConfig<'_>,
         range: FileRange,
     ) -> Cancellable<Option<RangeInfo<HoverResult>>> {
         self.with_db(|db| hover::hover(db, range, config))
@@ -538,7 +593,7 @@ impl Analysis {
     /// Returns URL(s) for the documentation of the symbol under the cursor.
     /// # Arguments
     /// * `position` - Position in the file.
-    /// * `target_dir` - Directory where the build output is storeda.
+    /// * `target_dir` - Directory where the build output is stored.
     pub fn external_docs(
         &self,
         position: FilePosition,
@@ -559,14 +614,15 @@ impl Analysis {
     pub fn call_hierarchy(
         &self,
         position: FilePosition,
+        config: &CallHierarchyConfig<'_>,
     ) -> Cancellable<Option<RangeInfo<Vec<NavigationTarget>>>> {
-        self.with_db(|db| call_hierarchy::call_hierarchy(db, position))
+        self.with_db(|db| call_hierarchy::call_hierarchy(db, position, config))
     }
 
     /// Computes incoming calls for the given file position.
     pub fn incoming_calls(
         &self,
-        config: CallHierarchyConfig,
+        config: &CallHierarchyConfig<'_>,
         position: FilePosition,
     ) -> Cancellable<Option<Vec<CallItem>>> {
         self.with_db(|db| call_hierarchy::incoming_calls(db, config, position))
@@ -575,7 +631,7 @@ impl Analysis {
     /// Computes outgoing calls for the given file position.
     pub fn outgoing_calls(
         &self,
-        config: CallHierarchyConfig,
+        config: &CallHierarchyConfig<'_>,
         position: FilePosition,
     ) -> Cancellable<Option<Vec<CallItem>>> {
         self.with_db(|db| call_hierarchy::outgoing_calls(db, config, position))
@@ -586,34 +642,44 @@ impl Analysis {
         self.with_db(|db| parent_module::parent_module(db, position))
     }
 
-    /// Returns crates this file belongs too.
-    pub fn crates_for(&self, file_id: FileId) -> Cancellable<Vec<CrateId>> {
+    /// Returns vec of `mod name;` declaration which are created by the current module.
+    pub fn child_modules(&self, position: FilePosition) -> Cancellable<Vec<NavigationTarget>> {
+        self.with_db(|db| child_modules::child_modules(db, position))
+    }
+
+    /// Returns crates that this file belongs to.
+    pub fn crates_for(&self, file_id: FileId) -> Cancellable<Vec<Crate>> {
         self.with_db(|db| parent_module::crates_for(db, file_id))
     }
 
-    /// Returns crates this file belongs too.
-    pub fn transitive_rev_deps(&self, crate_id: CrateId) -> Cancellable<Vec<CrateId>> {
-        self.with_db(|db| db.crate_graph().transitive_rev_deps(crate_id).collect())
+    /// Returns crates that this file belongs to.
+    pub fn transitive_rev_deps(&self, crate_id: Crate) -> Cancellable<Vec<Crate>> {
+        self.with_db(|db| Vec::from_iter(crate_id.transitive_rev_deps(db)))
     }
 
-    /// Returns crates this file *might* belong too.
-    pub fn relevant_crates_for(&self, file_id: FileId) -> Cancellable<Vec<CrateId>> {
-        self.with_db(|db| db.relevant_crates(file_id).iter().copied().collect())
+    /// Returns crates that this file *might* belong to.
+    pub fn relevant_crates_for(&self, file_id: FileId) -> Cancellable<Vec<Crate>> {
+        self.with_db(|db| relevant_crates(db, file_id).to_vec())
     }
 
     /// Returns the edition of the given crate.
-    pub fn crate_edition(&self, crate_id: CrateId) -> Cancellable<Edition> {
-        self.with_db(|db| db.crate_graph()[crate_id].edition)
+    pub fn crate_edition(&self, crate_id: Crate) -> Cancellable<Edition> {
+        self.with_db(|db| crate_id.data(db).edition)
+    }
+
+    /// Returns whether the given crate is a proc macro.
+    pub fn is_proc_macro_crate(&self, crate_id: Crate) -> Cancellable<bool> {
+        self.with_db(|db| crate_id.data(db).is_proc_macro)
     }
 
     /// Returns true if this crate has `no_std` or `no_core` specified.
-    pub fn is_crate_no_std(&self, crate_id: CrateId) -> Cancellable<bool> {
-        self.with_db(|db| hir::db::DefDatabase::crate_def_map(db, crate_id).is_no_std())
+    pub fn is_crate_no_std(&self, crate_id: Crate) -> Cancellable<bool> {
+        self.with_db(|db| crate_def_map(db, crate_id).is_no_std())
     }
 
     /// Returns the root file of the given crate.
-    pub fn crate_root(&self, crate_id: CrateId) -> Cancellable<FileId> {
-        self.with_db(|db| db.crate_graph()[crate_id].root_file_id)
+    pub fn crate_root(&self, crate_id: Crate) -> Cancellable<FileId> {
+        self.with_db(|db| crate_id.data(db).root_file_id)
     }
 
     /// Returns the set of possible targets to run for the current file.
@@ -627,16 +693,11 @@ impl Analysis {
         position: FilePosition,
         search_scope: Option<SearchScope>,
     ) -> Cancellable<Vec<Runnable>> {
-        self.with_db(|db| runnables::related_tests(db, position, search_scope))
-    }
-
-    /// Computes syntax highlighting for the given file
-    pub fn highlight(
-        &self,
-        highlight_config: HighlightConfig,
-        file_id: FileId,
-    ) -> Cancellable<Vec<HlRange>> {
-        self.with_db(|db| syntax_highlighting::highlight(db, highlight_config, file_id, None))
+        let search_scope = AssertUnwindSafe(search_scope);
+        self.with_db(|db| {
+            let _ = &search_scope;
+            runnables::related_tests(db, position, search_scope.0)
+        })
     }
 
     /// Computes all ranges to highlight for a given item in a file.
@@ -650,14 +711,40 @@ impl Analysis {
         })
     }
 
+    /// Computes syntax highlighting for the given file
+    pub fn highlight(
+        &self,
+        highlight_config: HighlightConfig<'_>,
+        file_id: FileId,
+    ) -> Cancellable<Vec<HlRange>> {
+        self.with_db(|db| syntax_highlighting::highlight(db, &highlight_config, file_id, None))
+    }
+
     /// Computes syntax highlighting for the given file range.
     pub fn highlight_range(
         &self,
-        highlight_config: HighlightConfig,
+        highlight_config: HighlightConfig<'_>,
         frange: FileRange,
     ) -> Cancellable<Vec<HlRange>> {
         self.with_db(|db| {
-            syntax_highlighting::highlight(db, highlight_config, frange.file_id, Some(frange.range))
+            syntax_highlighting::highlight(
+                db,
+                &highlight_config,
+                frange.file_id,
+                Some(frange.range),
+            )
+        })
+    }
+
+    /// Computes syntax highlighting for the given file.
+    pub fn highlight_as_html_with_config(
+        &self,
+        config: HighlightConfig<'_>,
+        file_id: FileId,
+        rainbow: bool,
+    ) -> Cancellable<String> {
+        self.with_db(|db| {
+            syntax_highlighting::highlight_as_html_with_config(db, &config, file_id, rainbow)
         })
     }
 
@@ -669,21 +756,19 @@ impl Analysis {
     /// Computes completions at the given position.
     pub fn completions(
         &self,
-        config: &CompletionConfig,
+        config: &CompletionConfig<'_>,
         position: FilePosition,
         trigger_character: Option<char>,
     ) -> Cancellable<Option<Vec<CompletionItem>>> {
-        self.with_db(|db| {
-            ide_completion::completions(db, config, position, trigger_character).map(Into::into)
-        })
+        self.with_db(|db| ide_completion::completions(db, config, position, trigger_character))
     }
 
     /// Resolves additional completion data at the position given.
     pub fn resolve_completion_edits(
         &self,
-        config: &CompletionConfig,
+        config: &CompletionConfig<'_>,
         position: FilePosition,
-        imports: impl IntoIterator<Item = (String, String)> + std::panic::UnwindSafe,
+        imports: impl IntoIterator<Item = String> + std::panic::UnwindSafe,
     ) -> Cancellable<Vec<TextEdit>> {
         Ok(self
             .with_db(|db| ide_completion::resolve_completion_edits(db, config, position, imports))?
@@ -728,7 +813,7 @@ impl Analysis {
         frange: FileRange,
     ) -> Cancellable<Vec<Assist>> {
         let include_fixes = match &assist_config.allowed {
-            Some(it) => it.iter().any(|&it| it == AssistKind::None || it == AssistKind::QuickFix),
+            Some(it) => it.contains(&AssistKind::QuickFix),
             None => true,
         };
 
@@ -759,8 +844,9 @@ impl Analysis {
         &self,
         position: FilePosition,
         new_name: &str,
+        config: &RenameConfig,
     ) -> Cancellable<Result<SourceChange, RenameError>> {
-        self.with_db(|db| rename::rename(db, position, new_name))
+        self.with_db(|db| rename::rename(db, position, new_name, config))
     }
 
     pub fn prepare_rename(
@@ -774,8 +860,9 @@ impl Analysis {
         &self,
         file_id: FileId,
         new_name_stem: &str,
+        config: &RenameConfig,
     ) -> Cancellable<Option<SourceChange>> {
-        self.with_db(|db| rename::will_rename_file(db, file_id, new_name_stem))
+        self.with_db(|db| rename::will_rename_file(db, file_id, new_name_stem, config))
     }
 
     pub fn structural_search_replace(
@@ -797,14 +884,18 @@ impl Analysis {
 
     pub fn annotations(
         &self,
-        config: &AnnotationConfig,
+        config: &AnnotationConfig<'_>,
         file_id: FileId,
     ) -> Cancellable<Vec<Annotation>> {
         self.with_db(|db| annotations::annotations(db, config, file_id))
     }
 
-    pub fn resolve_annotation(&self, annotation: Annotation) -> Cancellable<Annotation> {
-        self.with_db(|db| annotations::resolve_annotation(db, annotation))
+    pub fn resolve_annotation(
+        &self,
+        config: &AnnotationConfig<'_>,
+        annotation: Annotation,
+    ) -> Cancellable<Annotation> {
+        self.with_db(|db| annotations::resolve_annotation(db, config, annotation))
     }
 
     pub fn move_item(
@@ -820,6 +911,22 @@ impl Analysis {
         position: FilePosition,
     ) -> Cancellable<Option<RecursiveMemoryLayout>> {
         self.with_db(|db| view_memory_layout(db, position))
+    }
+
+    pub fn get_failed_obligations(&self, offset: TextSize, file_id: FileId) -> Cancellable<String> {
+        self.with_db(|db| {
+            let sema = Semantics::new(db);
+            let source_file = sema.parse_guess_edition(file_id);
+
+            let Some(token) = source_file.syntax().token_at_offset(offset).next() else {
+                return String::new();
+            };
+            sema.get_failed_obligations(token).unwrap_or_default()
+        })
+    }
+
+    pub fn editioned_file_id_to_vfs(&self, file_id: hir::EditionedFileId) -> FileId {
+        file_id.file_id(&self.db)
     }
 
     /// Performs an operation on the database that may be canceled.
@@ -839,7 +946,8 @@ impl Analysis {
     where
         F: FnOnce(&RootDatabase) -> T + std::panic::UnwindSafe,
     {
-        Cancelled::catch(|| f(&self.db))
+        // We use `attach_db_allow_change()` and not `attach_db()` because fixture injection can change the database.
+        hir::attach_db_allow_change(&self.db, || Cancelled::catch(|| f(&self.db)))
     }
 }
 

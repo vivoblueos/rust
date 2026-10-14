@@ -1,28 +1,29 @@
 use hir::{
-    Adt, AsAssocItem, HasSource, HirDisplay, HirFileIdExt, Module, PathResolution, Semantics,
-    StructKind, Type, TypeInfo,
+    Adt, AsAssocItem, HasSource, HirDisplay, Module, PathResolution, Semantics, StructKind, Type,
+    TypeInfo,
 };
 use ide_db::{
+    FileId, FxHashMap, FxHashSet, RootDatabase, SnippetCap,
     defs::{Definition, NameRefClass},
     famous_defs::FamousDefs,
     helpers::is_editable_crate,
     path_transform::PathTransform,
     source_change::SourceChangeBuilder,
-    FileId, FxHashMap, FxHashSet, RootDatabase, SnippetCap,
 };
 use itertools::Itertools;
 use stdx::to_lower_snake_case;
 use syntax::{
+    Edition, SyntaxKind, SyntaxNode, T, TextRange,
     ast::{
-        self, edit::IndentLevel, edit_in_place::Indent, make, AstNode, BlockExpr, CallExpr,
-        HasArgList, HasGenericParams, HasModuleItem, HasTypeBounds,
+        self, AstNode, BlockExpr, CallExpr, HasArgList, HasGenericParams, HasModuleItem,
+        HasTypeBounds, edit::IndentLevel, edit_in_place::Indent, make,
     },
-    ted, Edition, SyntaxKind, SyntaxNode, TextRange, T,
+    ted,
 };
 
 use crate::{
-    utils::{convert_reference_type, find_struct_impl},
-    AssistContext, AssistId, AssistKind, Assists,
+    AssistContext, AssistId, Assists,
+    utils::{convert_reference_type, expr_fill_default, find_struct_impl},
 };
 
 // Assist: generate_function
@@ -45,7 +46,7 @@ use crate::{
 //     bar("", baz());
 // }
 //
-// fn bar(arg: &str, baz: Baz) ${0:-> _} {
+// fn bar(arg: &'static str, baz: Baz) ${0:-> _} {
 //     todo!()
 // }
 //
@@ -68,10 +69,10 @@ fn gen_fn(acc: &mut Assists, ctx: &AssistContext<'_>) -> Option<()> {
     let TargetInfo { target_module, adt_info, target, file } =
         fn_target_info(ctx, path, &call, fn_name)?;
 
-    if let Some(m) = target_module {
-        if !is_editable_crate(m.krate(), ctx.db()) {
-            return None;
-        }
+    if let Some(m) = target_module
+        && !is_editable_crate(m.krate(ctx.db()), ctx.db())
+    {
+        return None;
     }
 
     let function_builder =
@@ -141,11 +142,20 @@ fn gen_method(acc: &mut Assists, ctx: &AssistContext<'_>) -> Option<()> {
     let adt = receiver_ty.as_adt()?;
 
     let target_module = adt.module(ctx.sema.db);
-    if !is_editable_crate(target_module.krate(), ctx.db()) {
+    if !is_editable_crate(target_module.krate(ctx.db()), ctx.db()) {
         return None;
     }
 
-    let (impl_, file) = get_adt_source(ctx, &adt, fn_name.text().as_str())?;
+    let enclosing_impl = ctx.find_node_at_offset::<ast::Impl>();
+    let cursor_impl = enclosing_impl.filter(|impl_| {
+        ctx.sema.to_def(impl_).map_or(false, |def| def.self_ty(ctx.sema.db).as_adt() == Some(adt))
+    });
+
+    let (impl_, file) = if let Some(impl_) = cursor_impl {
+        (Some(impl_), ctx.vfs_file_id())
+    } else {
+        get_adt_source(ctx, &adt, fn_name.text().as_str())?
+    };
     let target = get_method_target(ctx, &impl_, &adt)?;
 
     let function_builder = FunctionBuilder::from_method_call(
@@ -171,16 +181,15 @@ fn add_func_to_accumulator(
     adt_info: Option<AdtInfo>,
     label: String,
 ) -> Option<()> {
-    acc.add(AssistId("generate_function", AssistKind::Generate), label, text_range, |edit| {
+    acc.add(AssistId::generate("generate_function"), label, text_range, |edit| {
         edit.edit_file(file);
 
         let target = function_builder.target.clone();
         let edition = function_builder.target_edition;
         let func = function_builder.render(ctx.config.snippet_cap, edit);
 
-        if let Some(adt) =
-            adt_info
-                .and_then(|adt_info| if adt_info.impl_exists { None } else { Some(adt_info.adt) })
+        if let Some(adt) = adt_info
+            .and_then(|adt_info| if adt_info.impl_exists { None } else { Some(adt_info.adt) })
         {
             let name = make::ty_path(make::ext::ident_path(&format!(
                 "{}",
@@ -188,7 +197,7 @@ fn add_func_to_accumulator(
             )));
 
             // FIXME: adt may have generic params.
-            let impl_ = make::impl_(None, None, name, None, None).clone_for_update();
+            let impl_ = make::impl_(None, None, None, name, None, None).clone_for_update();
 
             func.indent(IndentLevel(1));
             impl_.get_or_create_assoc_item_list().add_item(func.into());
@@ -205,11 +214,12 @@ fn get_adt_source(
     fn_name: &str,
 ) -> Option<(Option<ast::Impl>, FileId)> {
     let range = adt.source(ctx.sema.db)?.syntax().original_file_range_rooted(ctx.sema.db);
+
     let file = ctx.sema.parse(range.file_id);
     let adt_source =
         ctx.sema.find_node_at_offset_with_macros(file.syntax(), range.range.start())?;
     find_struct_impl(ctx, &adt_source, &[fn_name.to_owned()])
-        .map(|impl_| (impl_, range.file_id.file_id()))
+        .map(|impl_| (impl_, range.file_id.file_id(ctx.db())))
 }
 
 struct FunctionBuilder {
@@ -239,7 +249,7 @@ impl FunctionBuilder {
     ) -> Option<Self> {
         let target_module =
             target_module.or_else(|| ctx.sema.scope(target.syntax()).map(|it| it.module()))?;
-        let target_edition = target_module.krate().edition(ctx.db());
+        let target_edition = target_module.krate(ctx.db()).edition(ctx.db());
 
         let current_module = ctx.sema.scope(call.syntax())?.module();
         let visibility = calculate_necessary_visibility(current_module, target_module, ctx);
@@ -275,7 +285,7 @@ impl FunctionBuilder {
                 target_module,
                 &mut necessary_generic_params,
             );
-            let placeholder_expr = make::ext::expr_todo();
+            let placeholder_expr = expr_fill_default(ctx.config);
             fn_body = make::block_expr(vec![], Some(placeholder_expr));
         };
 
@@ -301,16 +311,16 @@ impl FunctionBuilder {
         ctx: &AssistContext<'_>,
         call: &ast::MethodCallExpr,
         name: &ast::NameRef,
-        receiver_ty: Type,
+        receiver_ty: Type<'_>,
         target_module: Module,
         target: GeneratedFunctionTarget,
     ) -> Option<Self> {
-        let target_edition = target_module.krate().edition(ctx.db());
+        let target_edition = target_module.krate(ctx.db()).edition(ctx.db());
 
         let current_module = ctx.sema.scope(call.syntax())?.module();
         let visibility = calculate_necessary_visibility(current_module, target_module, ctx);
 
-        let fn_name = make::name(&name.text());
+        let fn_name = make::name(name.ident_token()?.text());
         let mut necessary_generic_params = FxHashSet::default();
         necessary_generic_params.extend(receiver_ty.generic_params(ctx.db()));
         let params = fn_args(
@@ -330,7 +340,7 @@ impl FunctionBuilder {
         let (generic_param_list, where_clause) =
             fn_generic_params(ctx, necessary_generic_params, &target)?;
 
-        let placeholder_expr = make::ext::expr_todo();
+        let placeholder_expr = expr_fill_default(ctx.config);
         let fn_body = make::block_expr(vec![], Some(placeholder_expr));
 
         Some(Self {
@@ -354,10 +364,13 @@ impl FunctionBuilder {
             Visibility::Crate => Some(make::visibility_pub_crate()),
             Visibility::Pub => Some(make::visibility_pub()),
         };
+        let type_params =
+            self.generic_param_list.filter(|list| list.generic_params().next().is_some());
         let fn_def = make::fn_(
+            None,
             visibility,
             self.fn_name,
-            self.generic_param_list,
+            type_params,
             self.where_clause,
             self.params,
             self.fn_body,
@@ -382,14 +395,14 @@ impl FunctionBuilder {
                 // Focus the return type if there is one
                 match ret_type {
                     Some(ret_type) => {
-                        edit.add_placeholder_snippet(cap, ret_type.clone());
+                        edit.add_placeholder_snippet(cap, ret_type);
                     }
                     None => {
-                        edit.add_placeholder_snippet(cap, tail_expr.clone());
+                        edit.add_placeholder_snippet(cap, tail_expr);
                     }
                 }
             } else {
-                edit.add_placeholder_snippet(cap, tail_expr.clone());
+                edit.add_placeholder_snippet(cap, tail_expr);
             }
         }
 
@@ -443,7 +456,7 @@ fn make_fn_body_as_new_function(
     let adt_info = adt_info.as_ref()?;
 
     let path_self = make::ext::ident_path("Self");
-    let placeholder_expr = make::ext::expr_todo();
+    let placeholder_expr = expr_fill_default(ctx.config);
     let tail_expr = if let Some(strukt) = adt_info.adt.as_struct() {
         match strukt.kind(ctx.db()) {
             StructKind::Record => {
@@ -470,7 +483,7 @@ fn make_fn_body_as_new_function(
                     .map(|_| placeholder_expr.clone())
                     .collect::<Vec<_>>();
 
-                make::expr_call(make::expr_path(path_self), make::arg_list(args))
+                make::expr_call(make::expr_path(path_self), make::arg_list(args)).into()
             }
             StructKind::Unit => make::expr_path(path_self),
         }
@@ -496,7 +509,7 @@ fn get_fn_target(
     target_module: Option<Module>,
     call: CallExpr,
 ) -> Option<(GeneratedFunctionTarget, FileId)> {
-    let mut file = ctx.file_id().into();
+    let mut file = ctx.vfs_file_id();
     let target = match target_module {
         Some(target_module) => {
             let (in_file, target) = next_space_for_fn_in_module(ctx.db(), target_module);
@@ -529,7 +542,7 @@ fn assoc_fn_target_info(
     let current_module = ctx.sema.scope(call.syntax())?.module();
     let module = adt.module(ctx.sema.db);
     let target_module = if current_module == module { None } else { Some(module) };
-    if current_module.krate() != module.krate() {
+    if current_module.krate(ctx.db()) != module.krate(ctx.db()) {
         return None;
     }
     let (impl_, file) = get_adt_source(ctx, &adt, fn_name)?;
@@ -724,22 +737,35 @@ fn fn_generic_params(
     filter_unnecessary_bounds(&mut generic_params, &mut where_preds, necessary_params);
     filter_bounds_in_scope(&mut generic_params, &mut where_preds, ctx, target);
 
-    let generic_params: Vec<_> =
+    let generic_params: Vec<ast::GenericParam> =
         generic_params.into_iter().map(|it| it.node.clone_for_update()).collect();
-    let where_preds: Vec<_> =
+    let where_preds: Vec<ast::WherePred> =
         where_preds.into_iter().map(|it| it.node.clone_for_update()).collect();
 
-    // 4. Rewrite paths
-    if let Some(param) = generic_params.first() {
-        let source_scope = ctx.sema.scope(param.syntax())?;
-        let target_scope = ctx.sema.scope(&target.parent())?;
-        if source_scope.module() != target_scope.module() {
+    let (generic_params, where_preds): (Vec<ast::GenericParam>, Vec<ast::WherePred>) =
+        if let Some(param) = generic_params.first()
+            && let source_scope = ctx.sema.scope(param.syntax())?
+            && let target_scope = ctx.sema.scope(&target.parent())?
+            && source_scope.module() != target_scope.module()
+        {
+            // 4. Rewrite paths
             let transform = PathTransform::generic_transformation(&target_scope, &source_scope);
             let generic_params = generic_params.iter().map(|it| it.syntax());
             let where_preds = where_preds.iter().map(|it| it.syntax());
-            transform.apply_all(generic_params.chain(where_preds));
-        }
-    }
+            transform
+                .apply_all(generic_params.chain(where_preds))
+                .into_iter()
+                .filter_map(|it| {
+                    if let Some(it) = ast::GenericParam::cast(it.clone()) {
+                        Some(either::Either::Left(it))
+                    } else {
+                        ast::WherePred::cast(it).map(either::Either::Right)
+                    }
+                })
+                .partition_map(|it| it)
+        } else {
+            (generic_params, where_preds)
+        };
 
     let generic_param_list = make::generic_param_list(generic_params);
     let where_clause =
@@ -1037,7 +1063,7 @@ fn filter_bounds_in_scope(
 
 /// Makes duplicate argument names unique by appending incrementing numbers.
 ///
-/// ```
+/// ```ignore
 /// let mut names: Vec<String> =
 ///     vec!["foo".into(), "foo".into(), "bar".into(), "baz".into(), "bar".into()];
 /// deduplicate_arg_names(&mut names);
@@ -1077,7 +1103,7 @@ fn fn_arg_name(sema: &Semantics<'_, RootDatabase>, arg_expr: &ast::Expr) -> Stri
                 .filter_map(ast::NameRef::cast)
                 .filter(|name| name.ident_token().is_some())
                 .last()?;
-            if let Some(NameRefClass::Definition(Definition::Const(_) | Definition::Static(_))) =
+            if let Some(NameRefClass::Definition(Definition::Const(_) | Definition::Static(_), _)) =
                 NameRefClass::classify(sema, &name_ref)
             {
                 return Some(name_ref.to_string().to_lowercase());
@@ -1116,9 +1142,8 @@ fn fn_arg_type(
 
         if ty.is_reference() || ty.is_mutable_reference() {
             let famous_defs = &FamousDefs(&ctx.sema, ctx.sema.scope(fn_arg.syntax())?.krate());
-            let target_edition = target_module.krate().edition(ctx.db());
             convert_reference_type(ty.strip_references(), ctx.db(), famous_defs)
-                .map(|conversion| conversion.convert_type(ctx.db(), target_edition).to_string())
+                .map(|conversion| conversion.convert_type(ctx.db(), target_module).to_string())
                 .or_else(|| ty.display_source_code(ctx.db(), target_module.into(), true).ok())
         } else {
             ty.display_source_code(ctx.db(), target_module.into(), true).ok()
@@ -1158,7 +1183,7 @@ fn next_space_for_fn_in_module(
     target_module: hir::Module,
 ) -> (FileId, GeneratedFunctionTarget) {
     let module_source = target_module.definition_source(db);
-    let file = module_source.file_id.original_file(db.upcast());
+    let file = module_source.file_id.original_file(db);
     let assist_item = match &module_source.value {
         hir::ModuleSource::SourceFile(it) => match it.items().last() {
             Some(last_item) => GeneratedFunctionTarget::AfterItem(last_item.syntax().clone()),
@@ -1183,7 +1208,7 @@ fn next_space_for_fn_in_module(
         }
     };
 
-    (file.file_id(), assist_item)
+    (file.file_id(db), assist_item)
 }
 
 #[derive(Clone, Copy)]
@@ -1202,7 +1227,7 @@ fn calculate_necessary_visibility(
     let current_module = current_module.nearest_non_block_module(db);
     let target_module = target_module.nearest_non_block_module(db);
 
-    if target_module.krate() != current_module.krate() {
+    if target_module.krate(ctx.db()) != current_module.krate(ctx.db()) {
         Visibility::Pub
     } else if current_module.path_to_root(db).contains(&target_module) {
         Visibility::None
@@ -1501,7 +1526,7 @@ fn foo() {
     bar("bar")
 }
 
-fn bar(arg: &str) {
+fn bar(arg: &'static str) {
     ${0:todo!()}
 }
 "#,
@@ -2055,7 +2080,7 @@ fn bar(closure: impl Fn(i64) -> i64) {
     }
 
     #[test]
-    fn unresolveable_types_default_to_placeholder() {
+    fn unresolvable_types_default_to_placeholder() {
         check_assist(
             generate_function,
             r"
@@ -2118,7 +2143,7 @@ fn foo() {
     bar(baz(), baz(), "foo", "bar")
 }
 
-fn bar(baz_1: Baz, baz_2: Baz, arg_1: &str, arg_2: &str) {
+fn bar(baz_1: Baz, baz_2: Baz, arg_1: &'static str, arg_2: &'static str) {
     ${0:todo!()}
 }
 "#,
@@ -2372,6 +2397,33 @@ impl Foo {
             r#"
 struct Foo;
 impl Foo {
+    fn foo(&self) {
+        self.bar();
+    }
+
+    fn bar(&self) ${0:-> _} {
+        todo!()
+    }
+}
+"#,
+        )
+    }
+
+    #[test]
+    fn create_method_with_unused_generics() {
+        check_assist(
+            generate_function,
+            r#"
+struct Foo<S>(S);
+impl<S> Foo<S> {
+    fn foo(&self) {
+        self.bar()$0;
+    }
+}
+"#,
+            r#"
+struct Foo<S>(S);
+impl<S> Foo<S> {
     fn foo(&self) {
         self.bar();
     }
@@ -3086,7 +3138,7 @@ pub struct Foo {
     field_2: String,
 }
 impl Foo {
-    fn new(baz_1: Baz, baz_2: Baz, arg_1: &str, arg_2: &str) -> Self {
+    fn new(baz_1: Baz, baz_2: Baz, arg_1: &'static str, arg_2: &'static str) -> Self {
         ${0:Self { field_1: todo!(), field_2: todo!() }}
     }
 }
@@ -3098,6 +3150,96 @@ fn main() {
     let foo = Foo::new(baz(), baz(), "foo", "bar");
 }
         "#,
+        )
+    }
+
+    #[test]
+    fn no_generate_method_by_keyword() {
+        check_assist_not_applicable(
+            generate_function,
+            r#"
+fn main() {
+    s.super$0();
+}
+        "#,
+        );
+        check_assist_not_applicable(
+            generate_function,
+            r#"
+fn main() {
+    s.Self$0();
+}
+        "#,
+        );
+        check_assist_not_applicable(
+            generate_function,
+            r#"
+fn main() {
+    s.self$0();
+}
+        "#,
+        );
+    }
+
+    #[test]
+    fn regression_21288() {
+        check_assist(
+            generate_function,
+            r#"
+//- minicore: copy
+fn foo() {
+    $0bar(&|x| true)
+}
+        "#,
+            r#"
+fn foo() {
+    bar(&|x| true)
+}
+
+fn bar(arg: impl Fn(_) -> bool) {
+    ${0:todo!()}
+}
+        "#,
+        );
+    }
+    #[test]
+    fn generate_method_uses_current_impl_block() {
+        check_assist(
+            generate_function,
+            r"
+struct Foo;
+
+impl Foo {
+    fn new() -> Self {
+        Foo
+    }
+}
+
+impl Foo {
+    fn method1(&self) {
+        self.method2$0(42)
+    }
+}
+",
+            r"
+struct Foo;
+
+impl Foo {
+    fn new() -> Self {
+        Foo
+    }
+}
+
+impl Foo {
+    fn method1(&self) {
+        self.method2(42)
+    }
+
+    fn method2(&self, arg: i32) {
+        ${0:todo!()}
+    }
+}
+",
         )
     }
 }

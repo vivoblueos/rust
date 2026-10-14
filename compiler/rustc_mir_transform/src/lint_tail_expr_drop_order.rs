@@ -2,29 +2,32 @@ use std::cell::RefCell;
 use std::collections::hash_map;
 use std::rc::Rc;
 
-use rustc_data_structures::fx::{FxHashMap, FxHashSet};
+use itertools::Itertools as _;
+use rustc_data_structures::fx::{FxHashMap, FxHashSet, FxIndexMap};
 use rustc_data_structures::unord::{UnordMap, UnordSet};
-use rustc_errors::Subdiagnostic;
+use rustc_errors::formatting::DiagMessageAddArg;
+use rustc_errors::{Subdiagnostic, msg};
 use rustc_hir::CRATE_HIR_ID;
-use rustc_hir::def_id::{DefId, LocalDefId};
-use rustc_index::bit_set::ChunkedBitSet;
+use rustc_hir::def_id::LocalDefId;
+use rustc_index::bit_set::MixedBitSet;
 use rustc_index::{IndexSlice, IndexVec};
-use rustc_macros::{LintDiagnostic, Subdiagnostic};
+use rustc_macros::{Diagnostic, Subdiagnostic};
 use rustc_middle::bug;
 use rustc_middle::mir::{
-    self, BasicBlock, Body, ClearCrossCrate, Local, Location, Place, StatementKind, TerminatorKind,
-    dump_mir,
+    self, BasicBlock, Body, ClearCrossCrate, Local, Location, MirDumper, Place, StatementKind,
+    TerminatorKind,
 };
-use rustc_middle::ty::{self, Ty, TyCtxt};
+use rustc_middle::ty::significant_drop_order::{
+    extract_component_with_significant_dtor, ty_dtor_span,
+};
+use rustc_middle::ty::{self, TyCtxt};
 use rustc_mir_dataflow::impls::MaybeInitializedPlaces;
 use rustc_mir_dataflow::move_paths::{LookupResult, MoveData, MovePathIndex};
 use rustc_mir_dataflow::{Analysis, MaybeReachable, ResultsCursor};
+use rustc_session::lint;
 use rustc_session::lint::builtin::TAIL_EXPR_DROP_ORDER;
-use rustc_session::lint::{self};
 use rustc_span::{DUMMY_SP, Span, Symbol};
-use rustc_type_ir::data_structures::IndexMap;
-use smallvec::{SmallVec, smallvec};
-use tracing::{debug, instrument};
+use tracing::debug;
 
 fn place_has_common_prefix<'tcx>(left: &Place<'tcx>, right: &Place<'tcx>) -> bool {
     left.local == right.local
@@ -49,24 +52,24 @@ struct DropsReachable<'a, 'mir, 'tcx> {
     move_data: &'a MoveData<'tcx>,
     maybe_init: &'a mut ResultsCursor<'mir, 'tcx, MaybeInitializedPlaces<'mir, 'tcx>>,
     block_drop_value_info: &'a mut IndexSlice<BasicBlock, MovePathIndexAtBlock>,
-    collected_drops: &'a mut ChunkedBitSet<MovePathIndex>,
-    visited: FxHashMap<BasicBlock, Rc<RefCell<ChunkedBitSet<MovePathIndex>>>>,
+    collected_drops: &'a mut MixedBitSet<MovePathIndex>,
+    visited: FxHashMap<BasicBlock, Rc<RefCell<MixedBitSet<MovePathIndex>>>>,
 }
 
 impl<'a, 'mir, 'tcx> DropsReachable<'a, 'mir, 'tcx> {
     fn visit(&mut self, block: BasicBlock) {
         let move_set_size = self.move_data.move_paths.len();
-        let make_new_path_set = || Rc::new(RefCell::new(ChunkedBitSet::new_empty(move_set_size)));
+        let make_new_path_set = || Rc::new(RefCell::new(MixedBitSet::new_empty(move_set_size)));
 
         let data = &self.body.basic_blocks[block];
         let Some(terminator) = &data.terminator else { return };
-        // Given that we observe these dropped locals here at `block` so far,
-        // we will try to update the successor blocks.
-        // An occupied entry at `block` in `self.visited` signals that we have visited `block` before.
+        // Given that we observe these dropped locals here at `block` so far, we will try to update
+        // the successor blocks. An occupied entry at `block` in `self.visited` signals that we
+        // have visited `block` before.
         let dropped_local_here =
             Rc::clone(self.visited.entry(block).or_insert_with(make_new_path_set));
-        // We could have invoked reverse lookup for a `MovePathIndex` every time, but unfortunately it is expensive.
-        // Let's cache them in `self.block_drop_value_info`.
+        // We could have invoked reverse lookup for a `MovePathIndex` every time, but unfortunately
+        // it is expensive. Let's cache them in `self.block_drop_value_info`.
         match self.block_drop_value_info[block] {
             MovePathIndexAtBlock::Some(dropped) => {
                 dropped_local_here.borrow_mut().insert(dropped);
@@ -76,23 +79,24 @@ impl<'a, 'mir, 'tcx> DropsReachable<'a, 'mir, 'tcx> {
                     && let LookupResult::Exact(idx) | LookupResult::Parent(Some(idx)) =
                         self.move_data.rev_lookup.find(place.as_ref())
                 {
-                    // Since we are working with MIRs at a very early stage,
-                    // observing a `drop` terminator is not indicative enough that
-                    // the drop will definitely happen.
-                    // That is decided in the drop elaboration pass instead.
-                    // Therefore, we need to consult with the maybe-initialization information.
+                    // Since we are working with MIRs at a very early stage, observing a `drop`
+                    // terminator is not indicative enough that the drop will definitely happen.
+                    // That is decided in the drop elaboration pass instead. Therefore, we need to
+                    // consult with the maybe-initialization information.
                     self.maybe_init.seek_before_primary_effect(Location {
                         block,
                         statement_index: data.statements.len(),
                     });
 
-                    // Check if the drop of `place` under inspection is really in effect.
-                    // This is true only when `place` may have been initialized along a control flow path from a BID to the drop program point today.
-                    // In other words, this is where the drop of `place` will happen in the future instead.
+                    // Check if the drop of `place` under inspection is really in effect. This is
+                    // true only when `place` may have been initialized along a control flow path
+                    // from a BID to the drop program point today. In other words, this is where
+                    // the drop of `place` will happen in the future instead.
                     if let MaybeReachable::Reachable(maybe_init) = self.maybe_init.get()
                         && maybe_init.contains(idx)
                     {
-                        // We also cache the drop information, so that we do not need to check on data-flow cursor again
+                        // We also cache the drop information, so that we do not need to check on
+                        // data-flow cursor again.
                         self.block_drop_value_info[block] = MovePathIndexAtBlock::Some(idx);
                         dropped_local_here.borrow_mut().insert(idx);
                     } else {
@@ -132,6 +136,8 @@ impl<'a, 'mir, 'tcx> DropsReachable<'a, 'mir, 'tcx> {
                     target: _,
                     unwind: _,
                     replace: _,
+                    drop: _,
+                    async_fut: _,
                 } = &terminator.kind
                 && place_has_common_prefix(dropped_place, self.place)
             {
@@ -139,8 +145,9 @@ impl<'a, 'mir, 'tcx> DropsReachable<'a, 'mir, 'tcx> {
                 // Let's check the observed dropped places in.
                 self.collected_drops.union(&*dropped_local_there.borrow());
                 if self.drop_span.is_none() {
-                    // FIXME(@dingxiangfei2009): it turns out that `self.body.source_scopes` are still a bit wonky.
-                    // There is a high chance that this span still points to a block rather than a statement semicolon.
+                    // FIXME(@dingxiangfei2009): it turns out that `self.body.source_scopes` are
+                    // still a bit wonky. There is a high chance that this span still points to a
+                    // block rather than a statement semicolon.
                     *self.drop_span = Some(terminator.source_info.span);
                 }
                 // Now we have discovered a simple control flow path from a future drop point
@@ -150,173 +157,6 @@ impl<'a, 'mir, 'tcx> DropsReachable<'a, 'mir, 'tcx> {
                 self.visit(succ)
             }
         }
-    }
-}
-
-/// An additional filter to exclude well-known types from the ecosystem
-/// because their drops are trivial.
-/// This returns additional types to check if the drops are delegated to those.
-/// A typical example is `hashbrown::HashMap<K, V>`, whose drop is delegated to `K` and `V`.
-fn true_significant_drop_ty<'tcx>(
-    tcx: TyCtxt<'tcx>,
-    ty: Ty<'tcx>,
-) -> Option<SmallVec<[Ty<'tcx>; 2]>> {
-    if let ty::Adt(def, args) = ty.kind() {
-        let mut did = def.did();
-        let mut name_rev = vec![];
-        loop {
-            let key = tcx.def_key(did);
-
-            match key.disambiguated_data.data {
-                rustc_hir::definitions::DefPathData::CrateRoot => {
-                    name_rev.push(tcx.crate_name(did.krate))
-                }
-                rustc_hir::definitions::DefPathData::TypeNs(symbol) => name_rev.push(symbol),
-                _ => return None,
-            }
-            if let Some(parent) = key.parent {
-                did = DefId { krate: did.krate, index: parent };
-            } else {
-                break;
-            }
-        }
-        let name_str: Vec<_> = name_rev.iter().rev().map(|x| x.as_str()).collect();
-        debug!(?name_str);
-        match name_str[..] {
-            // These are the types from Rust core ecosystem
-            ["sym" | "proc_macro2", ..]
-            | ["core" | "std", "task", "LocalWaker" | "Waker"]
-            | ["core" | "std", "task", "wake", "LocalWaker" | "Waker"] => Some(smallvec![]),
-            // These are important types from Rust ecosystem
-            ["tracing", "instrument", "Instrumented"] | ["bytes", "Bytes"] => Some(smallvec![]),
-            ["hashbrown", "raw", "RawTable" | "RawIntoIter"] => {
-                if let [ty, ..] = &***args
-                    && let Some(ty) = ty.as_type()
-                {
-                    Some(smallvec![ty])
-                } else {
-                    None
-                }
-            }
-            ["hashbrown", "raw", "RawDrain"] => {
-                if let [_, ty, ..] = &***args
-                    && let Some(ty) = ty.as_type()
-                {
-                    Some(smallvec![ty])
-                } else {
-                    None
-                }
-            }
-            _ => None,
-        }
-    } else {
-        None
-    }
-}
-
-/// Returns the list of types with a "potentially sigificant" that may be dropped
-/// by dropping a value of type `ty`.
-#[instrument(level = "debug", skip(tcx, param_env))]
-fn extract_component_raw<'tcx>(
-    tcx: TyCtxt<'tcx>,
-    param_env: ty::ParamEnv<'tcx>,
-    ty: Ty<'tcx>,
-    ty_seen: &mut UnordSet<Ty<'tcx>>,
-) -> SmallVec<[Ty<'tcx>; 4]> {
-    // Droppiness does not depend on regions, so let us erase them.
-    let ty = tcx
-        .try_normalize_erasing_regions(
-            ty::TypingEnv { param_env, typing_mode: ty::TypingMode::PostAnalysis },
-            ty,
-        )
-        .unwrap_or(ty);
-
-    let tys = tcx.list_significant_drop_tys(param_env.and(ty));
-    debug!(?ty, "components");
-    let mut out_tys = smallvec![];
-    for ty in tys {
-        if let Some(tys) = true_significant_drop_ty(tcx, ty) {
-            // Some types can be further opened up because the drop is simply delegated
-            for ty in tys {
-                if ty_seen.insert(ty) {
-                    out_tys.extend(extract_component_raw(tcx, param_env, ty, ty_seen));
-                }
-            }
-        } else {
-            if ty_seen.insert(ty) {
-                out_tys.push(ty);
-            }
-        }
-    }
-    out_tys
-}
-
-#[instrument(level = "debug", skip(tcx, param_env))]
-fn extract_component_with_significant_dtor<'tcx>(
-    tcx: TyCtxt<'tcx>,
-    param_env: ty::ParamEnv<'tcx>,
-    ty: Ty<'tcx>,
-) -> SmallVec<[Ty<'tcx>; 4]> {
-    let mut tys = extract_component_raw(tcx, param_env, ty, &mut Default::default());
-    let mut deduplicate = FxHashSet::default();
-    tys.retain(|oty| deduplicate.insert(*oty));
-    tys.into_iter().collect()
-}
-
-/// Extract the span of the custom destructor of a type
-/// especially the span of the `impl Drop` header or its entire block
-/// when we are working with current local crate.
-#[instrument(level = "debug", skip(tcx))]
-fn ty_dtor_span<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> Option<Span> {
-    match ty.kind() {
-        ty::Bool
-        | ty::Char
-        | ty::Int(_)
-        | ty::Uint(_)
-        | ty::Float(_)
-        | ty::Error(_)
-        | ty::Str
-        | ty::Never
-        | ty::RawPtr(_, _)
-        | ty::Ref(_, _, _)
-        | ty::FnPtr(_, _)
-        | ty::Tuple(_)
-        | ty::Dynamic(_, _, _)
-        | ty::Alias(_, _)
-        | ty::Bound(_, _)
-        | ty::Pat(_, _)
-        | ty::Placeholder(_)
-        | ty::Infer(_)
-        | ty::Slice(_)
-        | ty::Array(_, _) => None,
-        ty::Adt(adt_def, _) => {
-            let did = adt_def.did();
-            let try_local_did_span = |did: DefId| {
-                if let Some(local) = did.as_local() {
-                    tcx.source_span(local)
-                } else {
-                    tcx.def_span(did)
-                }
-            };
-            let dtor = if let Some(dtor) = tcx.adt_destructor(did) {
-                dtor.did
-            } else if let Some(dtor) = tcx.adt_async_destructor(did) {
-                dtor.future
-            } else {
-                return Some(try_local_did_span(did));
-            };
-            let def_key = tcx.def_key(dtor);
-            let Some(parent_index) = def_key.parent else { return Some(try_local_did_span(dtor)) };
-            let parent_did = DefId { index: parent_index, krate: dtor.krate };
-            Some(try_local_did_span(parent_did))
-        }
-        ty::Coroutine(did, _)
-        | ty::CoroutineWitness(did, _)
-        | ty::CoroutineClosure(did, _)
-        | ty::Closure(did, _)
-        | ty::FnDef(did, _)
-        | ty::Foreign(did) => Some(tcx.def_span(did)),
-        ty::Param(_) => None,
     }
 }
 
@@ -352,14 +192,19 @@ pub(crate) fn run_lint<'tcx>(tcx: TyCtxt<'tcx>, def_id: LocalDefId, body: &Body<
     {
         return;
     }
+
+    // FIXME(typing_env): This should be able to reveal the opaques local to the
+    // body using the typeck results.
+    let typing_env = ty::TypingEnv::non_body_analysis(tcx, def_id);
+
     // ## About BIDs in blocks ##
     // Track the set of blocks that contain a backwards-incompatible drop (BID)
     // and, for each block, the vector of locations.
     //
     // We group them per-block because they tend to scheduled in the same drop ladder block.
-    let mut bid_per_block = IndexMap::default();
+    let mut bid_per_block = FxIndexMap::default();
     let mut bid_places = UnordSet::new();
-    let param_env = tcx.param_env(def_id).with_reveal_all_normalized(tcx);
+
     let mut ty_dropped_components = UnordMap::default();
     for (block, data) in body.basic_blocks.iter_enumerated() {
         for (statement_index, stmt) in data.statements.iter().enumerate() {
@@ -367,7 +212,7 @@ pub(crate) fn run_lint<'tcx>(tcx: TyCtxt<'tcx>, def_id: LocalDefId, body: &Body<
                 let ty = place.ty(body, tcx).ty;
                 if ty_dropped_components
                     .entry(ty)
-                    .or_insert_with(|| extract_component_with_significant_dtor(tcx, param_env, ty))
+                    .or_insert_with(|| extract_component_with_significant_dtor(tcx, typing_env, ty))
                     .is_empty()
                 {
                     continue;
@@ -384,7 +229,10 @@ pub(crate) fn run_lint<'tcx>(tcx: TyCtxt<'tcx>, def_id: LocalDefId, body: &Body<
         return;
     }
 
-    dump_mir(tcx, false, "lint_tail_expr_drop_order", &0 as _, body, |_, _| Ok(()));
+    if let Some(dumper) = MirDumper::new(tcx, "lint_tail_expr_drop_order", body) {
+        dumper.dump_mir(body);
+    }
+
     let locals_with_user_names = collect_user_names(body);
     let is_closure_like = tcx.is_closure_like(def_id.to_def_id());
 
@@ -392,17 +240,18 @@ pub(crate) fn run_lint<'tcx>(tcx: TyCtxt<'tcx>, def_id: LocalDefId, body: &Body<
     // When we encounter a DROP of some place P we only care
     // about the drop if `P` may be initialized.
     let move_data = MoveData::gather_moves(body, tcx, |_| true);
-    let maybe_init = MaybeInitializedPlaces::new(tcx, body, &move_data);
-    let mut maybe_init = maybe_init.iterate_to_fixpoint(tcx, body, None).into_results_cursor(body);
+    let mut maybe_init = MaybeInitializedPlaces::new(tcx, body, &move_data)
+        .iterate_to_fixpoint(tcx, body, None)
+        .into_results_cursor(body);
     let mut block_drop_value_info =
         IndexVec::from_elem_n(MovePathIndexAtBlock::Unknown, body.basic_blocks.len());
     for (&block, candidates) in &bid_per_block {
         // We will collect drops on locals on paths between BID points to their actual drop locations
         // into `all_locals_dropped`.
-        let mut all_locals_dropped = ChunkedBitSet::new_empty(move_data.move_paths.len());
+        let mut all_locals_dropped = MixedBitSet::new_empty(move_data.move_paths.len());
         let mut drop_span = None;
         for &(_, place) in candidates.iter() {
-            let mut collected_drops = ChunkedBitSet::new_empty(move_data.move_paths.len());
+            let mut collected_drops = MixedBitSet::new_empty(move_data.move_paths.len());
             // ## On detecting change in relative drop order ##
             // Iterate through each BID-containing block `block`.
             // If the place `P` targeted by the BID is "maybe initialized",
@@ -430,8 +279,9 @@ pub(crate) fn run_lint<'tcx>(tcx: TyCtxt<'tcx>, def_id: LocalDefId, body: &Body<
 
         // We shall now exclude some local bindings for the following cases.
         {
-            let mut to_exclude = ChunkedBitSet::new_empty(all_locals_dropped.domain_size());
-            // We will now do subtraction from the candidate dropped locals, because of the following reasons.
+            let mut to_exclude = MixedBitSet::new_empty(all_locals_dropped.domain_size());
+            // We will now do subtraction from the candidate dropped locals, because of the
+            // following reasons.
             for path_idx in all_locals_dropped.iter() {
                 let move_path = &move_data.move_paths[path_idx];
                 let dropped_local = move_path.place.local;
@@ -479,7 +329,7 @@ pub(crate) fn run_lint<'tcx>(tcx: TyCtxt<'tcx>, def_id: LocalDefId, body: &Body<
                 if ty_dropped_components
                     .entry(observer_ty)
                     .or_insert_with(|| {
-                        extract_component_with_significant_dtor(tcx, param_env, observer_ty)
+                        extract_component_with_significant_dtor(tcx, typing_env, observer_ty)
                     })
                     .is_empty()
                 {
@@ -491,9 +341,9 @@ pub(crate) fn run_lint<'tcx>(tcx: TyCtxt<'tcx>, def_id: LocalDefId, body: &Body<
             // Suppose that all BIDs point into the same local,
             // we can remove the this local from the observed drops,
             // so that we can focus our diagnosis more on the others.
-            if candidates.iter().all(|&(_, place)| candidates[0].1.local == place.local) {
+            if let Ok(local) = candidates.iter().map(|&(_, place)| place.local).all_equal_value() {
                 for path_idx in all_locals_dropped.iter() {
-                    if move_data.move_paths[path_idx].place.local == candidates[0].1.local {
+                    if move_data.move_paths[path_idx].place.local == local {
                         to_exclude.insert(path_idx);
                     }
                 }
@@ -575,7 +425,7 @@ pub(crate) fn run_lint<'tcx>(tcx: TyCtxt<'tcx>, def_id: LocalDefId, body: &Body<
             let name = name.as_str();
 
             let mut seen_dyn = false;
-            let destructors = extract_component_with_significant_dtor(tcx, param_env, observer_ty)
+            let destructors = extract_component_with_significant_dtor(tcx, typing_env, observer_ty)
                 .into_iter()
                 .filter_map(|ty| {
                     if let Some(span) = ty_dtor_span(tcx, ty) {
@@ -612,8 +462,8 @@ pub(crate) fn run_lint<'tcx>(tcx: TyCtxt<'tcx>, def_id: LocalDefId, body: &Body<
 }
 
 /// Extract binding names if available for diagnosis
-fn collect_user_names(body: &Body<'_>) -> IndexMap<Local, Symbol> {
-    let mut names = IndexMap::default();
+fn collect_user_names(body: &Body<'_>) -> FxIndexMap<Local, Symbol> {
+    let mut names = FxIndexMap::default();
     for var_debug_info in &body.var_debug_info {
         if let mir::VarDebugInfoContents::Place(place) = &var_debug_info.value
             && let Some(local) = place.local_or_deref_local()
@@ -627,9 +477,9 @@ fn collect_user_names(body: &Body<'_>) -> IndexMap<Local, Symbol> {
 /// Assign names for anonymous or temporary values for diagnosis
 fn assign_observables_names(
     locals: impl IntoIterator<Item = Local>,
-    user_names: &IndexMap<Local, Symbol>,
-) -> IndexMap<Local, (String, bool)> {
-    let mut names = IndexMap::default();
+    user_names: &FxIndexMap<Local, Symbol>,
+) -> FxIndexMap<Local, (String, bool)> {
+    let mut names = FxIndexMap::default();
     let mut assigned_names = FxHashSet::default();
     let mut idx = 0u64;
     let mut fresh_name = || {
@@ -649,14 +499,18 @@ fn assign_observables_names(
     names
 }
 
-#[derive(LintDiagnostic)]
-#[diag(mir_transform_tail_expr_drop_order)]
+#[derive(Diagnostic)]
+#[diag("relative drop order changing in Rust 2024")]
 struct TailExprDropOrderLint<'a> {
     #[subdiagnostic]
     local_labels: Vec<LocalLabel<'a>>,
-    #[label(mir_transform_drop_location)]
+    #[label(
+        "now the temporary value is dropped here, before the local variables in the block or statement"
+    )]
     drop_span: Option<Span>,
-    #[note(mir_transform_note_epilogue)]
+    #[note(
+        "most of the time, changing drop order is harmless; inspect the `impl Drop`s for side effects like releasing locks or sending messages"
+    )]
     _epilogue: (),
 }
 
@@ -670,29 +524,41 @@ struct LocalLabel<'a> {
 
 /// A custom `Subdiagnostic` implementation so that the notes are delivered in a specific order
 impl Subdiagnostic for LocalLabel<'_> {
-    fn add_to_diag_with<
-        G: rustc_errors::EmissionGuarantee,
-        F: rustc_errors::SubdiagMessageOp<G>,
-    >(
-        self,
-        diag: &mut rustc_errors::Diag<'_, G>,
-        f: &F,
-    ) {
-        diag.arg("name", self.name);
-        diag.arg("is_generated_name", self.is_generated_name);
-        diag.arg("is_dropped_first_edition_2024", self.is_dropped_first_edition_2024);
-        let msg = f(diag, crate::fluent_generated::mir_transform_tail_expr_local.into());
-        diag.span_label(self.span, msg);
+    fn add_to_diag<G: rustc_errors::EmissionGuarantee>(self, diag: &mut rustc_errors::Diag<'_, G>) {
+        diag.span_label(
+            self.span,
+            msg!(
+                "{$is_generated_name ->
+                    [true] this value will be stored in a temporary; let us call it `{$name}`
+                    *[false] `{$name}` calls a custom destructor
+                }"
+            )
+            .arg("name", self.name)
+            .arg("is_generated_name", self.is_generated_name)
+            .format(),
+        );
         for dtor in self.destructors {
-            dtor.add_to_diag_with(diag, f);
+            dtor.add_to_diag(diag);
         }
-        let msg = f(diag, crate::fluent_generated::mir_transform_label_local_epilogue.into());
-        diag.span_label(self.span, msg);
+        diag.span_label(self.span, msg!(
+            "{$is_dropped_first_edition_2024 ->
+                [true] up until Edition 2021 `{$name}` is dropped last but will be dropped earlier in Edition 2024
+                *[false] `{$name}` will be dropped later as of Edition 2024
+            }"
+        )
+            .arg("is_dropped_first_edition_2024", self.is_dropped_first_edition_2024)
+            .arg("name", self.name)
+            .format());
     }
 }
 
 #[derive(Subdiagnostic)]
-#[note(mir_transform_tail_expr_dtor)]
+#[note(
+    "{$dtor_kind ->
+        [dyn] `{$name}` may invoke a custom destructor because it contains a trait object
+        *[concrete] `{$name}` invokes this custom destructor
+    }"
+)]
 struct DestructorLabel<'a> {
     #[primary_span]
     span: Span,

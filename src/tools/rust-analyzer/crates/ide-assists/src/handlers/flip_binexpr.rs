@@ -1,6 +1,10 @@
-use syntax::ast::{self, AstNode, BinExpr};
+use syntax::{
+    SyntaxKind, T,
+    ast::{self, AstNode, BinExpr, RangeItem, syntax_factory::SyntaxFactory},
+    syntax_editor::Position,
+};
 
-use crate::{AssistContext, AssistId, AssistKind, Assists};
+use crate::{AssistContext, AssistId, Assists};
 
 // Assist: flip_binexpr
 //
@@ -19,22 +23,17 @@ use crate::{AssistContext, AssistId, AssistKind, Assists};
 // ```
 pub(crate) fn flip_binexpr(acc: &mut Assists, ctx: &AssistContext<'_>) -> Option<()> {
     let expr = ctx.find_node_at_offset::<BinExpr>()?;
-    let rhs = expr.rhs()?.syntax().clone();
-    let lhs = expr.lhs()?.syntax().clone();
+    let lhs = expr.lhs()?;
+    let rhs = expr.rhs()?;
 
-    let lhs = if let Some(bin_expr) = BinExpr::cast(lhs.clone()) {
-        if bin_expr.op_kind() == expr.op_kind() {
-            bin_expr.rhs()?.syntax().clone()
-        } else {
-            lhs
-        }
-    } else {
-        lhs
+    let lhs = match &lhs {
+        ast::Expr::BinExpr(bin_expr) if bin_expr.op_kind() == expr.op_kind() => bin_expr.rhs()?,
+        _ => lhs,
     };
 
-    let op_range = expr.op_token()?.text_range();
+    let op_token = expr.op_token()?;
     // The assist should be applied only if the cursor is on the operator
-    let cursor_in_range = op_range.contains_range(ctx.selection_trimmed());
+    let cursor_in_range = op_token.text_range().contains_range(ctx.selection_trimmed());
     if !cursor_in_range {
         return None;
     }
@@ -45,15 +44,19 @@ pub(crate) fn flip_binexpr(acc: &mut Assists, ctx: &AssistContext<'_>) -> Option
     }
 
     acc.add(
-        AssistId("flip_binexpr", AssistKind::RefactorRewrite),
+        AssistId::refactor_rewrite("flip_binexpr"),
         "Flip binary expression",
-        op_range,
-        |edit| {
-            if let FlipAction::FlipAndReplaceOp(new_op) = action {
-                edit.replace(op_range, new_op);
-            }
-            edit.replace(lhs.text_range(), rhs.text());
-            edit.replace(rhs.text_range(), lhs.text());
+        op_token.text_range(),
+        |builder| {
+            let mut editor = builder.make_editor(&expr.syntax().parent().unwrap());
+            let make = SyntaxFactory::with_mappings();
+            if let FlipAction::FlipAndReplaceOp(binary_op) = action {
+                editor.replace(op_token, make.token(binary_op))
+            };
+            editor.replace(lhs.syntax(), rhs.syntax());
+            editor.replace(rhs.syntax(), lhs.syntax());
+            editor.add_mappings(make.finish_with_mappings());
+            builder.add_file_edits(ctx.vfs_file_id(), editor);
         },
     )
 }
@@ -62,7 +65,7 @@ enum FlipAction {
     // Flip the expression
     Flip,
     // Flip the expression and replace the operator with this string
-    FlipAndReplaceOp(&'static str),
+    FlipAndReplaceOp(SyntaxKind),
     // Do not flip the expression
     DontFlip,
 }
@@ -73,16 +76,84 @@ impl From<ast::BinaryOp> for FlipAction {
             ast::BinaryOp::Assignment { .. } => FlipAction::DontFlip,
             ast::BinaryOp::CmpOp(ast::CmpOp::Ord { ordering, strict }) => {
                 let rev_op = match (ordering, strict) {
-                    (ast::Ordering::Less, true) => ">",
-                    (ast::Ordering::Less, false) => ">=",
-                    (ast::Ordering::Greater, true) => "<",
-                    (ast::Ordering::Greater, false) => "<=",
+                    (ast::Ordering::Less, true) => T![>],
+                    (ast::Ordering::Less, false) => T![>=],
+                    (ast::Ordering::Greater, true) => T![<],
+                    (ast::Ordering::Greater, false) => T![<=],
                 };
                 FlipAction::FlipAndReplaceOp(rev_op)
             }
             _ => FlipAction::Flip,
         }
     }
+}
+
+// Assist: flip_range_expr
+//
+// Flips operands of a range expression.
+//
+// ```
+// fn main() {
+//     let _ = 90..$02;
+// }
+// ```
+// ->
+// ```
+// fn main() {
+//     let _ = 2..90;
+// }
+// ```
+// ---
+// ```
+// fn main() {
+//     let _ = 90..$0;
+// }
+// ```
+// ->
+// ```
+// fn main() {
+//     let _ = ..90;
+// }
+// ```
+pub(crate) fn flip_range_expr(acc: &mut Assists, ctx: &AssistContext<'_>) -> Option<()> {
+    let range_expr = ctx.find_node_at_offset::<ast::RangeExpr>()?;
+    let op = range_expr.op_token()?;
+    let start = range_expr.start();
+    let end = range_expr.end();
+
+    if !op.text_range().contains_range(ctx.selection_trimmed()) {
+        return None;
+    }
+    if start.is_none() && end.is_none() {
+        return None;
+    }
+
+    acc.add(
+        AssistId::refactor_rewrite("flip_range_expr"),
+        "Flip range expression",
+        op.text_range(),
+        |builder| {
+            let mut edit = builder.make_editor(range_expr.syntax());
+
+            match (start, end) {
+                (Some(start), Some(end)) => {
+                    edit.replace(start.syntax(), end.syntax());
+                    edit.replace(end.syntax(), start.syntax());
+                }
+                (Some(start), None) => {
+                    edit.delete(start.syntax());
+                    edit.insert(Position::after(&op), start.syntax());
+                }
+                (None, Some(end)) => {
+                    edit.delete(end.syntax());
+                    edit.insert(Position::before(&op), end.syntax());
+                }
+                (None, None) => (),
+            }
+
+            builder.add_file_edits(ctx.vfs_file_id(), edit);
+        },
+    )
 }
 
 #[cfg(test)]

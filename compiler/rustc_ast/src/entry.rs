@@ -1,7 +1,4 @@
-use rustc_span::Symbol;
-use rustc_span::symbol::sym;
-
-use crate::{Attribute, attr};
+use rustc_span::{Symbol, sym};
 
 #[derive(Debug)]
 pub enum EntryPointType {
@@ -19,12 +16,6 @@ pub enum EntryPointType {
     /// fn main() {}
     /// ```
     RustcMainAttr,
-    /// This is a function with the `#[start]` attribute.
-    /// ```ignore (clashes with test entrypoint)
-    /// #[start]
-    /// fn main() {}
-    /// ```
-    Start,
     /// This function is **not** an entrypoint but simply named `main` (not at the root).
     /// This is only used for diagnostics.
     /// ```
@@ -37,13 +28,11 @@ pub enum EntryPointType {
 }
 
 pub fn entry_point_type(
-    attrs: &[Attribute],
+    has_rustc_main: bool,
     at_root: bool,
     name: Option<Symbol>,
 ) -> EntryPointType {
-    if attr::contains_name(attrs, sym::start) {
-        EntryPointType::Start
-    } else if attr::contains_name(attrs, sym::rustc_main) {
+    if has_rustc_main {
         EntryPointType::RustcMainAttr
     } else if let Some(name) = name
         && name == sym::main

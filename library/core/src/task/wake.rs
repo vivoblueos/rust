@@ -40,17 +40,14 @@ impl RawWaker {
     /// of the `vtable` as the first parameter.
     ///
     /// It is important to consider that the `data` pointer must point to a
-    /// thread safe type such as an `[Arc]<T: Send + Sync>`
+    /// thread safe type such as an `Arc<T: Send + Sync>`
     /// when used to construct a [`Waker`]. This restriction is lifted when
     /// constructing a [`LocalWaker`], which allows using types that do not implement
-    /// <code>[Send] + [Sync]</code> like `[Rc]<T>`.
+    /// <code>[Send] + [Sync]</code> like `Rc<T>`.
     ///
     /// The `vtable` customizes the behavior of a `Waker` which gets created
     /// from a `RawWaker`. For each operation on the `Waker`, the associated
     /// function in the `vtable` of the underlying `RawWaker` will be called.
-    ///
-    /// [`Arc`]: std::sync::Arc
-    /// [`Rc`]: std::rc::Rc
     #[inline]
     #[rustc_promotable]
     #[stable(feature = "futures_api", since = "1.36.0")]
@@ -60,7 +57,7 @@ impl RawWaker {
         RawWaker { data, vtable }
     }
 
-    #[unstable(feature = "noop_waker", issue = "98286")]
+    #[stable(feature = "noop_waker", since = "1.85.0")]
     const NOOP: RawWaker = {
         const VTABLE: RawWakerVTable = RawWakerVTable::new(
             // Cloning just returns a new no-op raw waker
@@ -107,6 +104,7 @@ impl RawWaker {
 /// synchronization. This is because [`LocalWaker`] is not thread safe itself, so it cannot
 /// be sent across threads.
 #[stable(feature = "futures_api", since = "1.36.0")]
+#[allow(unpredictable_function_pointer_comparisons)]
 #[derive(PartialEq, Copy, Clone, Debug)]
 pub struct RawWakerVTable {
     /// This function will be called when the [`RawWaker`] gets cloned, e.g. when
@@ -283,7 +281,6 @@ impl fmt::Debug for Context<'_> {
 /// # Examples
 /// ```
 /// #![feature(local_waker)]
-/// #![feature(noop_waker)]
 /// use std::task::{ContextBuilder, LocalWaker, Waker, Poll};
 /// use std::future::Future;
 ///
@@ -319,12 +316,11 @@ impl<'a> ContextBuilder<'a> {
     /// Creates a ContextBuilder from a Waker.
     #[inline]
     #[unstable(feature = "local_waker", issue = "118959")]
-    #[cfg_attr(bootstrap, rustc_const_stable(feature = "const_waker", since = "1.82.0"))]
     pub const fn from_waker(waker: &'a Waker) -> Self {
         // SAFETY: LocalWaker is just Waker without thread safety
         let local_waker = unsafe { transmute(waker) };
         Self {
-            waker: waker,
+            waker,
             local_waker,
             ext: ExtData::None(()),
             _marker: PhantomData,
@@ -373,7 +369,6 @@ impl<'a> ContextBuilder<'a> {
     /// Builds the `Context`.
     #[inline]
     #[unstable(feature = "local_waker", issue = "118959")]
-    #[cfg_attr(bootstrap, rustc_const_stable(feature = "const_waker", since = "1.82.0"))]
     pub const fn build(self) -> Context<'a> {
         let ContextBuilder { waker, local_waker, ext, _marker, _marker2 } = self;
         Context { waker, local_waker, ext: AssertUnwindSafe(ext), _marker, _marker2 }
@@ -408,7 +403,7 @@ impl<'a> ContextBuilder<'a> {
 /// [`Wake`]: ../../alloc/task/trait.Wake.html
 #[repr(transparent)]
 #[stable(feature = "futures_api", since = "1.36.0")]
-#[cfg_attr(not(test), rustc_diagnostic_item = "Waker")]
+#[rustc_diagnostic_item = "Waker"]
 pub struct Waker {
     waker: RawWaker,
 }
@@ -557,8 +552,6 @@ impl Waker {
     /// # Examples
     ///
     /// ```
-    /// #![feature(noop_waker)]
-    ///
     /// use std::future::Future;
     /// use std::task;
     ///
@@ -569,7 +562,8 @@ impl Waker {
     /// ```
     #[inline]
     #[must_use]
-    #[unstable(feature = "noop_waker", issue = "98286")]
+    #[stable(feature = "noop_waker", since = "1.85.0")]
+    #[rustc_const_stable(feature = "noop_waker", since = "1.85.0")]
     pub const fn noop() -> &'static Waker {
         const WAKER: &Waker = &Waker { waker: RawWaker::NOOP };
         WAKER
@@ -589,6 +583,28 @@ impl Waker {
     #[stable(feature = "waker_getters", since = "1.83.0")]
     pub fn vtable(&self) -> &'static RawWakerVTable {
         self.waker.vtable
+    }
+
+    /// Constructs a `Waker` from a function pointer.
+    #[inline]
+    #[must_use]
+    #[unstable(feature = "waker_from_fn_ptr", issue = "148457")]
+    pub const fn from_fn_ptr(f: fn()) -> Self {
+        // SAFETY: Unsafe is used for transmutes, pointer came from `fn()` so it
+        //         is sound to transmute it back to `fn()`.
+        static VTABLE: RawWakerVTable = unsafe {
+            RawWakerVTable::new(
+                |this| RawWaker::new(this, &VTABLE),
+                |this| transmute::<*const (), fn()>(this)(),
+                |this| transmute::<*const (), fn()>(this)(),
+                |_| {},
+            )
+        };
+        let raw = RawWaker::new(f as *const (), &VTABLE);
+
+        // SAFETY: `clone` is just a copy, `drop` is a no-op while `wake` and
+        //         `wake_by_ref` just call the function pointer.
+        unsafe { Self::from_raw(raw) }
     }
 }
 
@@ -852,8 +868,6 @@ impl LocalWaker {
     ///
     /// ```
     /// #![feature(local_waker)]
-    /// #![feature(noop_waker)]
-    ///
     /// use std::future::Future;
     /// use std::task::{ContextBuilder, LocalWaker, Waker, Poll};
     ///
@@ -866,7 +880,7 @@ impl LocalWaker {
     /// ```
     #[inline]
     #[must_use]
-    #[unstable(feature = "noop_waker", issue = "98286")]
+    #[unstable(feature = "local_waker", issue = "118959")]
     pub const fn noop() -> &'static LocalWaker {
         const WAKER: &LocalWaker = &LocalWaker { waker: RawWaker::NOOP };
         WAKER
@@ -886,6 +900,28 @@ impl LocalWaker {
     #[unstable(feature = "local_waker", issue = "118959")]
     pub fn vtable(&self) -> &'static RawWakerVTable {
         self.waker.vtable
+    }
+
+    /// Constructs a `LocalWaker` from a function pointer.
+    #[inline]
+    #[must_use]
+    #[unstable(feature = "waker_from_fn_ptr", issue = "148457")]
+    pub const fn from_fn_ptr(f: fn()) -> Self {
+        // SAFETY: Unsafe is used for transmutes, pointer came from `fn()` so it
+        //         is sound to transmute it back to `fn()`.
+        static VTABLE: RawWakerVTable = unsafe {
+            RawWakerVTable::new(
+                |this| RawWaker::new(this, &VTABLE),
+                |this| transmute::<*const (), fn()>(this)(),
+                |this| transmute::<*const (), fn()>(this)(),
+                |_| {},
+            )
+        };
+        let raw = RawWaker::new(f as *const (), &VTABLE);
+
+        // SAFETY: `clone` is just a copy, `drop` is a no-op while `wake` and
+        //         `wake_by_ref` just call the function pointer.
+        unsafe { Self::from_raw(raw) }
     }
 }
 #[unstable(feature = "local_waker", issue = "118959")]
@@ -909,7 +945,8 @@ impl Clone for LocalWaker {
 }
 
 #[unstable(feature = "local_waker", issue = "118959")]
-impl AsRef<LocalWaker> for Waker {
+#[rustc_const_unstable(feature = "const_convert", issue = "143773")]
+impl const AsRef<LocalWaker> for Waker {
     fn as_ref(&self) -> &LocalWaker {
         // SAFETY: LocalWaker is just Waker without thread safety
         unsafe { transmute(self) }

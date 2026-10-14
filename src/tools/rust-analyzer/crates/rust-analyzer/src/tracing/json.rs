@@ -2,7 +2,8 @@
 //!
 //! Usage:
 //!
-//! ```rust
+//! ```ignore
+//! # use tracing_subscriber::Registry;
 //! let layer = json::TimingLayer::new(std::io::stderr);
 //! Registry::default().with(layer).init();
 //! ```
@@ -11,10 +12,10 @@ use std::{io::Write as _, marker::PhantomData, time::Instant};
 
 use ide_db::FxHashSet;
 use tracing::{
-    span::{Attributes, Id},
     Event, Subscriber,
+    span::{Attributes, Id},
 };
-use tracing_subscriber::{fmt::MakeWriter, layer::Context, registry::LookupSpan, Layer};
+use tracing_subscriber::{Layer, fmt::MakeWriter, layer::Context, registry::LookupSpan};
 
 struct JsonData {
     name: &'static str,
@@ -54,7 +55,7 @@ where
     fn on_event(&self, _event: &Event<'_>, _ctx: Context<'_, S>) {}
 
     fn on_close(&self, id: Id, ctx: Context<'_, S>) {
-        #[derive(serde::Serialize)]
+        #[derive(serde_derive::Serialize)]
         struct JsonDataInner {
             name: &'static str,
             elapsed_ms: u128,

@@ -1,8 +1,9 @@
 //@ check-pass
+#![feature(specialization)]
 
 fn main() {}
 
-#[cfg(FALSE)]
+#[cfg(false)]
 trait X {
     default const A: u8;
     default const B: u8 = 0;

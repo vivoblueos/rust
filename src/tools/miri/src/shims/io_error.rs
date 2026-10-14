@@ -1,4 +1,5 @@
 use std::io;
+use std::io::ErrorKind;
 
 use crate::*;
 
@@ -12,6 +13,29 @@ pub enum IoError {
     Raw(Scalar),
 }
 pub use self::IoError::*;
+
+impl IoError {
+    pub(crate) fn into_ntstatus(self) -> i32 {
+        let raw = match self {
+            HostError(e) =>
+                match e.kind() {
+                    // STATUS_MEDIA_WRITE_PROTECTED
+                    ErrorKind::ReadOnlyFilesystem => 0xC00000A2u32,
+                    // STATUS_FILE_INVALID
+                    ErrorKind::InvalidInput => 0xC0000098,
+                    // STATUS_DISK_FULL
+                    ErrorKind::QuotaExceeded => 0xC000007F,
+                    // STATUS_ACCESS_DENIED
+                    ErrorKind::PermissionDenied => 0xC0000022,
+                    // For the default error code we arbitrarily pick 0xC0000185, STATUS_IO_DEVICE_ERROR.
+                    _ => 0xC0000185,
+                },
+            // For the default error code we arbitrarily pick 0xC0000185, STATUS_IO_DEVICE_ERROR.
+            _ => 0xC0000185,
+        };
+        raw.cast_signed()
+    }
+}
 
 impl From<io::Error> for IoError {
     fn from(value: io::Error) -> Self {
@@ -32,7 +56,7 @@ impl From<Scalar> for IoError {
 }
 
 // This mapping should match `decode_error_kind` in
-// <https://github.com/rust-lang/rust/blob/master/library/std/src/sys/pal/unix/mod.rs>.
+// <https://github.com/rust-lang/rust/blob/HEAD/library/std/src/sys/io/error/unix.rs>.
 const UNIX_IO_ERROR_TABLE: &[(&str, std::io::ErrorKind)] = {
     use std::io::ErrorKind::*;
     &[
@@ -44,7 +68,7 @@ const UNIX_IO_ERROR_TABLE: &[(&str, std::io::ErrorKind)] = {
         ("ECONNREFUSED", ConnectionRefused),
         ("ECONNRESET", ConnectionReset),
         ("EDEADLK", Deadlock),
-        ("EDQUOT", FilesystemQuotaExceeded),
+        ("EDQUOT", QuotaExceeded),
         ("EEXIST", AlreadyExists),
         ("EFBIG", FileTooLarge),
         ("EHOSTUNREACH", HostUnreachable),
@@ -70,6 +94,7 @@ const UNIX_IO_ERROR_TABLE: &[(&str, std::io::ErrorKind)] = {
         ("ETIMEDOUT", TimedOut),
         ("ETXTBSY", ExecutableFileBusy),
         ("EXDEV", CrossesDevices),
+        ("EINPROGRESS", InProgress),
         // The following have two valid options. We have both for the forwards mapping; only the
         // first one will be used for the backwards mapping.
         ("EPERM", PermissionDenied),
@@ -79,14 +104,75 @@ const UNIX_IO_ERROR_TABLE: &[(&str, std::io::ErrorKind)] = {
     ]
 };
 // This mapping should match `decode_error_kind` in
-// <https://github.com/rust-lang/rust/blob/master/library/std/src/sys/pal/windows/mod.rs>.
+// <https://github.com/rust-lang/rust/blob/HEAD/library/std/src/sys/io/error/windows.rs>.
 const WINDOWS_IO_ERROR_TABLE: &[(&str, std::io::ErrorKind)] = {
     use std::io::ErrorKind::*;
-    // FIXME: this is still incomplete.
+    // It's common for multiple error codes to map to the same io::ErrorKind. We have all for the
+    // forwards mapping; only the first one will be used for the backwards mapping.
+    // Slightly arbitrarily, we prefer non-WSA and the most generic sounding variant for backwards
+    // mapping.
     &[
-        ("ERROR_ACCESS_DENIED", PermissionDenied),
-        ("ERROR_FILE_NOT_FOUND", NotFound),
+        ("WSAEADDRINUSE", AddrInUse),
+        ("WSAEADDRNOTAVAIL", AddrNotAvailable),
+        ("ERROR_ALREADY_EXISTS", AlreadyExists),
+        ("ERROR_FILE_EXISTS", AlreadyExists),
+        ("ERROR_NO_DATA", BrokenPipe),
+        ("WSAECONNABORTED", ConnectionAborted),
+        ("WSAECONNREFUSED", ConnectionRefused),
+        ("WSAECONNRESET", ConnectionReset),
+        ("ERROR_NOT_SAME_DEVICE", CrossesDevices),
+        ("ERROR_POSSIBLE_DEADLOCK", Deadlock),
+        ("ERROR_DIR_NOT_EMPTY", DirectoryNotEmpty),
+        ("ERROR_CANT_RESOLVE_FILENAME", FilesystemLoop),
+        ("ERROR_DISK_QUOTA_EXCEEDED", QuotaExceeded),
+        ("WSAEDQUOT", QuotaExceeded),
+        ("ERROR_FILE_TOO_LARGE", FileTooLarge),
+        ("ERROR_HOST_UNREACHABLE", HostUnreachable),
+        ("WSAEHOSTUNREACH", HostUnreachable),
+        ("ERROR_INVALID_NAME", InvalidFilename),
+        ("ERROR_BAD_PATHNAME", InvalidFilename),
+        ("ERROR_FILENAME_EXCED_RANGE", InvalidFilename),
         ("ERROR_INVALID_PARAMETER", InvalidInput),
+        ("WSAEINVAL", InvalidInput),
+        ("ERROR_DIRECTORY_NOT_SUPPORTED", IsADirectory),
+        ("WSAENETDOWN", NetworkDown),
+        ("ERROR_NETWORK_UNREACHABLE", NetworkUnreachable),
+        ("WSAENETUNREACH", NetworkUnreachable),
+        ("ERROR_DIRECTORY", NotADirectory),
+        ("WSAENOTCONN", NotConnected),
+        ("ERROR_FILE_NOT_FOUND", NotFound),
+        ("ERROR_PATH_NOT_FOUND", NotFound),
+        ("ERROR_INVALID_DRIVE", NotFound),
+        ("ERROR_BAD_NETPATH", NotFound),
+        ("ERROR_BAD_NET_NAME", NotFound),
+        ("ERROR_SEEK_ON_DEVICE", NotSeekable),
+        ("ERROR_NOT_ENOUGH_MEMORY", OutOfMemory),
+        ("ERROR_OUTOFMEMORY", OutOfMemory),
+        ("ERROR_ACCESS_DENIED", PermissionDenied),
+        ("WSAEACCES", PermissionDenied),
+        ("ERROR_WRITE_PROTECT", ReadOnlyFilesystem),
+        ("ERROR_BUSY", ResourceBusy),
+        ("ERROR_DISK_FULL", StorageFull),
+        ("ERROR_HANDLE_DISK_FULL", StorageFull),
+        ("WAIT_TIMEOUT", TimedOut),
+        ("WSAETIMEDOUT", TimedOut),
+        ("ERROR_DRIVER_CANCEL_TIMEOUT", TimedOut),
+        ("ERROR_OPERATION_ABORTED", TimedOut),
+        ("ERROR_SERVICE_REQUEST_TIMEOUT", TimedOut),
+        ("ERROR_COUNTER_TIMEOUT", TimedOut),
+        ("ERROR_TIMEOUT", TimedOut),
+        ("ERROR_RESOURCE_CALL_TIMED_OUT", TimedOut),
+        ("ERROR_CTX_MODEM_RESPONSE_TIMEOUT", TimedOut),
+        ("ERROR_CTX_CLIENT_QUERY_TIMEOUT", TimedOut),
+        ("FRS_ERR_SYSVOL_POPULATE_TIMEOUT", TimedOut),
+        ("ERROR_DS_TIMELIMIT_EXCEEDED", TimedOut),
+        ("DNS_ERROR_RECORD_TIMED_OUT", TimedOut),
+        ("ERROR_IPSEC_IKE_TIMED_OUT", TimedOut),
+        ("ERROR_RUNLEVEL_SWITCH_TIMEOUT", TimedOut),
+        ("ERROR_RUNLEVEL_SWITCH_AGENT_TIMEOUT", TimedOut),
+        ("ERROR_TOO_MANY_LINKS", TooManyLinks),
+        ("ERROR_CALL_NOT_IMPLEMENTED", Unsupported),
+        ("WSAEWOULDBLOCK", WouldBlock),
     ]
 };
 

@@ -3,7 +3,7 @@ import * as os from "os";
 import * as path from "path";
 import * as readline from "readline";
 import * as vscode from "vscode";
-import { log, memoizeAsync, unwrapUndefinable } from "./util";
+import { Env, log, memoizeAsync, unwrapUndefinable } from "./util";
 import type { CargoRunnableArgs } from "./lsp_ext";
 
 interface CompilationArtifact {
@@ -18,11 +18,26 @@ export interface ArtifactSpec {
     filter?: (artifacts: CompilationArtifact[]) => CompilationArtifact[];
 }
 
+interface CompilerMessage {
+    reason: string;
+    executable?: string;
+    target: {
+        crate_types: [string, ...string[]];
+        kind: [string, ...string[]];
+        name: string;
+    };
+    profile: {
+        test: boolean;
+    };
+    message: {
+        rendered: string;
+    };
+}
+
 export class Cargo {
     constructor(
         readonly rootFolder: string,
-        readonly output: vscode.OutputChannel,
-        readonly env: Record<string, string>,
+        readonly env: Env,
     ) {}
 
     // Made public for testing purposes
@@ -77,15 +92,15 @@ export class Cargo {
                             });
                         }
                     } else if (message.reason === "compiler-message") {
-                        this.output.append(message.message.rendered);
+                        log.info(message.message.rendered);
                     }
                 },
-                (stderr) => this.output.append(stderr),
+                (stderr) => log.error(stderr),
                 env,
             );
         } catch (err) {
-            this.output.show(true);
-            throw new Error(`Cargo invocation has failed: ${err}`);
+            log.error(`Cargo invocation has failed: ${err}`);
+            throw new Error(`Cargo invocation has failed: ${err}`, { cause: err });
         }
 
         return spec.filter?.(artifacts) ?? artifacts;
@@ -109,7 +124,7 @@ export class Cargo {
 
     private async runCargo(
         cargoArgs: string[],
-        onStdoutJson: (obj: any) => void,
+        onStdoutJson: (obj: CompilerMessage) => void,
         onStderrString: (data: string) => void,
         env?: Record<string, string>,
     ): Promise<number> {
@@ -131,7 +146,7 @@ export class Cargo {
                 onStdoutJson(message);
             });
 
-            cargo.on("exit", (exitCode, _) => {
+            cargo.on("exit", (exitCode) => {
                 if (exitCode === 0) resolve(exitCode);
                 else reject(new Error(`exit code: ${exitCode}.`));
             });
@@ -141,7 +156,7 @@ export class Cargo {
 
 /** Mirrors `toolchain::cargo()` implementation */
 // FIXME: The server should provide this
-export function cargoPath(env?: Record<string, string>): Promise<string> {
+export function cargoPath(env?: Env): Promise<string> {
     if (env?.["RUSTC_TOOLCHAIN"]) {
         return Promise.resolve("cargo");
     }

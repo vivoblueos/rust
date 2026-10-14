@@ -3,7 +3,6 @@
 //
 //@ compile-flags: -Zincremental-ignore-spans
 //@ revisions: cpass cfail
-//@ error-pattern: cycle detected when computing type of `Bar::N`
 
 #![feature(trait_alias)]
 #![crate_type="lib"]
@@ -13,5 +12,6 @@ trait Bar<const N: usize> {}
 
 #[cfg(cfail)]
 trait Bar<const N: dyn BB> {}
+//[cfail]~^ ERROR cycle detected when computing type of `Bar::N`
 
 trait BB = Bar<{ 2 + 1 }>;

@@ -1,28 +1,20 @@
+//@ add-minicore
 //@ revisions: x86_64 aarch64
+//@ reference: asm.ts-args.at-least-once
+//@ reference: asm.template-modifiers.only-one
 
 //@ [x86_64] compile-flags: --target x86_64-unknown-linux-gnu
 //@ [aarch64] compile-flags: --target aarch64-unknown-linux-gnu
 
 //@ [x86_64] needs-llvm-components: x86
 //@ [aarch64] needs-llvm-components: aarch64
+//@ ignore-backends: gcc
 
-#![feature(no_core, lang_items, rustc_attrs)]
+#![feature(no_core)]
 #![no_core]
 
-#[rustc_builtin_macro]
-macro_rules! asm {
-    () => {};
-}
-#[rustc_builtin_macro]
-macro_rules! global_asm {
-    () => {};
-}
-
-#[lang = "sized"]
-trait Sized {}
-
-#[lang = "copy"]
-trait Copy {}
+extern crate minicore;
+use minicore::*;
 
 fn main() {
     let mut foo = 0;

@@ -1,26 +1,28 @@
+use std::borrow::Cow;
+use std::ops::ControlFlow;
+
 use super::NEEDLESS_COLLECT;
 use clippy_utils::diagnostics::{span_lint_and_sugg, span_lint_hir_and_then};
+use clippy_utils::res::{MaybeDef, MaybeResPath, MaybeTypeckRes};
 use clippy_utils::source::{snippet, snippet_with_applicability};
 use clippy_utils::sugg::Sugg;
-use clippy_utils::ty::{get_type_diagnostic_name, make_normalized_projection, make_projection};
-use clippy_utils::{
-    CaptureKind, can_move_expr_to_closure, fn_def_id, get_enclosing_block, higher, is_trait_method, path_to_local,
-    path_to_local_id,
-};
+use clippy_utils::ty::{has_non_owning_mutable_access, make_normalized_projection, make_projection};
+use clippy_utils::{CaptureKind, can_move_expr_to_closure, fn_def_id, get_enclosing_block, higher, sym};
 use rustc_data_structures::fx::FxHashMap;
 use rustc_errors::{Applicability, MultiSpan};
-use rustc_hir::intravisit::{Visitor, walk_block, walk_expr};
+use rustc_hir::intravisit::{Visitor, walk_block, walk_expr, walk_stmt};
 use rustc_hir::{
-    BindingMode, Block, Expr, ExprKind, HirId, HirIdSet, LetStmt, Mutability, Node, PatKind, Stmt, StmtKind,
+    BindingMode, Block, Expr, ExprKind, HirId, HirIdSet, LetStmt, Mutability, Node, Pat, PatKind, Stmt, StmtKind,
 };
 use rustc_lint::LateContext;
 use rustc_middle::hir::nested_filter;
-use rustc_middle::ty::{self, AssocKind, ClauseKind, EarlyBinder, GenericArg, GenericArgKind, Ty};
+use rustc_middle::ty::{self, AssocTag, ClauseKind, EarlyBinder, GenericArg, GenericArgKind, Ty};
 use rustc_span::symbol::Ident;
-use rustc_span::{Span, sym};
+use rustc_span::{Span, Symbol};
 
 const NEEDLESS_COLLECT_MSG: &str = "avoid using `collect()` when not needed";
 
+#[expect(clippy::too_many_lines)]
 pub(super) fn check<'tcx>(
     cx: &LateContext<'tcx>,
     name_span: Span,
@@ -28,17 +30,24 @@ pub(super) fn check<'tcx>(
     iter_expr: &'tcx Expr<'tcx>,
     call_span: Span,
 ) {
+    let iter_ty = cx.typeck_results().expr_ty(iter_expr);
+    if has_non_owning_mutable_access(cx, iter_ty) {
+        return; // don't lint if the iterator has side effects
+    }
+
     match cx.tcx.parent_hir_node(collect_expr.hir_id) {
         Node::Expr(parent) => {
             check_collect_into_intoiterator(cx, parent, collect_expr, call_span, iter_expr);
 
+            let sugg: String;
+            let mut app;
+
             if let ExprKind::MethodCall(name, _, args @ ([] | [_]), _) = parent.kind {
-                let mut app = Applicability::MachineApplicable;
-                let name = name.ident.as_str();
+                app = Applicability::MachineApplicable;
                 let collect_ty = cx.typeck_results().expr_ty(collect_expr);
 
-                let sugg: String = match name {
-                    "len" => {
+                sugg = match name.ident.name {
+                    sym::len => {
                         if let Some(adt) = collect_ty.ty_adt_def()
                             && matches!(
                                 cx.tcx.get_diagnostic_name(adt.did()),
@@ -50,13 +59,13 @@ pub(super) fn check<'tcx>(
                             return;
                         }
                     },
-                    "is_empty"
+                    sym::is_empty
                         if is_is_empty_sig(cx, parent.hir_id)
                             && iterates_same_ty(cx, cx.typeck_results().expr_ty(iter_expr), collect_ty) =>
                     {
                         "next().is_none()".into()
                     },
-                    "contains" => {
+                    sym::contains => {
                         if is_contains_sig(cx, parent.hir_id, iter_expr)
                             && let Some(arg) = args.first()
                         {
@@ -73,33 +82,50 @@ pub(super) fn check<'tcx>(
                     },
                     _ => return,
                 };
-
-                span_lint_and_sugg(
-                    cx,
-                    NEEDLESS_COLLECT,
-                    call_span.with_hi(parent.span.hi()),
-                    NEEDLESS_COLLECT_MSG,
-                    "replace with",
-                    sugg,
-                    app,
-                );
+            } else if let ExprKind::Index(_, index, _) = parent.kind
+                && cx.typeck_results().expr_ty(index).is_usize()
+            {
+                app = Applicability::MaybeIncorrect;
+                let snip = snippet_with_applicability(cx, index.span, "_", &mut app);
+                sugg = format!("nth({snip}).unwrap()");
+            } else {
+                return;
             }
+
+            span_lint_and_sugg(
+                cx,
+                NEEDLESS_COLLECT,
+                call_span.with_hi(parent.span.hi()),
+                NEEDLESS_COLLECT_MSG,
+                "replace with",
+                sugg,
+                app,
+            );
         },
         Node::LetStmt(l) => {
             if let PatKind::Binding(BindingMode::NONE | BindingMode::MUT, id, _, None) = l.pat.kind
                 && let ty = cx.typeck_results().expr_ty(collect_expr)
-                && matches!(
-                    get_type_diagnostic_name(cx, ty),
-                    Some(sym::Vec | sym::VecDeque | sym::BinaryHeap | sym::LinkedList)
-                )
+                && let Some(extra_spec) = ty.opt_diag_name(cx).and_then(ExtraFunctionSpec::new)
                 && let iter_ty = cx.typeck_results().expr_ty(iter_expr)
                 && let Some(block) = get_enclosing_block(cx, l.hir_id)
-                && let Some(iter_calls) = detect_iter_and_into_iters(block, id, cx, get_captured_ids(cx, iter_ty))
+                && let Some((iter_calls, extra_calls)) =
+                    detect_iter_and_into_iters(block, id, cx, get_captured_ids(cx, iter_ty), extra_spec)
                 && let [iter_call] = &*iter_calls
             {
-                let mut used_count_visitor = UsedCountVisitor { cx, id, count: 0 };
+                let mut used_count_visitor = UsedCountVisitor {
+                    cx,
+                    id,
+                    extra_spec,
+                    count: 0,
+                };
                 walk_block(&mut used_count_visitor, block);
                 if used_count_visitor.count > 1 {
+                    return;
+                }
+
+                if let IterFunctionKind::IntoIter(hir_id) = iter_call.func
+                    && !check_iter_expr_used_only_as_iterator(cx, hir_id, block)
+                {
                     return;
                 }
 
@@ -113,11 +139,24 @@ pub(super) fn check<'tcx>(
                     span,
                     NEEDLESS_COLLECT_MSG,
                     |diag| {
-                        let iter_replacement =
-                            format!("{}{}", Sugg::hir(cx, iter_expr, ".."), iter_call.get_iter_method(cx));
+                        let iter_snippet = Sugg::hir(cx, iter_expr, "..");
+                        let mut iter_replacement = iter_snippet.to_string();
+                        for extra in &extra_calls {
+                            iter_replacement = extra.apply_iter_method(cx, &iter_replacement);
+                        }
+                        iter_replacement.push_str(&iter_call.get_iter_method(cx));
+
+                        let mut remove_suggestions = vec![(l.span, String::new())];
+                        remove_suggestions.extend(
+                            extra_calls
+                                .iter()
+                                .flat_map(|extra| extra.span().map(|s| (s, String::new()))),
+                        );
+                        remove_suggestions.push((iter_call.span, iter_replacement));
+
                         diag.multipart_suggestion(
                             iter_call.get_suggestion_text(),
-                            vec![(l.span, String::new()), (iter_call.span, iter_replacement)],
+                            remove_suggestions,
                             Applicability::MaybeIncorrect,
                         );
                     },
@@ -203,11 +242,12 @@ fn is_is_empty_sig(cx: &LateContext<'_>, call_id: HirId) -> bool {
 fn iterates_same_ty<'tcx>(cx: &LateContext<'tcx>, iter_ty: Ty<'tcx>, collect_ty: Ty<'tcx>) -> bool {
     if let Some(iter_trait) = cx.tcx.get_diagnostic_item(sym::Iterator)
         && let Some(into_iter_trait) = cx.tcx.get_diagnostic_item(sym::IntoIterator)
-        && let Some(iter_item_ty) = make_normalized_projection(cx.tcx, cx.typing_env(), iter_trait, sym::Item, [iter_ty])
+        && let Some(iter_item_ty) =
+            make_normalized_projection(cx.tcx, cx.typing_env(), iter_trait, sym::Item, [iter_ty])
         && let Some(into_iter_item_proj) = make_projection(cx.tcx, into_iter_trait, sym::Item, [collect_ty])
         && let Ok(into_iter_item_ty) = cx.tcx.try_normalize_erasing_regions(
             cx.typing_env(),
-            Ty::new_projection_from_args(cx.tcx, into_iter_item_proj.def_id, into_iter_item_proj.args),
+            Ty::new_projection_from_args(cx.tcx, into_iter_item_proj.kind.def_id(), into_iter_item_proj.args),
         )
     {
         iter_item_ty == into_iter_item_ty
@@ -229,10 +269,10 @@ fn is_contains_sig(cx: &LateContext<'_>, call_id: HirId, iter_expr: &Expr<'_>) -
             .instantiate_bound_regions_with_erased(sig.rebind(search_ty))
             .kind()
         && let Some(iter_trait) = cx.tcx.get_diagnostic_item(sym::Iterator)
-        && let Some(iter_item) = cx.tcx.associated_items(iter_trait).find_by_name_and_kind(
+        && let Some(iter_item) = cx.tcx.associated_items(iter_trait).find_by_ident_and_kind(
             cx.tcx,
             Ident::with_dummy_span(sym::Item),
-            AssocKind::Type,
+            AssocTag::Type,
             iter_trait,
         )
         && let args = cx.tcx.mk_args(&[GenericArg::from(typeck.expr_ty_adjusted(iter_expr))])
@@ -249,10 +289,11 @@ struct IterFunction {
     func: IterFunctionKind,
     span: Span,
 }
+
 impl IterFunction {
     fn get_iter_method(&self, cx: &LateContext<'_>) -> String {
         match &self.func {
-            IterFunctionKind::IntoIter => String::new(),
+            IterFunctionKind::IntoIter(_) => String::new(),
             IterFunctionKind::Len => String::from(".count()"),
             IterFunctionKind::IsEmpty => String::from(".next().is_none()"),
             IterFunctionKind::Contains(span) => {
@@ -265,9 +306,10 @@ impl IterFunction {
             },
         }
     }
+
     fn get_suggestion_text(&self) -> &'static str {
         match &self.func {
-            IterFunctionKind::IntoIter => {
+            IterFunctionKind::IntoIter(_) => {
                 "use the original Iterator instead of collecting it and then producing a new one"
             },
             IterFunctionKind::Len => {
@@ -282,11 +324,112 @@ impl IterFunction {
         }
     }
 }
+
 enum IterFunctionKind {
-    IntoIter,
+    IntoIter(HirId),
     Len,
     IsEmpty,
     Contains(Span),
+}
+
+struct ExtraFunctionSpan {
+    /// Span of the function call
+    func_span: Span,
+    /// Span of the argument
+    arg_span: Span,
+}
+
+enum ExtraFunction {
+    Push {
+        back: Vec<ExtraFunctionSpan>,
+        front: Vec<ExtraFunctionSpan>,
+    },
+    Extend(ExtraFunctionSpan),
+}
+
+impl ExtraFunction {
+    fn apply_iter_method(&self, cx: &LateContext<'_>, inner: &str) -> String {
+        match &self {
+            ExtraFunction::Push { back, front } => {
+                let back_sugg = back
+                    .iter()
+                    .map(|span| snippet(cx, span.arg_span, ".."))
+                    .intersperse(Cow::Borrowed(", "))
+                    .collect::<String>();
+                let front = front
+                    .iter()
+                    .map(|span| snippet(cx, span.arg_span, ".."))
+                    .intersperse(Cow::Borrowed(", "))
+                    .collect::<String>();
+                match (front.is_empty(), back_sugg.is_empty()) {
+                    (true, true) => inner.to_string(),
+                    (true, false) => format!("{inner}.chain([{back_sugg}])"),
+                    (false, true) => format!("[{front}].into_iter().chain({inner})"),
+                    (false, false) => format!("[{front}].into_iter().chain({inner}).chain([{back_sugg}])"),
+                }
+            },
+            ExtraFunction::Extend(span) => {
+                let s = snippet(cx, span.arg_span, "..");
+                format!("{inner}.chain({s})")
+            },
+        }
+    }
+
+    fn span(&self) -> Box<dyn Iterator<Item = Span> + '_> {
+        match &self {
+            ExtraFunction::Push { back, front } => Box::new(
+                back.iter()
+                    .map(|s| s.func_span)
+                    .chain(front.iter().map(|s| s.func_span)),
+            ),
+            ExtraFunction::Extend(span) => Box::new(std::iter::once(span.func_span)),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ExtraFunctionPushSpec {
+    back: Option<Symbol>,
+    front: Option<Symbol>,
+}
+
+#[derive(Clone, Copy)]
+struct ExtraFunctionSpec {
+    push_symbol: ExtraFunctionPushSpec,
+    extend_symbol: Option<Symbol>,
+}
+
+impl ExtraFunctionSpec {
+    fn new(target: Symbol) -> Option<Self> {
+        match target {
+            sym::Vec => Some(ExtraFunctionSpec {
+                push_symbol: ExtraFunctionPushSpec {
+                    back: Some(sym::push),
+                    front: None,
+                },
+                extend_symbol: Some(sym::extend),
+            }),
+            sym::VecDeque | sym::LinkedList => Some(ExtraFunctionSpec {
+                push_symbol: ExtraFunctionPushSpec {
+                    back: Some(sym::push_back),
+                    front: Some(sym::push_front),
+                },
+                extend_symbol: Some(sym::extend),
+            }),
+            sym::BinaryHeap => Some(ExtraFunctionSpec {
+                push_symbol: ExtraFunctionPushSpec {
+                    back: None,
+                    front: None,
+                },
+                extend_symbol: None,
+            }),
+            _ => None,
+        }
+    }
+
+    fn is_extra_function(self, name: Symbol) -> bool {
+        self.push_symbol.back == Some(name) || self.push_symbol.front == Some(name) || self.extend_symbol == Some(name)
+    }
 }
 
 struct IterFunctionVisitor<'a, 'tcx> {
@@ -294,11 +437,14 @@ struct IterFunctionVisitor<'a, 'tcx> {
     current_mutably_captured_ids: HirIdSet,
     cx: &'a LateContext<'tcx>,
     uses: Vec<Option<IterFunction>>,
+    extras: Vec<ExtraFunction>,
+    extra_spec: ExtraFunctionSpec,
     hir_id_uses_map: FxHashMap<HirId, usize>,
     current_statement_hir_id: Option<HirId>,
     seen_other: bool,
     target: HirId,
 }
+
 impl<'tcx> Visitor<'tcx> for IterFunctionVisitor<'_, 'tcx> {
     fn visit_block(&mut self, block: &'tcx Block<'tcx>) {
         for (expr, hir_id) in block.stmts.iter().filter_map(get_expr_and_hir_id_from_stmt) {
@@ -318,19 +464,24 @@ impl<'tcx> Visitor<'tcx> for IterFunctionVisitor<'_, 'tcx> {
         }
     }
 
+    #[expect(clippy::too_many_lines)]
     fn visit_expr(&mut self, expr: &'tcx Expr<'tcx>) {
         // Check function calls on our collection
         if let ExprKind::MethodCall(method_name, recv, args, _) = &expr.kind {
             if args.is_empty()
-                && method_name.ident.name.as_str() == "collect"
-                && is_trait_method(self.cx, expr, sym::Iterator)
+                && method_name.ident.name == sym::collect
+                && self
+                    .cx
+                    .ty_based_def(expr)
+                    .opt_parent(self.cx)
+                    .is_diag_item(self.cx, sym::Iterator)
             {
                 self.current_mutably_captured_ids = get_captured_ids(self.cx, self.cx.typeck_results().expr_ty(recv));
                 self.visit_expr(recv);
                 return;
             }
 
-            if path_to_local_id(recv, self.target) {
+            if recv.res_local_id() == Some(self.target) {
                 if self
                     .illegal_mutable_capture_ids
                     .intersection(&self.current_mutably_captured_ids)
@@ -340,23 +491,70 @@ impl<'tcx> Visitor<'tcx> for IterFunctionVisitor<'_, 'tcx> {
                     if let Some(hir_id) = self.current_statement_hir_id {
                         self.hir_id_uses_map.insert(hir_id, self.uses.len());
                     }
-                    match method_name.ident.name.as_str() {
-                        "into_iter" => self.uses.push(Some(IterFunction {
-                            func: IterFunctionKind::IntoIter,
+                    match method_name.ident.name {
+                        sym::into_iter => self.uses.push(Some(IterFunction {
+                            func: IterFunctionKind::IntoIter(expr.hir_id),
                             span: expr.span,
                         })),
-                        "len" => self.uses.push(Some(IterFunction {
+                        sym::len => self.uses.push(Some(IterFunction {
                             func: IterFunctionKind::Len,
                             span: expr.span,
                         })),
-                        "is_empty" => self.uses.push(Some(IterFunction {
+                        sym::is_empty => self.uses.push(Some(IterFunction {
                             func: IterFunctionKind::IsEmpty,
                             span: expr.span,
                         })),
-                        "contains" => self.uses.push(Some(IterFunction {
+                        sym::contains => self.uses.push(Some(IterFunction {
                             func: IterFunctionKind::Contains(args[0].span),
                             span: expr.span,
                         })),
+                        name if let is_push_back = self.extra_spec.push_symbol.back.is_some_and(|sym| name == sym)
+                            && (is_push_back || self.extra_spec.push_symbol.front.is_some_and(|sym| name == sym))
+                            && self.uses.is_empty() =>
+                        {
+                            let span = get_span_of_expr_or_parent_stmt(self.cx, expr);
+                            match self.extras.last_mut() {
+                                Some(ExtraFunction::Push { back, .. }) if is_push_back => {
+                                    back.push(ExtraFunctionSpan {
+                                        func_span: span,
+                                        arg_span: args[0].span,
+                                    });
+                                },
+                                Some(ExtraFunction::Push { front, .. }) => {
+                                    front.push(ExtraFunctionSpan {
+                                        func_span: span,
+                                        arg_span: args[0].span,
+                                    });
+                                },
+                                _ if is_push_back => {
+                                    self.extras.push(ExtraFunction::Push {
+                                        back: vec![ExtraFunctionSpan {
+                                            func_span: span,
+                                            arg_span: args[0].span,
+                                        }],
+                                        front: Vec::new(),
+                                    });
+                                },
+                                _ => {
+                                    self.extras.push(ExtraFunction::Push {
+                                        back: Vec::new(),
+                                        front: vec![ExtraFunctionSpan {
+                                            func_span: span,
+                                            arg_span: args[0].span,
+                                        }],
+                                    });
+                                },
+                            }
+                        },
+                        name if self.extra_spec.extend_symbol.is_some_and(|sym| name == sym)
+                            && self.uses.is_empty() =>
+                        {
+                            let span = get_span_of_expr_or_parent_stmt(self.cx, expr);
+                            self.extras.push(ExtraFunction::Extend(ExtraFunctionSpan {
+                                func_span: span,
+                                arg_span: args[0].span,
+                            }));
+                        },
                         _ => {
                             self.seen_other = true;
                             if let Some(hir_id) = self.current_statement_hir_id {
@@ -368,29 +566,39 @@ impl<'tcx> Visitor<'tcx> for IterFunctionVisitor<'_, 'tcx> {
                 return;
             }
 
-            if let Some(hir_id) = path_to_local(recv) {
-                if let Some(index) = self.hir_id_uses_map.remove(&hir_id) {
-                    if self
-                        .illegal_mutable_capture_ids
-                        .intersection(&self.current_mutably_captured_ids)
-                        .next()
-                        .is_none()
-                    {
-                        if let Some(hir_id) = self.current_statement_hir_id {
-                            self.hir_id_uses_map.insert(hir_id, index);
-                        }
-                    } else {
-                        self.uses[index] = None;
+            if let Some(hir_id) = recv.res_local_id()
+                && let Some(index) = self.hir_id_uses_map.remove(&hir_id)
+            {
+                if self
+                    .illegal_mutable_capture_ids
+                    .intersection(&self.current_mutably_captured_ids)
+                    .next()
+                    .is_none()
+                {
+                    if let Some(hir_id) = self.current_statement_hir_id {
+                        self.hir_id_uses_map.insert(hir_id, index);
                     }
+                } else {
+                    self.uses[index] = None;
                 }
             }
         }
         // Check if the collection is used for anything else
-        if path_to_local_id(expr, self.target) {
+        if expr.res_local_id() == Some(self.target) {
             self.seen_other = true;
         } else {
             walk_expr(self, expr);
         }
+    }
+}
+
+/// If parent of the `expr` is a statement, return the span of the statement, otherwise return the
+/// span of the expression.
+fn get_span_of_expr_or_parent_stmt<'tcx>(cx: &LateContext<'tcx>, expr: &'tcx Expr<'tcx>) -> Span {
+    if let Node::Stmt(stmt) = cx.tcx.parent_hir_node(expr.hir_id) {
+        stmt.span
+    } else {
+        expr.span
     }
 }
 
@@ -441,6 +649,7 @@ fn get_expr_and_hir_id_from_stmt<'v>(stmt: &'v Stmt<'v>) -> Option<(&'v Expr<'v>
 struct UsedCountVisitor<'a, 'tcx> {
     cx: &'a LateContext<'tcx>,
     id: HirId,
+    extra_spec: ExtraFunctionSpec,
     count: usize,
 }
 
@@ -448,15 +657,24 @@ impl<'tcx> Visitor<'tcx> for UsedCountVisitor<'_, 'tcx> {
     type NestedFilter = nested_filter::OnlyBodies;
 
     fn visit_expr(&mut self, expr: &'tcx Expr<'_>) {
-        if path_to_local_id(expr, self.id) {
-            self.count += 1;
-        } else {
+        if expr.res_local_id() != Some(self.id) {
             walk_expr(self, expr);
+            return;
         }
+
+        let parent = self.cx.tcx.parent_hir_node(expr.hir_id);
+        if let Node::Expr(expr) = parent
+            && let ExprKind::MethodCall(method_name, _, _, _) = &expr.kind
+            && self.extra_spec.is_extra_function(method_name.ident.name)
+        {
+            return;
+        }
+
+        self.count += 1;
     }
 
-    fn nested_visit_map(&mut self) -> Self::Map {
-        self.cx.tcx.hir()
+    fn maybe_tcx(&mut self) -> Self::MaybeTyCtxt {
+        self.cx.tcx
     }
 }
 
@@ -467,22 +685,25 @@ fn detect_iter_and_into_iters<'tcx: 'a, 'a>(
     id: HirId,
     cx: &'a LateContext<'tcx>,
     captured_ids: HirIdSet,
-) -> Option<Vec<IterFunction>> {
+    extra_spec: ExtraFunctionSpec,
+) -> Option<(Vec<IterFunction>, Vec<ExtraFunction>)> {
     let mut visitor = IterFunctionVisitor {
-        uses: Vec::new(),
-        target: id,
-        seen_other: false,
-        cx,
-        current_mutably_captured_ids: HirIdSet::default(),
         illegal_mutable_capture_ids: captured_ids,
+        current_mutably_captured_ids: HirIdSet::default(),
+        cx,
+        uses: Vec::new(),
+        extras: Vec::new(),
+        extra_spec,
         hir_id_uses_map: FxHashMap::default(),
         current_statement_hir_id: None,
+        seen_other: false,
+        target: id,
     };
     visitor.visit_block(block);
     if visitor.seen_other {
         None
     } else {
-        Some(visitor.uses.into_iter().flatten().collect())
+        Some((visitor.uses.into_iter().flatten().collect(), visitor.extras))
     }
 }
 
@@ -491,13 +712,13 @@ fn get_captured_ids(cx: &LateContext<'_>, ty: Ty<'_>) -> HirIdSet {
         match ty.kind() {
             ty::Adt(_, generics) => {
                 for generic in *generics {
-                    if let GenericArgKind::Type(ty) = generic.unpack() {
+                    if let GenericArgKind::Type(ty) = generic.kind() {
                         get_captured_ids_recursive(cx, ty, set);
                     }
                 }
             },
             ty::Closure(def_id, _) => {
-                let closure_hir_node = cx.tcx.hir().get_if_local(*def_id).unwrap();
+                let closure_hir_node = cx.tcx.hir_get_if_local(*def_id).unwrap();
                 if let Node::Expr(closure_expr) = closure_hir_node {
                     can_move_expr_to_closure(cx, closure_expr)
                         .unwrap()
@@ -518,4 +739,66 @@ fn get_captured_ids(cx: &LateContext<'_>, ty: Ty<'_>) -> HirIdSet {
     get_captured_ids_recursive(cx, ty, &mut set);
 
     set
+}
+
+struct IteratorMethodCheckVisitor<'a, 'tcx> {
+    cx: &'a LateContext<'tcx>,
+    hir_id_of_expr: HirId,
+    hir_id_of_let_binding: Option<HirId>,
+}
+
+impl<'tcx> Visitor<'tcx> for IteratorMethodCheckVisitor<'_, 'tcx> {
+    type Result = ControlFlow<()>;
+    fn visit_expr(&mut self, expr: &'tcx Expr<'tcx>) -> ControlFlow<()> {
+        if let ExprKind::MethodCall(_method_name, recv, _args, _) = &expr.kind
+            && (recv.hir_id == self.hir_id_of_expr
+                || self
+                    .hir_id_of_let_binding
+                    .is_some_and(|hid| recv.res_local_id() == Some(hid)))
+            && !self
+                .cx
+                .ty_based_def(expr)
+                .opt_parent(self.cx)
+                .is_diag_item(self.cx, sym::Iterator)
+        {
+            return ControlFlow::Break(());
+        } else if let ExprKind::Assign(place, value, _span) = &expr.kind
+            && value.hir_id == self.hir_id_of_expr
+            && let Some(id) = place.res_local_id()
+        {
+            // our iterator was directly assigned to a variable
+            self.hir_id_of_let_binding = Some(id);
+        }
+        walk_expr(self, expr)
+    }
+    fn visit_stmt(&mut self, stmt: &'tcx Stmt<'tcx>) -> ControlFlow<()> {
+        if let StmtKind::Let(LetStmt {
+            init: Some(expr),
+            pat:
+                Pat {
+                    kind: PatKind::Binding(BindingMode::NONE | BindingMode::MUT, id, _, None),
+                    ..
+                },
+            ..
+        }) = &stmt.kind
+            && expr.hir_id == self.hir_id_of_expr
+        {
+            // our iterator was directly assigned to a variable
+            self.hir_id_of_let_binding = Some(*id);
+        }
+        walk_stmt(self, stmt)
+    }
+}
+
+fn check_iter_expr_used_only_as_iterator<'tcx>(
+    cx: &LateContext<'tcx>,
+    hir_id_of_expr: HirId,
+    block: &'tcx Block<'tcx>,
+) -> bool {
+    let mut visitor = IteratorMethodCheckVisitor {
+        cx,
+        hir_id_of_expr,
+        hir_id_of_let_binding: None,
+    };
+    visitor.visit_block(block).is_continue()
 }

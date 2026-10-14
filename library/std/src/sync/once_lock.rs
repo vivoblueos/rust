@@ -1,3 +1,4 @@
+use super::once::OnceExclusiveState;
 use crate::cell::UnsafeCell;
 use crate::fmt;
 use crate::marker::PhantomData;
@@ -12,6 +13,11 @@ use crate::sync::Once;
 /// with less effort: `LazyLock<T, F>` "looks like" `&T` because it initializes with `F` on deref!
 /// Where OnceLock shines is when LazyLock is too simple to support a given case, as LazyLock
 /// doesn't allow additional inputs to its function after you call [`LazyLock::new(|| ...)`].
+///
+/// A `OnceLock` can be thought of as a safe abstraction over uninitialized data that becomes
+/// initialized once written.
+///
+/// Unlike [`Mutex`](crate::sync::Mutex), `OnceLock` is never poisoned on panic.
 ///
 /// [`OnceCell`]: crate::cell::OnceCell
 /// [`LazyLock<T, F>`]: crate::sync::LazyLock
@@ -101,6 +107,7 @@ use crate::sync::Once;
 /// ```
 #[stable(feature = "once_cell", since = "1.70.0")]
 pub struct OnceLock<T> {
+    // FIXME(nonpoison_once): switch to nonpoison version once it is available
     once: Once,
     // Whether or not the value is initialized is tracked by `once.is_completed()`.
     value: UnsafeCell<MaybeUninit<T>>,
@@ -125,7 +132,7 @@ pub struct OnceLock<T> {
 }
 
 impl<T> OnceLock<T> {
-    /// Creates a new empty cell.
+    /// Creates a new uninitialized cell.
     #[inline]
     #[must_use]
     #[stable(feature = "once_cell", since = "1.70.0")]
@@ -140,13 +147,14 @@ impl<T> OnceLock<T> {
 
     /// Gets the reference to the underlying value.
     ///
-    /// Returns `None` if the cell is empty, or being initialized. This
-    /// method never blocks.
+    /// Returns `None` if the cell is uninitialized, or being initialized.
+    /// This method never blocks.
     #[inline]
     #[stable(feature = "once_cell", since = "1.70.0")]
+    #[rustc_should_not_be_called_on_const_items]
     pub fn get(&self) -> Option<&T> {
-        if self.is_initialized() {
-            // Safe b/c checked is_initialized
+        if self.initialized() {
+            // Safe b/c checked initialized
             Some(unsafe { self.get_unchecked() })
         } else {
             None
@@ -155,12 +163,16 @@ impl<T> OnceLock<T> {
 
     /// Gets the mutable reference to the underlying value.
     ///
-    /// Returns `None` if the cell is empty. This method never blocks.
+    /// Returns `None` if the cell is uninitialized.
+    ///
+    /// This method never blocks. Since it borrows the `OnceLock` mutably,
+    /// it is statically guaranteed that no active borrows to the `OnceLock`
+    /// exist, including from other threads.
     #[inline]
     #[stable(feature = "once_cell", since = "1.70.0")]
     pub fn get_mut(&mut self) -> Option<&mut T> {
-        if self.is_initialized() {
-            // Safe b/c checked is_initialized and we have a unique access
+        if self.initialized_mut() {
+            // Safe b/c checked initialized and we have a unique access
             Some(unsafe { self.get_unchecked_mut() })
         } else {
             None
@@ -173,8 +185,6 @@ impl<T> OnceLock<T> {
     ///
     /// Waiting for a computation on another thread to finish:
     /// ```rust
-    /// #![feature(once_wait)]
-    ///
     /// use std::thread;
     /// use std::sync::OnceLock;
     ///
@@ -188,19 +198,21 @@ impl<T> OnceLock<T> {
     /// })
     /// ```
     #[inline]
-    #[unstable(feature = "once_wait", issue = "127527")]
+    #[stable(feature = "once_wait", since = "1.86.0")]
+    #[rustc_should_not_be_called_on_const_items]
     pub fn wait(&self) -> &T {
         self.once.wait_force();
 
         unsafe { self.get_unchecked() }
     }
 
-    /// Sets the contents of this cell to `value`.
+    /// Initializes the contents of the cell to `value`.
     ///
     /// May block if another thread is currently attempting to initialize the cell. The cell is
-    /// guaranteed to contain a value when set returns, though not necessarily the one provided.
+    /// guaranteed to contain a value when `set` returns, though not necessarily the one provided.
     ///
-    /// Returns `Ok(())` if the cell's value was set by this call.
+    /// Returns `Ok(())` if the cell was uninitialized and
+    /// `Err(value)` if the cell was already initialized.
     ///
     /// # Examples
     ///
@@ -222,6 +234,7 @@ impl<T> OnceLock<T> {
     /// ```
     #[inline]
     #[stable(feature = "once_cell", since = "1.70.0")]
+    #[rustc_should_not_be_called_on_const_items]
     pub fn set(&self, value: T) -> Result<(), T> {
         match self.try_insert(value) {
             Ok(_) => Ok(()),
@@ -229,13 +242,15 @@ impl<T> OnceLock<T> {
         }
     }
 
-    /// Sets the contents of this cell to `value` if the cell was empty, then
-    /// returns a reference to it.
+    /// Initializes the contents of the cell to `value` if the cell was uninitialized,
+    /// then returns a reference to it.
     ///
     /// May block if another thread is currently attempting to initialize the cell. The cell is
-    /// guaranteed to contain a value when set returns, though not necessarily the one provided.
+    /// guaranteed to contain a value when `try_insert` returns, though not necessarily the
+    /// one provided.
     ///
-    /// Returns `Ok(&value)` if the cell was empty and `Err(&current_value, value)` if it was full.
+    /// Returns `Ok(&value)` if the cell was uninitialized and
+    /// `Err((&current_value, value))` if it was already initialized.
     ///
     /// # Examples
     ///
@@ -259,6 +274,7 @@ impl<T> OnceLock<T> {
     /// ```
     #[inline]
     #[unstable(feature = "once_cell_try_insert", issue = "116693")]
+    #[rustc_should_not_be_called_on_const_items]
     pub fn try_insert(&self, value: T) -> Result<&T, (&T, T)> {
         let mut value = Some(value);
         let res = self.get_or_init(|| value.take().unwrap());
@@ -268,16 +284,16 @@ impl<T> OnceLock<T> {
         }
     }
 
-    /// Gets the contents of the cell, initializing it with `f` if the cell
-    /// was empty.
+    /// Gets the contents of the cell, initializing it to `f()` if the cell
+    /// was uninitialized.
     ///
     /// Many threads may call `get_or_init` concurrently with different
     /// initializing functions, but it is guaranteed that only one function
-    /// will be executed.
+    /// will be executed if the function doesn't panic.
     ///
     /// # Panics
     ///
-    /// If `f` panics, the panic is propagated to the caller, and the cell
+    /// If `f()` panics, the panic is propagated to the caller, and the cell
     /// remains uninitialized.
     ///
     /// It is an error to reentrantly initialize the cell from `f`. The
@@ -297,6 +313,7 @@ impl<T> OnceLock<T> {
     /// ```
     #[inline]
     #[stable(feature = "once_cell", since = "1.70.0")]
+    #[rustc_should_not_be_called_on_const_items]
     pub fn get_or_init<F>(&self, f: F) -> &T
     where
         F: FnOnce() -> T,
@@ -307,13 +324,15 @@ impl<T> OnceLock<T> {
     }
 
     /// Gets the mutable reference of the contents of the cell, initializing
-    /// it with `f` if the cell was empty.
+    /// it to `f()` if the cell was uninitialized.
     ///
-    /// This method never blocks.
+    /// This method never blocks. Since it borrows the `OnceLock` mutably,
+    /// it is statically guaranteed that no active borrows to the `OnceLock`
+    /// exist, including from other threads.
     ///
     /// # Panics
     ///
-    /// If `f` panics, the panic is propagated to the caller, and the cell
+    /// If `f()` panics, the panic is propagated to the caller, and the cell
     /// remains uninitialized.
     ///
     /// # Examples
@@ -344,13 +363,13 @@ impl<T> OnceLock<T> {
         }
     }
 
-    /// Gets the contents of the cell, initializing it with `f` if
-    /// the cell was empty. If the cell was empty and `f` failed, an
-    /// error is returned.
+    /// Gets the contents of the cell, initializing it to `f()` if
+    /// the cell was uninitialized. If the cell was uninitialized
+    /// and `f()` failed, an error is returned.
     ///
     /// # Panics
     ///
-    /// If `f` panics, the panic is propagated to the caller, and
+    /// If `f()` panics, the panic is propagated to the caller, and
     /// the cell remains uninitialized.
     ///
     /// It is an error to reentrantly initialize the cell from `f`.
@@ -375,6 +394,7 @@ impl<T> OnceLock<T> {
     /// ```
     #[inline]
     #[unstable(feature = "once_cell_try", issue = "109737")]
+    #[rustc_should_not_be_called_on_const_items]
     pub fn get_or_try_init<F, E>(&self, f: F) -> Result<&T, E>
     where
         F: FnOnce() -> Result<T, E>,
@@ -383,27 +403,27 @@ impl<T> OnceLock<T> {
         // NOTE: We need to perform an acquire on the state in this method
         // in order to correctly synchronize `LazyLock::force`. This is
         // currently done by calling `self.get()`, which in turn calls
-        // `self.is_initialized()`, which in turn performs the acquire.
+        // `self.initialized()`, which in turn performs the acquire.
         if let Some(value) = self.get() {
             return Ok(value);
         }
         self.initialize(f)?;
-
-        debug_assert!(self.is_initialized());
 
         // SAFETY: The inner value has been initialized
         Ok(unsafe { self.get_unchecked() })
     }
 
     /// Gets the mutable reference of the contents of the cell, initializing
-    /// it with `f` if the cell was empty. If the cell was empty and `f` failed,
-    /// an error is returned.
+    /// it to `f()` if the cell was uninitialized. If the cell was uninitialized
+    /// and `f()` failed, an error is returned.
     ///
-    /// This method never blocks.
+    /// This method never blocks. Since it borrows the `OnceLock` mutably,
+    /// it is statically guaranteed that no active borrows to the `OnceLock`
+    /// exist, including from other threads.
     ///
     /// # Panics
     ///
-    /// If `f` panics, the panic is propagated to the caller, and
+    /// If `f()` panics, the panic is propagated to the caller, and
     /// the cell remains uninitialized.
     ///
     /// # Examples
@@ -415,7 +435,7 @@ impl<T> OnceLock<T> {
     ///
     /// let mut cell: OnceLock<u32> = OnceLock::new();
     ///
-    /// // Failed initializers do not change the value
+    /// // Failed attempts to initialize the cell do not change its contents
     /// assert!(cell.get_mut_or_try_init(|| "not a number!".parse()).is_err());
     /// assert!(cell.get().is_none());
     ///
@@ -430,16 +450,16 @@ impl<T> OnceLock<T> {
     where
         F: FnOnce() -> Result<T, E>,
     {
-        if self.get().is_none() {
+        if self.get_mut().is_none() {
             self.initialize(f)?;
         }
-        debug_assert!(self.is_initialized());
+
         // SAFETY: The inner value has been initialized
         Ok(unsafe { self.get_unchecked_mut() })
     }
 
     /// Consumes the `OnceLock`, returning the wrapped value. Returns
-    /// `None` if the cell was empty.
+    /// `None` if the cell was uninitialized.
     ///
     /// # Examples
     ///
@@ -461,9 +481,10 @@ impl<T> OnceLock<T> {
 
     /// Takes the value out of this `OnceLock`, moving it back to an uninitialized state.
     ///
-    /// Has no effect and returns `None` if the `OnceLock` hasn't been initialized.
+    /// Has no effect and returns `None` if the `OnceLock` was uninitialized.
     ///
-    /// Safety is guaranteed by requiring a mutable reference.
+    /// Since this method borrows the `OnceLock` mutably, it is statically guaranteed that
+    /// no active borrows to the `OnceLock` exist, including from other threads.
     ///
     /// # Examples
     ///
@@ -481,20 +502,30 @@ impl<T> OnceLock<T> {
     #[inline]
     #[stable(feature = "once_cell", since = "1.70.0")]
     pub fn take(&mut self) -> Option<T> {
-        if self.is_initialized() {
+        if self.initialized_mut() {
             self.once = Once::new();
             // SAFETY: `self.value` is initialized and contains a valid `T`.
-            // `self.once` is reset, so `is_initialized()` will be false again
+            // `self.once` is reset, so `initialized()` will be false again
             // which prevents the value from being read twice.
-            unsafe { Some((&mut *self.value.get()).assume_init_read()) }
+            unsafe { Some(self.value.get_mut().assume_init_read()) }
         } else {
             None
         }
     }
 
     #[inline]
-    fn is_initialized(&self) -> bool {
+    fn initialized(&self) -> bool {
         self.once.is_completed()
+    }
+
+    #[inline]
+    fn initialized_mut(&mut self) -> bool {
+        // `state()` does not perform an atomic load, so prefer it over `is_complete()`.
+        let state = self.once.state();
+        match state {
+            OnceExclusiveState::Complete => true,
+            _ => false,
+        }
     }
 
     #[cold]
@@ -527,20 +558,20 @@ impl<T> OnceLock<T> {
 
     /// # Safety
     ///
-    /// The value must be initialized
+    /// The cell must be initialized
     #[inline]
     unsafe fn get_unchecked(&self) -> &T {
-        debug_assert!(self.is_initialized());
+        debug_assert!(self.initialized());
         unsafe { (&*self.value.get()).assume_init_ref() }
     }
 
     /// # Safety
     ///
-    /// The value must be initialized
+    /// The cell must be initialized
     #[inline]
     unsafe fn get_unchecked_mut(&mut self) -> &mut T {
-        debug_assert!(self.is_initialized());
-        unsafe { (&mut *self.value.get()).assume_init_mut() }
+        debug_assert!(self.initialized_mut());
+        unsafe { self.value.get_mut().assume_init_mut() }
     }
 }
 
@@ -560,8 +591,9 @@ impl<T: RefUnwindSafe + UnwindSafe> RefUnwindSafe for OnceLock<T> {}
 impl<T: UnwindSafe> UnwindSafe for OnceLock<T> {}
 
 #[stable(feature = "once_cell", since = "1.70.0")]
-impl<T> Default for OnceLock<T> {
-    /// Creates a new empty cell.
+#[rustc_const_unstable(feature = "const_default", issue = "143894")]
+impl<T> const Default for OnceLock<T> {
+    /// Creates a new uninitialized cell.
     ///
     /// # Example
     ///
@@ -667,14 +699,11 @@ impl<T: Eq> Eq for OnceLock<T> {}
 unsafe impl<#[may_dangle] T> Drop for OnceLock<T> {
     #[inline]
     fn drop(&mut self) {
-        if self.is_initialized() {
+        if self.initialized_mut() {
             // SAFETY: The cell is initialized and being dropped, so it can't
             // be accessed again. We also don't touch the `T` other than
             // dropping it, which validates our usage of #[may_dangle].
-            unsafe { (&mut *self.value.get()).assume_init_drop() };
+            unsafe { self.value.get_mut().assume_init_drop() };
         }
     }
 }
-
-#[cfg(test)]
-mod tests;

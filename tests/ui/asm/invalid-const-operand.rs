@@ -1,6 +1,7 @@
 //@ needs-asm-support
 //@ ignore-nvptx64
 //@ ignore-spirv
+//@ reference: asm.operand-type.supported-operands.const
 
 use std::arch::{asm, global_asm};
 
@@ -14,7 +15,7 @@ global_asm!("{}", const 0f32);
 global_asm!("{}", const 0 as *mut u8);
 //~^ ERROR invalid type for `const` operand
 
-fn main() {
+fn test1() {
     unsafe {
         // Const operands must be integers and must be constants.
 
@@ -27,7 +28,11 @@ fn main() {
         //~^ ERROR invalid type for `const` operand
         asm!("{}", const &0);
         //~^ ERROR invalid type for `const` operand
+    }
+}
 
+fn test2() {
+    unsafe {
         // Constants must be... constant
 
         let x = 0;
@@ -47,3 +52,5 @@ fn main() {
         //~^ ERROR attempt to use a non-constant value in a constant
     }
 }
+
+fn main() {}

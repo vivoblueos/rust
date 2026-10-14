@@ -33,17 +33,63 @@ rustc = "$(pwd)/../dist/bin/rustc-clif"
 cargo = "$(rustup which cargo)"
 full-bootstrap = true
 local-rebuild = true
+compiletest-allow-stage0 = true
 
 [rust]
+download-rustc = false
 codegen-backends = ["cranelift"]
 deny-warnings = false
 verbose-tests = false
 # The cg_clif sysroot doesn't contain llvm tools and unless llvm_tools is
 # disabled bootstrap will crash trying to copy llvm tools for the bootstrap
 # compiler.
-llvm_tools = false
+llvm-tools = false
+std-features = ["panic-unwind"]
 
 EOF
+
+cat <<EOF | git apply -
+diff --git a/src/bootstrap/bootstrap.py b/src/bootstrap/bootstrap.py
+index 2e16f2cf27..3ac3df99a8 100644
+--- a/src/bootstrap/bootstrap.py
++++ b/src/bootstrap/bootstrap.py
+@@ -1147,6 +1147,8 @@ class RustBuild(object):
+             args += ["-Zwarnings"]
+             env["CARGO_BUILD_WARNINGS"] = "deny"
+
++        env["RUSTFLAGS"] += " -Zbinary-dep-depinfo"
++
+         # Add RUSTFLAGS_BOOTSTRAP to RUSTFLAGS for bootstrap compilation.
+         # Note that RUSTFLAGS_BOOTSTRAP should always be added to the end of
+         # RUSTFLAGS, since that causes RUSTFLAGS_BOOTSTRAP to override RUSTFLAGS.
+diff --git a/src/bootstrap/src/core/config/config.rs b/src/bootstrap/src/core/config/config.rs
+index bc68bfe396..00143ef3ed 100644
+--- a/src/bootstrap/src/core/config/config.rs
++++ b/src/bootstrap/src/core/config/config.rs
+@@ -2230,7 +2230,7 @@ pub fn download_ci_rustc_commit<'a>(
+                     return None;
+                 }
+
+-                if dwn_ctx.is_running_on_ci() {
++                if false && dwn_ctx.is_running_on_ci() {
+                     eprintln!("CI rustc commit matches with HEAD and we are in CI.");
+                     eprintln!(
+                         "\`rustc.download-ci\` functionality will be skipped as artifacts are not available."
+diff --git a/src/build_helper/src/git.rs b/src/build_helper/src/git.rs
+index 330fb465de..a4593ed96f 100644
+--- a/src/build_helper/src/git.rs
++++ b/src/build_helper/src/git.rs
+@@ -218,7 +218,7 @@ pub fn get_closest_upstream_commit(
+     config: &GitConfig<'_>,
+     env: CiEnv,
+ ) -> Result<Option<String>, String> {
+-    let base = match env {
++    let base = match CiEnv::None {
+         CiEnv::None => "HEAD",
+         CiEnv::GitHubActions => {
+             // On CI, we should always have a non-upstream merge commit at the tip,
+EOF
+
 popd
 
 # Allow the testsuite to use llvm tools

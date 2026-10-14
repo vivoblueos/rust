@@ -1,38 +1,38 @@
 //@ needs-asm-support
-#![feature(naked_functions)]
+//@ reference: attributes.codegen.naked.inline
 #![crate_type = "lib"]
 
 use std::arch::naked_asm;
 
-#[naked]
-pub unsafe extern "C" fn inline_none() {
+#[unsafe(naked)]
+pub extern "C" fn inline_none() {
     naked_asm!("");
 }
 
-#[naked]
+#[unsafe(naked)]
 #[inline]
 //~^ ERROR [E0736]
-pub unsafe extern "C" fn inline_hint() {
+pub extern "C" fn inline_hint() {
     naked_asm!("");
 }
 
-#[naked]
+#[unsafe(naked)]
 #[inline(always)]
 //~^ ERROR [E0736]
-pub unsafe extern "C" fn inline_always() {
+pub extern "C" fn inline_always() {
     naked_asm!("");
 }
 
-#[naked]
+#[unsafe(naked)]
 #[inline(never)]
 //~^ ERROR [E0736]
-pub unsafe extern "C" fn inline_never() {
+pub extern "C" fn inline_never() {
     naked_asm!("");
 }
 
-#[naked]
-#[cfg_attr(all(), inline(never))]
+#[unsafe(naked)]
+#[cfg_attr(true, inline(never))]
 //~^ ERROR [E0736]
-pub unsafe extern "C" fn conditional_inline_never() {
+pub extern "C" fn conditional_inline_never() {
     naked_asm!("");
 }

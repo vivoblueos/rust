@@ -1,4 +1,5 @@
-//@ aux-build:test-macros.rs
+//@ edition:2015
+//@ proc-macro: test-macros.rs
 
 #[macro_use]
 extern crate test_macros;
@@ -17,11 +18,11 @@ type A = X; //~ ERROR cannot find type `X` in this scope
 mod n {}
 
 #[empty_attr]
-mod module; //~ ERROR non-inline modules in proc macro input are unstable
+mod module; //~ ERROR file modules in proc macro input are unstable
 
 #[empty_attr]
 mod outer {
-    mod inner; //~ ERROR non-inline modules in proc macro input are unstable
+    mod inner; //~ ERROR file modules in proc macro input are unstable
 
     mod inner_inline {} // OK
 }
@@ -30,16 +31,16 @@ mod outer {
 struct S {
     field: [u8; {
         #[path = "outer/inner.rs"]
-        mod inner; //~ ERROR non-inline modules in proc macro input are unstable
+        mod inner; //~ ERROR file modules in proc macro input are unstable
         mod inner_inline {} // OK
         0
-    }]
+    }],
 }
 
 #[identity_attr]
 fn f() {
     #[path = "outer/inner.rs"]
-    mod inner; //~ ERROR non-inline modules in proc macro input are unstable
+    mod inner; //~ ERROR file modules in proc macro input are unstable
     mod inner_inline {} // OK
 }
 

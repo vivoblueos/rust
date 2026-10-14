@@ -1,5 +1,7 @@
-#![feature(if_let_guard)]
-#![feature(let_chains)]
+//@revisions: edition2021 edition2024
+//@[edition2021] edition:2021
+//@[edition2024] edition:2024
+
 #![allow(irrefutable_let_patterns)]
 
 fn same_pattern(c: bool) {

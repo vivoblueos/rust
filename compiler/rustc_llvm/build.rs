@@ -1,8 +1,12 @@
+use std::borrow::Cow;
 use std::env;
 use std::ffi::{OsStr, OsString};
 use std::fmt::Display;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Command, Output, Stdio};
+use std::str::SplitWhitespace;
+
+use shlex::Shlex;
 
 const OPTIONAL_COMPONENTS: &[&str] = &[
     "x86",
@@ -16,7 +20,6 @@ const OPTIONAL_COMPONENTS: &[&str] = &[
     "mips",
     "powerpc",
     "systemz",
-    "jsbackend",
     "webassembly",
     "msp430",
     "sparc",
@@ -51,9 +54,13 @@ fn detect_llvm_link() -> (&'static str, &'static str) {
 fn restore_library_path() {
     let key = tracked_env_var_os("REAL_LIBRARY_PATH_VAR").expect("REAL_LIBRARY_PATH_VAR");
     if let Some(env) = tracked_env_var_os("REAL_LIBRARY_PATH") {
-        env::set_var(&key, env);
+        unsafe {
+            env::set_var(&key, env);
+        }
     } else {
-        env::remove_var(&key);
+        unsafe {
+            env::remove_var(&key);
+        }
     }
 }
 
@@ -83,8 +90,8 @@ fn rerun_if_changed_anything_in_dir(dir: &Path) {
 }
 
 #[track_caller]
-fn output(cmd: &mut Command) -> String {
-    let output = match cmd.stderr(Stdio::inherit()).output() {
+fn execute(cmd: &mut Command) -> Output {
+    let output = match cmd.output() {
         Ok(status) => status,
         Err(e) => {
             println!("\n\nfailed to execute command: {cmd:?}\nerror: {e}\n\n");
@@ -98,10 +105,66 @@ fn output(cmd: &mut Command) -> String {
             cmd, output.status
         );
     }
-    String::from_utf8(output.stdout).unwrap()
+    output
+}
+
+#[track_caller]
+fn output(cmd: &mut Command) -> String {
+    String::from_utf8(execute(cmd.stderr(Stdio::inherit())).stdout).unwrap()
+}
+#[track_caller]
+fn stderr(cmd: &mut Command) -> String {
+    String::from_utf8(execute(cmd).stderr).unwrap()
+}
+
+enum LlvmConfigOutput {
+    QuotedPaths(String),
+    UnquotedPaths(String),
+}
+
+enum SplitLlvmConfigOutput<'a> {
+    QuotedPaths(Shlex<'a>),
+    UnquotedPaths(SplitWhitespace<'a>),
+}
+
+impl<'a> Iterator for SplitLlvmConfigOutput<'a> {
+    type Item = Cow<'a, str>;
+    fn next(&mut self) -> Option<Cow<'a, str>> {
+        match self {
+            Self::QuotedPaths(iter) => iter.next().map(Cow::Owned),
+            Self::UnquotedPaths(iter) => iter.next().map(Cow::Borrowed),
+        }
+    }
+}
+
+impl Drop for SplitLlvmConfigOutput<'_> {
+    fn drop(&mut self) {
+        if let Self::QuotedPaths(shlex) = self {
+            assert!(!shlex.had_error, "error parsing llvm-config output");
+        }
+    }
+}
+
+impl<'a> IntoIterator for &'a LlvmConfigOutput {
+    type Item = Cow<'a, str>;
+    type IntoIter = SplitLlvmConfigOutput<'a>;
+    fn into_iter(self) -> Self::IntoIter {
+        match self {
+            LlvmConfigOutput::QuotedPaths(output) => {
+                SplitLlvmConfigOutput::QuotedPaths(Shlex::new(output))
+            }
+            LlvmConfigOutput::UnquotedPaths(output) => {
+                SplitLlvmConfigOutput::UnquotedPaths(output.split_whitespace())
+            }
+        }
+    }
 }
 
 fn main() {
+    if cfg!(feature = "check_only") {
+        return;
+    }
+
     for component in REQUIRED_COMPONENTS.iter().chain(OPTIONAL_COMPONENTS.iter()) {
         println!("cargo:rustc-check-cfg=cfg(llvm_component,values(\"{component}\"))");
     }
@@ -117,6 +180,19 @@ fn main() {
         PathBuf::from(tracked_env_var_os("LLVM_CONFIG").expect("LLVM_CONFIG was not set"));
 
     println!("cargo:rerun-if-changed={}", llvm_config.display());
+
+    // FIXME: `--quote-paths` was added to llvm-config in LLVM 22, so this test (and all its ensuing
+    //        fallback paths) can be removed once we bump the minimum llvm_version >= (22, 0, 0).
+    let llvm_config_supports_quote_paths =
+        stderr(Command::new(&llvm_config).arg("--help")).contains("quote-paths");
+
+    let quoted_split = |mut cmd: Command| {
+        if llvm_config_supports_quote_paths {
+            LlvmConfigOutput::QuotedPaths(output(cmd.arg("--quote-paths")))
+        } else {
+            LlvmConfigOutput::UnquotedPaths(output(&mut cmd))
+        }
+    };
 
     // Test whether we're cross-compiling LLVM. This is a pretty rare case
     // currently where we're producing an LLVM for a different platform than
@@ -160,10 +236,20 @@ fn main() {
     // Link in our own LLVM shims, compiled with the same flags as LLVM
     let mut cmd = Command::new(&llvm_config);
     cmd.arg("--cxxflags");
-    let cxxflags = output(&mut cmd);
+    let cxxflags = quoted_split(cmd);
     let mut cfg = cc::Build::new();
     cfg.warnings(false);
-    for flag in cxxflags.split_whitespace() {
+
+    // Prevent critical warnings when we're compiling from rust-lang/rust CI,
+    // except on MSVC, as the compiler throws warnings that are only reported
+    // for this platform. See https://github.com/rust-lang/rust/pull/145031#issuecomment-3162677202.
+    // Moreover, LLVM generally guarantees warning-freedom only when building with Clang, as other
+    // compilers have too many false positives. This is typically the case for MSVC, which throws
+    // many false-positive warnings. We keep it excluded, for these reasons.
+    if std::env::var_os("CI").is_some() && !target.contains("msvc") {
+        cfg.warnings_into_errors(true);
+    }
+    for flag in &cxxflags {
         // Ignore flags like `-m64` when we're doing a cross build
         if is_crossed && flag.starts_with("-m") {
             continue;
@@ -180,17 +266,25 @@ fn main() {
 
         // Include path contains host directory, replace it with target
         if is_crossed && flag.starts_with("-I") {
-            cfg.flag(&flag.replace(&host, &target));
+            cfg.flag(flag.replace(&host, &target));
             continue;
         }
 
-        cfg.flag(flag);
+        cfg.flag(&*flag);
     }
 
     for component in &components {
         let mut flag = String::from("LLVM_COMPONENT_");
         flag.push_str(&component.to_uppercase());
         cfg.define(&flag, None);
+    }
+
+    if tracked_env_var_os("LLVM_ENZYME").is_some() {
+        cfg.define("ENZYME", None);
+    }
+
+    if tracked_env_var_os("LLVM_OFFLOAD").is_some() {
+        cfg.define("OFFLOAD", None);
     }
 
     if tracked_env_var_os("LLVM_RUSTLLVM").is_some() {
@@ -204,7 +298,6 @@ fn main() {
     rerun_if_changed_anything_in_dir(Path::new("llvm-wrapper"));
     cfg.file("llvm-wrapper/PassWrapper.cpp")
         .file("llvm-wrapper/RustWrapper.cpp")
-        .file("llvm-wrapper/ArchiveWrapper.cpp")
         .file("llvm-wrapper/CoverageMappingWrapper.cpp")
         .file("llvm-wrapper/SymbolWrapper.cpp")
         .file("llvm-wrapper/Linker.cpp")
@@ -220,10 +313,10 @@ fn main() {
     let mut cmd = Command::new(&llvm_config);
     cmd.arg(llvm_link_arg).arg("--libs");
 
-    // Don't link system libs if cross-compiling unless targetting Windows.
+    // Don't link system libs if cross-compiling unless targeting Windows from Windows host.
     // On Windows system DLLs aren't linked directly, instead import libraries are used.
     // These import libraries are independent of the host.
-    if !is_crossed || target.contains("windows") {
+    if !is_crossed || target.contains("windows") && host.contains("windows") {
         cmd.arg("--system-libs");
     }
 
@@ -233,7 +326,10 @@ fn main() {
         println!("cargo:rustc-link-lib=kstat");
     }
 
-    if (target.starts_with("arm") && !target.contains("freebsd"))
+    if (target.starts_with("arm")
+        && !target.starts_with("arm64")
+        && !target.contains("freebsd")
+        && !target.contains("ohos"))
         || target.starts_with("mips-")
         || target.starts_with("mipsel-")
         || target.starts_with("powerpc-")
@@ -247,6 +343,7 @@ fn main() {
     } else if target.contains("haiku")
         || target.contains("darwin")
         || (is_crossed && (target.contains("dragonfly") || target.contains("solaris")))
+        || target.contains("cygwin")
     {
         println!("cargo:rustc-link-lib=z");
     } else if target.contains("netbsd") {
@@ -261,13 +358,13 @@ fn main() {
     }
     cmd.args(&components);
 
-    for lib in output(&mut cmd).split_whitespace() {
+    for lib in &quoted_split(cmd) {
         let mut is_static = false;
         let name = if let Some(stripped) = lib.strip_prefix("-l") {
             stripped
         } else if let Some(stripped) = lib.strip_prefix('-') {
             stripped
-        } else if Path::new(lib).exists() {
+        } else if Path::new(&*lib).exists() {
             // On MSVC llvm-config will print the full name to libraries, but
             // we're only interested in the name part
             // On Unix when we get a static library llvm-config will print the
@@ -278,7 +375,7 @@ fn main() {
             // and we transform the zstd part into
             //   cargo:rustc-link-search-native=/usr/local/lib
             //   cargo:rustc-link-lib=static=zstd
-            let path = Path::new(lib);
+            let path = Path::new(&*lib);
             if lib.ends_with(".a") {
                 is_static = true;
                 println!("cargo:rustc-link-search=native={}", path.parent().unwrap().display());
@@ -323,7 +420,7 @@ fn main() {
     // that those -L directories are the same!
     let mut cmd = Command::new(&llvm_config);
     cmd.arg(llvm_link_arg).arg("--ldflags");
-    for lib in output(&mut cmd).split_whitespace() {
+    for lib in &quoted_split(cmd) {
         if is_crossed {
             if let Some(stripped) = lib.strip_prefix("-LIBPATH:") {
                 println!("cargo:rustc-link-search=native={}", stripped.replace(&host, &target));
@@ -345,13 +442,16 @@ fn main() {
     // dependencies.
     let llvm_linker_flags = tracked_env_var_os("LLVM_LINKER_FLAGS");
     if let Some(s) = llvm_linker_flags {
-        for lib in s.into_string().unwrap().split_whitespace() {
+        let linker_flags = s.into_string().unwrap();
+        let mut shlex = Shlex::new(&linker_flags);
+        for lib in shlex.by_ref() {
             if let Some(stripped) = lib.strip_prefix("-l") {
                 println!("cargo:rustc-link-lib={stripped}");
             } else if let Some(stripped) = lib.strip_prefix("-L") {
                 println!("cargo:rustc-link-search=native={stripped}");
             }
         }
+        assert!(!shlex.had_error, "error parsing LLVM_LINKER_FLAGS");
     }
 
     let llvm_static_stdcpp = tracked_env_var_os("LLVM_STATIC_STDCPP");
@@ -363,6 +463,7 @@ fn main() {
         || target.contains("freebsd")
         || target.contains("windows-gnullvm")
         || target.contains("aix")
+        || target.contains("ohos")
     {
         "c++"
     } else if target.contains("netbsd") && llvm_static_stdcpp.is_some() {
@@ -385,7 +486,7 @@ fn main() {
     // C++ runtime library
     if !target.contains("msvc") {
         if let Some(s) = llvm_static_stdcpp {
-            assert!(!cxxflags.contains("stdlib=libc++"));
+            assert!(cxxflags.into_iter().all(|flag| flag != "-stdlib=libc++"));
             let path = PathBuf::from(s);
             println!("cargo:rustc-link-search=native={}", path.parent().unwrap().display());
             if target.contains("windows") {
@@ -393,7 +494,7 @@ fn main() {
             } else {
                 println!("cargo:rustc-link-lib=static={stdcppname}");
             }
-        } else if cxxflags.contains("stdlib=libc++") {
+        } else if cxxflags.into_iter().any(|flag| flag == "-stdlib=libc++") {
             println!("cargo:rustc-link-lib=c++");
         } else {
             println!("cargo:rustc-link-lib={stdcppname}");

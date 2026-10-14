@@ -1,3 +1,5 @@
 trait MyTrait {}
-impl !MyTrait for u32 {} //~ ERROR negative trait bounds are not yet fully implemented
+
+impl !MyTrait for u32 {} //~ ERROR negative impls are experimental
+
 fn main() {}

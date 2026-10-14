@@ -92,7 +92,10 @@ impl<'a, T: Ord> Ord for Interned<'a, T> {
     }
 }
 
-impl<'a, T> Hash for Interned<'a, T> {
+impl<'a, T> Hash for Interned<'a, T>
+where
+    T: Hash,
+{
     #[inline]
     fn hash<H: Hasher>(&self, s: &mut H) {
         // Pointer hashing is sufficient, due to the uniqueness constraint.
@@ -100,11 +103,11 @@ impl<'a, T> Hash for Interned<'a, T> {
     }
 }
 
-impl<T, CTX> HashStable<CTX> for Interned<'_, T>
+impl<T, Hcx> HashStable<Hcx> for Interned<'_, T>
 where
-    T: HashStable<CTX>,
+    T: HashStable<Hcx>,
 {
-    fn hash_stable(&self, hcx: &mut CTX, hasher: &mut StableHasher) {
+    fn hash_stable(&self, hcx: &mut Hcx, hasher: &mut StableHasher) {
         self.0.hash_stable(hcx, hasher);
     }
 }

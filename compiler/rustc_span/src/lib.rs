@@ -17,20 +17,12 @@
 
 // tidy-alphabetical-start
 #![allow(internal_features)]
-#![doc(html_root_url = "https://doc.rust-lang.org/nightly/nightly-rustc/")]
-#![doc(rust_logo)]
-#![feature(array_windows)]
-#![feature(cfg_match)]
+#![cfg_attr(target_arch = "loongarch64", feature(stdarch_loongarch))]
 #![feature(core_io_borrowed_buf)]
-#![feature(if_let_guard)]
-#![feature(let_chains)]
-#![feature(min_specialization)]
+#![feature(map_try_insert)]
 #![feature(negative_impls)]
 #![feature(read_buf)]
-#![feature(round_char_boundary)]
 #![feature(rustc_attrs)]
-#![feature(rustdoc_internals)]
-#![warn(unreachable_pub)]
 // tidy-alphabetical-end
 
 // The code produced by the `Encodable`/`Decodable` derive macros refer to
@@ -44,12 +36,14 @@ use rustc_macros::{Decodable, Encodable, HashStable_Generic};
 use rustc_serialize::opaque::{FileEncoder, MemDecoder};
 use rustc_serialize::{Decodable, Decoder, Encodable, Encoder};
 use tracing::debug;
+pub use unicode_width::UNICODE_VERSION;
 
 mod caching_source_map_view;
 pub mod source_map;
 use source_map::{SourceMap, SourceMapInputs};
 
 pub use self::caching_source_map_view::CachingSourceMapView;
+use crate::fatal_error::FatalError;
 
 pub mod edition;
 use edition::Edition;
@@ -58,7 +52,6 @@ use hygiene::Transparency;
 pub use hygiene::{
     DesugaringKind, ExpnData, ExpnHash, ExpnId, ExpnKind, LocalExpnId, MacroKind, SyntaxContext,
 };
-use rustc_data_structures::stable_hasher::HashingControls;
 pub mod def_id;
 use def_id::{CrateNum, DefId, DefIndex, DefPathHash, LOCAL_CRATE, LocalDefId, StableCrateId};
 pub mod edit_distance;
@@ -66,7 +59,9 @@ mod span_encoding;
 pub use span_encoding::{DUMMY_SP, Span};
 
 pub mod symbol;
-pub use symbol::{Symbol, sym};
+pub use symbol::{
+    ByteSymbol, Ident, MacroRulesNormalizedIdent, STDLIB_STABLE_CRATES, Symbol, kw, sym,
+};
 
 mod analyze_source_file;
 pub mod fatal_error;
@@ -81,17 +76,33 @@ use std::io::{self, Read};
 use std::ops::{Add, Range, Sub};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::sync::Arc;
 use std::{fmt, iter};
 
 use md5::{Digest, Md5};
-use rustc_data_structures::fx::FxHashMap;
-use rustc_data_structures::stable_hasher::{Hash64, Hash128, HashStable, StableHasher};
-use rustc_data_structures::sync::{FreezeLock, FreezeWriteGuard, Lock, Lrc};
+use rustc_data_structures::stable_hasher::{HashStable, StableHasher};
+use rustc_data_structures::sync::{FreezeLock, FreezeWriteGuard, Lock};
+use rustc_data_structures::unord::UnordMap;
+use rustc_hashes::{Hash64, Hash128};
 use sha1::Sha1;
 use sha2::Sha256;
 
 #[cfg(test)]
 mod tests;
+
+#[derive(Clone, Encodable, Decodable, Debug, Copy, PartialEq, Hash, HashStable_Generic)]
+pub struct Spanned<T> {
+    pub node: T,
+    pub span: Span,
+}
+
+pub fn respan<T>(sp: Span, t: T) -> Spanned<T> {
+    Spanned { node: t, span: sp }
+}
+
+pub fn dummy_spanned<T>(t: T) -> Spanned<T> {
+    respan(DUMMY_SP, t)
+}
 
 /// Per-session global variables: this struct is stored in thread-local storage
 /// in such a way that it is accessible without any kind of handle to all
@@ -102,29 +113,34 @@ pub struct SessionGlobals {
     span_interner: Lock<span_encoding::SpanInterner>,
     /// Maps a macro argument token into use of the corresponding metavariable in the macro body.
     /// Collisions are possible and processed in `maybe_use_metavar_location` on best effort basis.
-    metavar_spans: Lock<FxHashMap<Span, Span>>,
+    metavar_spans: MetavarSpansMap,
     hygiene_data: Lock<hygiene::HygieneData>,
 
     /// The session's source map, if there is one. This field should only be
     /// used in places where the `Session` is truly not available, such as
     /// `<Span as Debug>::fmt`.
-    source_map: Option<Lrc<SourceMap>>,
+    source_map: Option<Arc<SourceMap>>,
 }
 
 impl SessionGlobals {
-    pub fn new(edition: Edition, sm_inputs: Option<SourceMapInputs>) -> SessionGlobals {
+    pub fn new(
+        edition: Edition,
+        extra_symbols: &[&'static str],
+        sm_inputs: Option<SourceMapInputs>,
+    ) -> SessionGlobals {
         SessionGlobals {
-            symbol_interner: symbol::Interner::fresh(),
+            symbol_interner: symbol::Interner::with_extra_symbols(extra_symbols),
             span_interner: Lock::new(span_encoding::SpanInterner::default()),
             metavar_spans: Default::default(),
             hygiene_data: Lock::new(hygiene::HygieneData::new(edition)),
-            source_map: sm_inputs.map(|inputs| Lrc::new(SourceMap::with_inputs(inputs))),
+            source_map: sm_inputs.map(|inputs| Arc::new(SourceMap::with_inputs(inputs))),
         }
     }
 }
 
 pub fn create_session_globals_then<R>(
     edition: Edition,
+    extra_symbols: &[&'static str],
     sm_inputs: Option<SourceMapInputs>,
     f: impl FnOnce() -> R,
 ) -> R {
@@ -133,7 +149,7 @@ pub fn create_session_globals_then<R>(
         "SESSION_GLOBALS should never be overwritten! \
          Use another thread if you need another SessionGlobals"
     );
-    let session_globals = SessionGlobals::new(edition, sm_inputs);
+    let session_globals = SessionGlobals::new(edition, extra_symbols, sm_inputs);
     SESSION_GLOBALS.set(&session_globals, f)
 }
 
@@ -152,13 +168,14 @@ where
     F: FnOnce(&SessionGlobals) -> R,
 {
     if !SESSION_GLOBALS.is_set() {
-        let session_globals = SessionGlobals::new(edition, None);
+        let session_globals = SessionGlobals::new(edition, &[], None);
         SESSION_GLOBALS.set(&session_globals, || SESSION_GLOBALS.with(f))
     } else {
         SESSION_GLOBALS.with(f)
     }
 }
 
+#[inline]
 pub fn with_session_globals<R, F>(f: F) -> R
 where
     F: FnOnce(&SessionGlobals) -> R,
@@ -168,7 +185,7 @@ where
 
 /// Default edition, no source map.
 pub fn create_default_session_globals_then<R>(f: impl FnOnce() -> R) -> R {
-    create_session_globals_then(edition::DEFAULT_EDITION, None, f)
+    create_session_globals_then(edition::DEFAULT_EDITION, &[], None, f)
 }
 
 // If this ever becomes non thread-local, `decode_syntax_context`
@@ -176,126 +193,309 @@ pub fn create_default_session_globals_then<R>(f: impl FnOnce() -> R) -> R {
 // deserialization.
 scoped_tls::scoped_thread_local!(static SESSION_GLOBALS: SessionGlobals);
 
-#[inline]
-pub fn with_metavar_spans<R>(f: impl FnOnce(&mut FxHashMap<Span, Span>) -> R) -> R {
-    with_session_globals(|session_globals| f(&mut session_globals.metavar_spans.lock()))
-}
+#[derive(Default)]
+pub struct MetavarSpansMap(FreezeLock<UnordMap<Span, (Span, bool)>>);
 
-// FIXME: We should use this enum or something like it to get rid of the
-// use of magic `/rust/1.x/...` paths across the board.
-#[derive(Debug, Eq, PartialEq, Clone, Ord, PartialOrd, Decodable)]
-pub enum RealFileName {
-    LocalPath(PathBuf),
-    /// For remapped paths (namely paths into libstd that have been mapped
-    /// to the appropriate spot on the local host's file system, and local file
-    /// system paths that have been remapped with `FilePathMapping`),
-    Remapped {
-        /// `local_path` is the (host-dependent) local path to the file. This is
-        /// None if the file was imported from another crate
-        local_path: Option<PathBuf>,
-        /// `virtual_name` is the stable path rustc will store internally within
-        /// build artifacts.
-        virtual_name: PathBuf,
-    },
-}
+impl MetavarSpansMap {
+    pub fn insert(&self, span: Span, var_span: Span) -> bool {
+        match self.0.write().try_insert(span, (var_span, false)) {
+            Ok(_) => true,
+            Err(entry) => entry.entry.get().0 == var_span,
+        }
+    }
 
-impl Hash for RealFileName {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        // To prevent #70924 from happening again we should only hash the
-        // remapped (virtualized) path if that exists. This is because
-        // virtualized paths to sysroot crates (/rust/$hash or /rust/$version)
-        // remain stable even if the corresponding local_path changes
-        self.remapped_path_if_available().hash(state)
+    /// Read a span and record that it was read.
+    pub fn get(&self, span: Span) -> Option<Span> {
+        if let Some(mut mspans) = self.0.try_write() {
+            if let Some((var_span, read)) = mspans.get_mut(&span) {
+                *read = true;
+                Some(*var_span)
+            } else {
+                None
+            }
+        } else {
+            if let Some((span, true)) = self.0.read().get(&span) { Some(*span) } else { None }
+        }
+    }
+
+    /// Freeze the set, and return the spans which have been read.
+    ///
+    /// After this is frozen, no spans that have not been read can be read.
+    pub fn freeze_and_get_read_spans(&self) -> UnordMap<Span, Span> {
+        self.0.freeze().items().filter(|(_, (_, b))| *b).map(|(s1, (s2, _))| (*s1, *s2)).collect()
     }
 }
 
-// This is functionally identical to #[derive(Encodable)], with the exception of
-// an added assert statement
-impl<S: Encoder> Encodable<S> for RealFileName {
-    fn encode(&self, encoder: &mut S) {
-        match *self {
-            RealFileName::LocalPath(ref local_path) => {
-                encoder.emit_u8(0);
-                local_path.encode(encoder);
-            }
+#[inline]
+pub fn with_metavar_spans<R>(f: impl FnOnce(&MetavarSpansMap) -> R) -> R {
+    with_session_globals(|session_globals| f(&session_globals.metavar_spans))
+}
 
-            RealFileName::Remapped { ref local_path, ref virtual_name } => {
-                encoder.emit_u8(1);
-                // For privacy and build reproducibility, we must not embed host-dependant path
-                // in artifacts if they have been remapped by --remap-path-prefix
-                assert!(local_path.is_none());
-                local_path.encode(encoder);
-                virtual_name.encode(encoder);
-            }
+bitflags::bitflags! {
+    /// Scopes used to determined if it need to apply to `--remap-path-prefix`
+    #[derive(Debug, Eq, PartialEq, Clone, Copy, Ord, PartialOrd, Hash)]
+    pub struct RemapPathScopeComponents: u8 {
+        /// Apply remappings to the expansion of `std::file!()` macro
+        const MACRO = 1 << 0;
+        /// Apply remappings to printed compiler diagnostics
+        const DIAGNOSTICS = 1 << 1;
+        /// Apply remappings to debug information
+        const DEBUGINFO = 1 << 3;
+        /// Apply remappings to coverage information
+        const COVERAGE = 1 << 4;
+        /// Apply remappings to documentation information
+        const DOCUMENTATION = 1 << 5;
+
+        /// An alias for `macro`, `debuginfo` and `coverage`. This ensures all paths in compiled
+        /// executables, libraries and objects are remapped but not elsewhere.
+        const OBJECT = Self::MACRO.bits() | Self::DEBUGINFO.bits() | Self::COVERAGE.bits();
+    }
+}
+
+impl<E: Encoder> Encodable<E> for RemapPathScopeComponents {
+    #[inline]
+    fn encode(&self, s: &mut E) {
+        s.emit_u8(self.bits());
+    }
+}
+
+impl<D: Decoder> Decodable<D> for RemapPathScopeComponents {
+    #[inline]
+    fn decode(s: &mut D) -> RemapPathScopeComponents {
+        RemapPathScopeComponents::from_bits(s.read_u8())
+            .expect("invalid bits for RemapPathScopeComponents")
+    }
+}
+
+/// A self-contained "real" filename.
+///
+/// It is produced by `SourceMap::to_real_filename`.
+///
+/// `RealFileName` represents a filename that may have been (partly) remapped
+/// by `--remap-path-prefix` and `-Zremap-path-scope`.
+///
+/// It also contains an embedabble component which gives a working directory
+/// and a maybe-remapped maybe-aboslote name. This is useful for debuginfo where
+/// some formats and tools highly prefer absolute paths.
+///
+/// ## Consistency across compiler sessions
+///
+/// The type-system, const-eval and other parts of the compiler rely on `FileName`
+/// and by extension `RealFileName` to be consistent across compiler sessions.
+///
+/// Otherwise unsoudness (like rust-lang/rust#148328) may occur.
+///
+/// As such this type is self-sufficient and consistent in it's output.
+///
+/// The [`RealFileName::path`] and [`RealFileName::embeddable_name`] methods
+/// are guaranteed to always return the same output across compiler sessions.
+///
+/// ## Usage
+///
+/// Creation of a [`RealFileName`] should be done using
+/// [`FilePathMapping::to_real_filename`][rustc_span::source_map::FilePathMapping::to_real_filename].
+///
+/// Retrieving a path can be done in two main ways:
+///  - by using [`RealFileName::path`] with a given scope (should be preferred)
+///  - or by using [`RealFileName::embeddable_name`] with a given scope
+#[derive(Debug, Eq, PartialEq, Clone, Ord, PartialOrd, Decodable, Encodable)]
+pub struct RealFileName {
+    /// The local name (always present in the original crate)
+    local: Option<InnerRealFileName>,
+    /// The maybe remapped part. Correspond to `local` when no remapped happened.
+    maybe_remapped: InnerRealFileName,
+    /// The remapped scopes. Any active scope MUST use `maybe_virtual`
+    scopes: RemapPathScopeComponents,
+}
+
+/// The inner workings of `RealFileName`.
+///
+/// It contains the `name`, `working_directory` and `embeddable_name` components.
+#[derive(Debug, Eq, PartialEq, Clone, Ord, PartialOrd, Decodable, Encodable, Hash)]
+struct InnerRealFileName {
+    /// The name.
+    name: PathBuf,
+    /// The working directory associated with the embeddable name.
+    working_directory: PathBuf,
+    /// The embeddable name.
+    embeddable_name: PathBuf,
+}
+
+impl Hash for RealFileName {
+    #[inline]
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        // To prevent #70924 from happening again we should only hash the
+        // remapped path if that exists. This is because remapped paths to
+        // sysroot crates (/rust/$hash or /rust/$version) remain stable even
+        // if the corresponding local path changes.
+        if !self.was_fully_remapped() {
+            self.local.hash(state);
         }
+        self.maybe_remapped.hash(state);
+        self.scopes.bits().hash(state);
     }
 }
 
 impl RealFileName {
-    /// Returns the path suitable for reading from the file system on the local host,
-    /// if this information exists.
-    /// Avoid embedding this in build artifacts; see `remapped_path_if_available()` for that.
-    pub fn local_path(&self) -> Option<&Path> {
-        match self {
-            RealFileName::LocalPath(p) => Some(p),
-            RealFileName::Remapped { local_path, virtual_name: _ } => local_path.as_deref(),
-        }
-    }
-
-    /// Returns the path suitable for reading from the file system on the local host,
-    /// if this information exists.
-    /// Avoid embedding this in build artifacts; see `remapped_path_if_available()` for that.
-    pub fn into_local_path(self) -> Option<PathBuf> {
-        match self {
-            RealFileName::LocalPath(p) => Some(p),
-            RealFileName::Remapped { local_path: p, virtual_name: _ } => p,
-        }
-    }
-
-    /// Returns the path suitable for embedding into build artifacts. This would still
-    /// be a local path if it has not been remapped. A remapped path will not correspond
-    /// to a valid file system path: see `local_path_if_available()` for something that
-    /// is more likely to return paths into the local host file system.
-    pub fn remapped_path_if_available(&self) -> &Path {
-        match self {
-            RealFileName::LocalPath(p)
-            | RealFileName::Remapped { local_path: _, virtual_name: p } => p,
-        }
-    }
-
-    /// Returns the path suitable for reading from the file system on the local host,
-    /// if this information exists. Otherwise returns the remapped name.
-    /// Avoid embedding this in build artifacts; see `remapped_path_if_available()` for that.
-    pub fn local_path_if_available(&self) -> &Path {
-        match self {
-            RealFileName::LocalPath(path)
-            | RealFileName::Remapped { local_path: None, virtual_name: path }
-            | RealFileName::Remapped { local_path: Some(path), virtual_name: _ } => path,
-        }
-    }
-
-    /// Return the path remapped or not depending on the [`FileNameDisplayPreference`].
+    /// Returns the associated path for the given remapping scope.
     ///
-    /// For the purpose of this function, local and short preference are equal.
-    pub fn to_path(&self, display_pref: FileNameDisplayPreference) -> &Path {
-        match display_pref {
-            FileNameDisplayPreference::Local | FileNameDisplayPreference::Short => {
-                self.local_path_if_available()
-            }
-            FileNameDisplayPreference::Remapped => self.remapped_path_if_available(),
+    /// ## Panic
+    ///
+    /// Only one scope components can be given to this function.
+    #[inline]
+    pub fn path(&self, scope: RemapPathScopeComponents) -> &Path {
+        assert!(
+            scope.bits().count_ones() == 1,
+            "one and only one scope should be passed to `RealFileName::path`: {scope:?}"
+        );
+        if !self.scopes.contains(scope)
+            && let Some(local_name) = &self.local
+        {
+            local_name.name.as_path()
+        } else {
+            self.maybe_remapped.name.as_path()
         }
     }
 
-    pub fn to_string_lossy(&self, display_pref: FileNameDisplayPreference) -> Cow<'_, str> {
+    /// Returns the working directory and embeddable path for the given remapping scope.
+    ///
+    /// Useful for embedding a mostly abosolute path (modulo remapping) in the compiler outputs.
+    ///
+    /// The embedabble path is not guaranteed to be an absolute path, nor is it garuenteed
+    /// that the working directory part is always a prefix of embeddable path.
+    ///
+    /// ## Panic
+    ///
+    /// Only one scope components can be given to this function.
+    #[inline]
+    pub fn embeddable_name(&self, scope: RemapPathScopeComponents) -> (&Path, &Path) {
+        assert!(
+            scope.bits().count_ones() == 1,
+            "one and only one scope should be passed to `RealFileName::embeddable_path`: {scope:?}"
+        );
+        if !self.scopes.contains(scope)
+            && let Some(local_name) = &self.local
+        {
+            (&local_name.working_directory, &local_name.embeddable_name)
+        } else {
+            (&self.maybe_remapped.working_directory, &self.maybe_remapped.embeddable_name)
+        }
+    }
+
+    /// Returns the path suitable for reading from the file system on the local host,
+    /// if this information exists.
+    ///
+    /// May not exists if the filename was imported from another crate.
+    ///
+    /// Avoid embedding this in build artifacts; prefer `path()` or `embeddable_name()`.
+    #[inline]
+    pub fn local_path(&self) -> Option<&Path> {
+        if self.was_not_remapped() {
+            Some(&self.maybe_remapped.name)
+        } else if let Some(local) = &self.local {
+            Some(&local.name)
+        } else {
+            None
+        }
+    }
+
+    /// Returns the path suitable for reading from the file system on the local host,
+    /// if this information exists.
+    ///
+    /// May not exists if the filename was imported from another crate.
+    ///
+    /// Avoid embedding this in build artifacts; prefer `path()` or `embeddable_name()`.
+    #[inline]
+    pub fn into_local_path(self) -> Option<PathBuf> {
+        if self.was_not_remapped() {
+            Some(self.maybe_remapped.name)
+        } else if let Some(local) = self.local {
+            Some(local.name)
+        } else {
+            None
+        }
+    }
+
+    /// Returns whenever the filename was remapped.
+    #[inline]
+    pub(crate) fn was_remapped(&self) -> bool {
+        !self.scopes.is_empty()
+    }
+
+    /// Returns whenever the filename was fully remapped.
+    #[inline]
+    fn was_fully_remapped(&self) -> bool {
+        self.scopes.is_all()
+    }
+
+    /// Returns whenever the filename was not remapped.
+    #[inline]
+    fn was_not_remapped(&self) -> bool {
+        self.scopes.is_empty()
+    }
+
+    /// Returns an empty `RealFileName`
+    ///
+    /// Useful as the working directory input to `SourceMap::to_real_filename`.
+    #[inline]
+    pub fn empty() -> RealFileName {
+        RealFileName {
+            local: Some(InnerRealFileName {
+                name: PathBuf::new(),
+                working_directory: PathBuf::new(),
+                embeddable_name: PathBuf::new(),
+            }),
+            maybe_remapped: InnerRealFileName {
+                name: PathBuf::new(),
+                working_directory: PathBuf::new(),
+                embeddable_name: PathBuf::new(),
+            },
+            scopes: RemapPathScopeComponents::empty(),
+        }
+    }
+
+    /// Returns a `RealFileName` that is completely remapped without any local components.
+    ///
+    /// Only exposed for the purpose of `-Zsimulate-remapped-rust-src-base`.
+    pub fn from_virtual_path(path: &Path) -> RealFileName {
+        let name = InnerRealFileName {
+            name: path.to_owned(),
+            embeddable_name: path.to_owned(),
+            working_directory: PathBuf::new(),
+        };
+        RealFileName { local: None, maybe_remapped: name, scopes: RemapPathScopeComponents::all() }
+    }
+
+    /// Update the filename for encoding in the crate metadata.
+    ///
+    /// Currently it's about removing the local part when the filename
+    /// is either fully remapped or not remapped at all.
+    #[inline]
+    pub fn update_for_crate_metadata(&mut self) {
+        if self.was_fully_remapped() || self.was_not_remapped() {
+            // NOTE: This works because when the filename is fully
+            // remapped, we don't care about the `local` part,
+            // and when the filename is not remapped at all,
+            // `maybe_remapped` and `local` are equal.
+            self.local = None;
+        }
+    }
+
+    /// Internal routine to display the filename.
+    ///
+    /// Users should always use the `RealFileName::path` method or `FileName` methods instead.
+    fn to_string_lossy<'a>(&'a self, display_pref: FileNameDisplayPreference) -> Cow<'a, str> {
         match display_pref {
-            FileNameDisplayPreference::Local => self.local_path_if_available().to_string_lossy(),
-            FileNameDisplayPreference::Remapped => {
-                self.remapped_path_if_available().to_string_lossy()
+            FileNameDisplayPreference::Remapped => self.maybe_remapped.name.to_string_lossy(),
+            FileNameDisplayPreference::Local => {
+                self.local.as_ref().unwrap_or(&self.maybe_remapped).name.to_string_lossy()
             }
             FileNameDisplayPreference::Short => self
-                .local_path_if_available()
+                .maybe_remapped
+                .name
                 .file_name()
                 .map_or_else(|| "".into(), |f| f.to_string_lossy()),
+            FileNameDisplayPreference::Scope(scope) => self.path(scope).to_string_lossy(),
         }
     }
 }
@@ -304,8 +504,8 @@ impl RealFileName {
 #[derive(Debug, Eq, PartialEq, Clone, Ord, PartialOrd, Hash, Decodable, Encodable)]
 pub enum FileName {
     Real(RealFileName),
-    /// Call to `quote!`.
-    QuoteExpansion(Hash64),
+    /// Strings provided as `--cfg [cfgspec]`.
+    CfgSpec(Hash64),
     /// Command line.
     Anon(Hash64),
     /// Hack in `src/librustc_ast/parse.rs`.
@@ -321,28 +521,18 @@ pub enum FileName {
     InlineAsm(Hash64),
 }
 
-impl From<PathBuf> for FileName {
-    fn from(p: PathBuf) -> Self {
-        FileName::Real(RealFileName::LocalPath(p))
-    }
-}
-
-#[derive(Clone, Copy, Eq, PartialEq, Hash, Debug)]
-pub enum FileNameDisplayPreference {
-    /// Display the path after the application of rewrite rules provided via `--remap-path-prefix`.
-    /// This is appropriate for paths that get embedded into files produced by the compiler.
-    Remapped,
-    /// Display the path before the application of rewrite rules provided via `--remap-path-prefix`.
-    /// This is appropriate for use in user-facing output (such as diagnostics).
-    Local,
-    /// Display only the filename, as a way to reduce the verbosity of the output.
-    /// This is appropriate for use in user-facing output (such as diagnostics).
-    Short,
-}
-
 pub struct FileNameDisplay<'a> {
     inner: &'a FileName,
     display_pref: FileNameDisplayPreference,
+}
+
+// Internal enum. Should not be exposed.
+#[derive(Clone, Copy)]
+enum FileNameDisplayPreference {
+    Remapped,
+    Local,
+    Short,
+    Scope(RemapPathScopeComponents),
 }
 
 impl fmt::Display for FileNameDisplay<'_> {
@@ -352,7 +542,7 @@ impl fmt::Display for FileNameDisplay<'_> {
             Real(ref name) => {
                 write!(fmt, "{}", name.to_string_lossy(self.display_pref))
             }
-            QuoteExpansion(_) => write!(fmt, "<quote expansion>"),
+            CfgSpec(_) => write!(fmt, "<cfgspec>"),
             MacroExpansion(_) => write!(fmt, "<macro expansion>"),
             Anon(_) => write!(fmt, "<anon>"),
             ProcMacroSourceCode(_) => write!(fmt, "<proc-macro source code>"),
@@ -367,7 +557,7 @@ impl fmt::Display for FileNameDisplay<'_> {
 impl<'a> FileNameDisplay<'a> {
     pub fn to_string_lossy(&self) -> Cow<'a, str> {
         match self.inner {
-            FileName::Real(ref inner) => inner.to_string_lossy(self.display_pref),
+            FileName::Real(inner) => inner.to_string_lossy(self.display_pref),
             _ => Cow::from(self.to_string()),
         }
     }
@@ -383,24 +573,40 @@ impl FileName {
             | ProcMacroSourceCode(_)
             | CliCrateAttr(_)
             | Custom(_)
-            | QuoteExpansion(_)
+            | CfgSpec(_)
             | DocTest(_, _)
             | InlineAsm(_) => false,
         }
     }
 
-    pub fn prefer_remapped_unconditionaly(&self) -> FileNameDisplay<'_> {
+    /// Returns the path suitable for reading from the file system on the local host,
+    /// if this information exists.
+    ///
+    /// Avoid embedding this in build artifacts. Prefer using the `display` method.
+    #[inline]
+    pub fn prefer_remapped_unconditionally(&self) -> FileNameDisplay<'_> {
         FileNameDisplay { inner: self, display_pref: FileNameDisplayPreference::Remapped }
     }
 
-    /// This may include transient local filesystem information.
-    /// Must not be embedded in build outputs.
-    pub fn prefer_local(&self) -> FileNameDisplay<'_> {
+    /// Returns the path suitable for reading from the file system on the local host,
+    /// if this information exists.
+    ///
+    /// Avoid embedding this in build artifacts. Prefer using the `display` method.
+    #[inline]
+    pub fn prefer_local_unconditionally(&self) -> FileNameDisplay<'_> {
         FileNameDisplay { inner: self, display_pref: FileNameDisplayPreference::Local }
     }
 
-    pub fn display(&self, display_pref: FileNameDisplayPreference) -> FileNameDisplay<'_> {
-        FileNameDisplay { inner: self, display_pref }
+    /// Returns a short (either the filename or an empty string).
+    #[inline]
+    pub fn short(&self) -> FileNameDisplay<'_> {
+        FileNameDisplay { inner: self, display_pref: FileNameDisplayPreference::Short }
+    }
+
+    /// Returns a `Display`-able path for the given scope.
+    #[inline]
+    pub fn display(&self, scope: RemapPathScopeComponents) -> FileNameDisplay<'_> {
+        FileNameDisplay { inner: self, display_pref: FileNameDisplayPreference::Scope(scope) }
     }
 
     pub fn macro_expansion_source_code(src: &str) -> FileName {
@@ -424,7 +630,7 @@ impl FileName {
     pub fn cfg_spec_source_code(src: &str) -> FileName {
         let mut hasher = StableHasher::new();
         src.hash(&mut hasher);
-        FileName::QuoteExpansion(hasher.finish())
+        FileName::CfgSpec(hasher.finish())
     }
 
     pub fn cli_crate_attr_source_code(src: &str) -> FileName {
@@ -445,7 +651,8 @@ impl FileName {
 
     /// Returns the path suitable for reading from the file system on the local host,
     /// if this information exists.
-    /// Avoid embedding this in build artifacts; see `remapped_path_if_available()` for that.
+    ///
+    /// Avoid embedding this in build artifacts.
     pub fn into_local_path(self) -> Option<PathBuf> {
         match self {
             FileName::Real(path) => path.into_local_path(),
@@ -521,6 +728,12 @@ impl SpanData {
     }
 }
 
+impl Default for SpanData {
+    fn default() -> Self {
+        Self { lo: BytePos(0), hi: BytePos(0), ctxt: SyntaxContext::root(), parent: None }
+    }
+}
+
 impl PartialOrd for Span {
     fn partial_cmp(&self, rhs: &Self) -> Option<Ordering> {
         PartialOrd::partial_cmp(&self.data(), &rhs.data())
@@ -559,9 +772,26 @@ impl Span {
         !self.is_dummy() && sm.is_span_accessible(self)
     }
 
+    /// Returns whether this span originates in a foreign crate's external macro.
+    ///
+    /// This is used to test whether a lint should not even begin to figure out whether it should
+    /// be reported on the current node.
+    #[inline]
+    pub fn in_external_macro(self, sm: &SourceMap) -> bool {
+        self.ctxt().in_external_macro(sm)
+    }
+
     /// Returns `true` if `span` originates in a derive-macro's expansion.
     pub fn in_derive_expansion(self) -> bool {
         matches!(self.ctxt().outer_expn_data().kind, ExpnKind::Macro(MacroKind::Derive, _))
+    }
+
+    /// Return whether `span` is generated by `async` or `await`.
+    pub fn is_from_async_await(self) -> bool {
+        matches!(
+            self.ctxt().outer_expn_data().kind,
+            ExpnKind::Desugaring(DesugaringKind::Async | DesugaringKind::Await),
+        )
     }
 
     /// Gate suggestions that would not be appropriate in a context the user didn't write.
@@ -656,18 +886,23 @@ impl Span {
         if !ctxt.is_root() { ctxt.outer_expn_data().call_site.source_callsite() } else { self }
     }
 
-    /// The `Span` for the tokens in the previous macro expansion from which `self` was generated,
-    /// if any.
+    /// Returns the call-site span of the last macro expansion which produced this `Span`.
+    /// (see [`ExpnData::call_site`]). Returns `None` if this is not an expansion.
     pub fn parent_callsite(self) -> Option<Span> {
         let ctxt = self.ctxt();
         (!ctxt.is_root()).then(|| ctxt.outer_expn_data().call_site)
     }
 
-    /// Walk down the expansion ancestors to find a span that's contained within `outer`.
+    /// Find the first ancestor span that's contained within `outer`.
     ///
-    /// The span returned by this method may have a different [`SyntaxContext`] as `outer`.
+    /// This method traverses the macro expansion ancestors until it finds the first span
+    /// that's contained within `outer`.
+    ///
+    /// The span returned by this method may have a different [`SyntaxContext`] than `outer`.
     /// If you need to extend the span, use [`find_ancestor_inside_same_ctxt`] instead,
     /// because joining spans with different syntax contexts can create unexpected results.
+    ///
+    /// This is used to find the span of the macro call when a parent expr span, i.e. `outer`, is known.
     ///
     /// [`find_ancestor_inside_same_ctxt`]: Self::find_ancestor_inside_same_ctxt
     pub fn find_ancestor_inside(mut self, outer: Span) -> Option<Span> {
@@ -677,8 +912,10 @@ impl Span {
         Some(self)
     }
 
-    /// Walk down the expansion ancestors to find a span with the same [`SyntaxContext`] as
-    /// `other`.
+    /// Find the first ancestor span with the same [`SyntaxContext`] as `other`.
+    ///
+    /// This method traverses the macro expansion ancestors until it finds a span
+    /// that has the same [`SyntaxContext`] as `other`.
     ///
     /// Like [`find_ancestor_inside_same_ctxt`], but specifically for when spans might not
     /// overlap. Take care when using this, and prefer [`find_ancestor_inside`] or
@@ -694,8 +931,11 @@ impl Span {
         Some(self)
     }
 
-    /// Walk down the expansion ancestors to find a span that's contained within `outer` and
+    /// Find the first ancestor span that's contained within `outer` and
     /// has the same [`SyntaxContext`] as `outer`.
+    ///
+    /// This method traverses the macro expansion ancestors until it finds a span
+    /// that is both contained within `outer` and has the same [`SyntaxContext`] as `outer`.
     ///
     /// This method is the combination of [`find_ancestor_inside`] and
     /// [`find_ancestor_in_same_ctxt`] and should be preferred when extending the returned span.
@@ -710,43 +950,43 @@ impl Span {
         Some(self)
     }
 
-    /// Recursively walk down the expansion ancestors to find the oldest ancestor span with the same
-    /// [`SyntaxContext`] the initial span.
+    /// Find the first ancestor span that does not come from an external macro.
     ///
-    /// This method is suitable for peeling through *local* macro expansions to find the "innermost"
-    /// span that is still local and shares the same [`SyntaxContext`]. For example, given
+    /// This method traverses the macro expansion ancestors until it finds a span
+    /// that is either from user-written code or from a local macro (defined in the current crate).
     ///
-    /// ```ignore (illustrative example, contains type error)
-    ///  macro_rules! outer {
-    ///      ($x: expr) => {
-    ///          inner!($x)
-    ///      }
-    ///  }
+    /// External macros are those defined in dependencies or the standard library.
+    /// This method is useful for reporting errors in user-controllable code and avoiding
+    /// diagnostics inside external macros.
     ///
-    ///  macro_rules! inner {
-    ///      ($x: expr) => {
-    ///          format!("error: {}", $x)
-    ///          //~^ ERROR mismatched types
-    ///      }
-    ///  }
+    /// # See also
     ///
-    ///  fn bar(x: &str) -> Result<(), Box<dyn std::error::Error>> {
-    ///      Err(outer!(x))
-    ///  }
-    /// ```
-    ///
-    /// if provided the initial span of `outer!(x)` inside `bar`, this method will recurse
-    /// the parent callsites until we reach `format!("error: {}", $x)`, at which point it is the
-    /// oldest ancestor span that is both still local and shares the same [`SyntaxContext`] as the
-    /// initial span.
-    pub fn find_oldest_ancestor_in_same_ctxt(self) -> Span {
-        let mut cur = self;
-        while cur.eq_ctxt(self)
-            && let Some(parent_callsite) = cur.parent_callsite()
-        {
-            cur = parent_callsite;
+    /// - [`Self::find_ancestor_not_from_macro`]
+    /// - [`Self::in_external_macro`]
+    pub fn find_ancestor_not_from_extern_macro(mut self, sm: &SourceMap) -> Option<Span> {
+        while self.in_external_macro(sm) {
+            self = self.parent_callsite()?;
         }
-        cur
+        Some(self)
+    }
+
+    /// Find the first ancestor span that does not come from any macro expansion.
+    ///
+    /// This method traverses the macro expansion ancestors until it finds a span
+    /// that originates from user-written code rather than any macro-generated code.
+    ///
+    /// This method is useful for reporting errors at the exact location users wrote code
+    /// and providing suggestions at directly editable locations.
+    ///
+    /// # See also
+    ///
+    /// - [`Self::find_ancestor_not_from_extern_macro`]
+    /// - [`Span::from_expansion`]
+    pub fn find_ancestor_not_from_macro(mut self) -> Option<Span> {
+        while self.from_expansion() {
+            self = self.parent_callsite()?;
+        }
+        Some(self)
     }
 
     /// Edition of the crate from which this span came.
@@ -801,7 +1041,7 @@ impl Span {
         self.ctxt()
             .outer_expn_data()
             .allow_internal_unstable
-            .is_some_and(|features| features.iter().any(|&f| f == feature))
+            .is_some_and(|features| features.contains(&feature))
     }
 
     /// Checks if this span arises from a compiler desugaring of kind `kind`.
@@ -865,8 +1105,7 @@ impl Span {
 
     /// Check if you can select metavar spans for the given spans to get matching contexts.
     fn try_metavars(a: SpanData, b: SpanData, a_orig: Span, b_orig: Span) -> (SpanData, SpanData) {
-        let get = |mspans: &FxHashMap<_, _>, s| mspans.get(&s).copied();
-        match with_metavar_spans(|mspans| (get(mspans, a_orig), get(mspans, b_orig))) {
+        match with_metavar_spans(|mspans| (mspans.get(a_orig), mspans.get(b_orig))) {
             (None, None) => {}
             (Some(meta_a), None) => {
                 let meta_a = meta_a.data();
@@ -982,6 +1221,37 @@ impl Span {
         }
     }
 
+    /// Returns the `Span` within the syntax context of "within". This is useful when
+    /// "self" is an expansion from a macro variable, since this can be used for
+    /// providing extra macro expansion context for certain errors.
+    ///
+    /// ```text
+    /// macro_rules! m {
+    ///     ($ident:ident) => { ($ident,) }
+    /// }
+    ///
+    /// m!(outer_ident);
+    /// ```
+    ///
+    /// If "self" is the span of the outer_ident, and "within" is the span of the `($ident,)`
+    /// expr, then this will return the span of the `$ident` macro variable.
+    pub fn within_macro(self, within: Span, sm: &SourceMap) -> Option<Span> {
+        match Span::prepare_to_combine(self, within) {
+            // Only return something if it doesn't overlap with the original span,
+            // and the span isn't "imported" (i.e. from unavailable sources).
+            // FIXME: This does limit the usefulness of the error when the macro is
+            // from a foreign crate; we could also take into account `-Zmacro-backtrace`,
+            // which doesn't redact this span (but that would mean passing in even more
+            // args to this function, lol).
+            Ok((self_, _, parent))
+                if self_.hi < self.lo() || self.hi() < self_.lo && !sm.is_imported(within) =>
+            {
+                Some(Span::new(self_.lo, self_.hi, self_.ctxt, parent))
+            }
+            _ => None,
+        }
+    }
+
     pub fn from_inner(self, inner: InnerSpan) -> Span {
         let span = self.data();
         Span::new(
@@ -1007,7 +1277,7 @@ impl Span {
     /// Equivalent of `Span::mixed_site` from the proc macro API,
     /// except that the location is taken from the `self` span.
     pub fn with_mixed_site_ctxt(self, expn_id: ExpnId) -> Span {
-        self.with_ctxt_from_mark(expn_id, Transparency::SemiTransparent)
+        self.with_ctxt_from_mark(expn_id, Transparency::SemiOpaque)
     }
 
     /// Produces a span with the same location as `self` and context produced by a macro with the
@@ -1053,30 +1323,6 @@ impl Span {
     }
 
     #[inline]
-    pub fn glob_adjust(&mut self, expn_id: ExpnId, glob_span: Span) -> Option<Option<ExpnId>> {
-        let mut mark = None;
-        *self = self.map_ctxt(|mut ctxt| {
-            mark = ctxt.glob_adjust(expn_id, glob_span);
-            ctxt
-        });
-        mark
-    }
-
-    #[inline]
-    pub fn reverse_glob_adjust(
-        &mut self,
-        expn_id: ExpnId,
-        glob_span: Span,
-    ) -> Option<Option<ExpnId>> {
-        let mut mark = None;
-        *self = self.map_ctxt(|mut ctxt| {
-            mark = ctxt.reverse_glob_adjust(expn_id, glob_span);
-            ctxt
-        });
-        mark
-    }
-
-    #[inline]
     pub fn normalize_to_macros_2_0(self) -> Span {
         self.map_ctxt(|ctxt| ctxt.normalize_to_macros_2_0())
     }
@@ -1103,11 +1349,12 @@ rustc_index::newtype_index! {
 /// It is similar to rustc_type_ir's TyEncoder.
 pub trait SpanEncoder: Encoder {
     fn encode_span(&mut self, span: Span);
-    fn encode_symbol(&mut self, symbol: Symbol);
+    fn encode_symbol(&mut self, sym: Symbol);
+    fn encode_byte_symbol(&mut self, byte_sym: ByteSymbol);
     fn encode_expn_id(&mut self, expn_id: ExpnId);
     fn encode_syntax_context(&mut self, syntax_context: SyntaxContext);
-    /// As a local identifier, a `CrateNum` is only meaningful within its context, e.g. within a tcx.
-    /// Therefore, make sure to include the context when encode a `CrateNum`.
+    /// As a local identifier, a `CrateNum` is only meaningful within its context, e.g. within a
+    /// tcx. Therefore, make sure to include the context when encode a `CrateNum`.
     fn encode_crate_num(&mut self, crate_num: CrateNum);
     fn encode_def_index(&mut self, def_index: DefIndex);
     fn encode_def_id(&mut self, def_id: DefId);
@@ -1120,8 +1367,12 @@ impl SpanEncoder for FileEncoder {
         span.hi.encode(self);
     }
 
-    fn encode_symbol(&mut self, symbol: Symbol) {
-        self.emit_str(symbol.as_str());
+    fn encode_symbol(&mut self, sym: Symbol) {
+        self.emit_str(sym.as_str());
+    }
+
+    fn encode_byte_symbol(&mut self, byte_sym: ByteSymbol) {
+        self.emit_byte_str(byte_sym.as_byte_str());
     }
 
     fn encode_expn_id(&mut self, _expn_id: ExpnId) {
@@ -1155,6 +1406,12 @@ impl<E: SpanEncoder> Encodable<E> for Span {
 impl<E: SpanEncoder> Encodable<E> for Symbol {
     fn encode(&self, s: &mut E) {
         s.encode_symbol(*self);
+    }
+}
+
+impl<E: SpanEncoder> Encodable<E> for ByteSymbol {
+    fn encode(&self, s: &mut E) {
+        s.encode_byte_symbol(*self);
     }
 }
 
@@ -1194,17 +1451,49 @@ impl<E: SpanEncoder> Encodable<E> for AttrId {
     }
 }
 
+pub trait BlobDecoder: Decoder {
+    fn decode_symbol(&mut self) -> Symbol;
+    fn decode_byte_symbol(&mut self) -> ByteSymbol;
+    fn decode_def_index(&mut self) -> DefIndex;
+}
+
 /// This trait is used to allow decoder specific encodings of certain types.
 /// It is similar to rustc_type_ir's TyDecoder.
-pub trait SpanDecoder: Decoder {
+///
+/// Specifically for metadata, an important note is that spans can only be decoded once
+/// some other metadata is already read.
+/// Spans have to be properly mapped into the decoding crate's sourcemap,
+/// and crate numbers have to be converted sometimes.
+/// This can only be done once the `CrateRoot` is available.
+///
+/// As such, some methods that used to be in the `SpanDecoder` trait
+/// are now in the `BlobDecoder` trait. This hierarchy is not mirrored for `Encoder`s.
+/// `BlobDecoder` has methods for deserializing types that are more complex than just those
+/// that can be decoded with `Decoder`, but which can be decoded on their own, *before* any other metadata is.
+/// Importantly, that means that types that can be decoded with `BlobDecoder` can show up in the crate root.
+/// The place where this distinction is relevant is in `rustc_metadata` where metadata is decoded using either the
+/// `MetadataDecodeContext` or the `BlobDecodeContext`.
+pub trait SpanDecoder: BlobDecoder {
     fn decode_span(&mut self) -> Span;
-    fn decode_symbol(&mut self) -> Symbol;
     fn decode_expn_id(&mut self) -> ExpnId;
     fn decode_syntax_context(&mut self) -> SyntaxContext;
     fn decode_crate_num(&mut self) -> CrateNum;
-    fn decode_def_index(&mut self) -> DefIndex;
     fn decode_def_id(&mut self) -> DefId;
     fn decode_attr_id(&mut self) -> AttrId;
+}
+
+impl BlobDecoder for MemDecoder<'_> {
+    fn decode_symbol(&mut self) -> Symbol {
+        Symbol::intern(self.read_str())
+    }
+
+    fn decode_byte_symbol(&mut self) -> ByteSymbol {
+        ByteSymbol::intern(self.read_byte_str())
+    }
+
+    fn decode_def_index(&mut self) -> DefIndex {
+        panic!("cannot decode `DefIndex` with `MemDecoder`");
+    }
 }
 
 impl SpanDecoder for MemDecoder<'_> {
@@ -1213,10 +1502,6 @@ impl SpanDecoder for MemDecoder<'_> {
         let hi = Decodable::decode(self);
 
         Span::new(lo, hi, SyntaxContext::root(), None)
-    }
-
-    fn decode_symbol(&mut self) -> Symbol {
-        Symbol::intern(self.read_str())
     }
 
     fn decode_expn_id(&mut self) -> ExpnId {
@@ -1229,10 +1514,6 @@ impl SpanDecoder for MemDecoder<'_> {
 
     fn decode_crate_num(&mut self) -> CrateNum {
         CrateNum::from_u32(self.read_u32())
-    }
-
-    fn decode_def_index(&mut self) -> DefIndex {
-        panic!("cannot decode `DefIndex` with `MemDecoder`");
     }
 
     fn decode_def_id(&mut self) -> DefId {
@@ -1250,9 +1531,15 @@ impl<D: SpanDecoder> Decodable<D> for Span {
     }
 }
 
-impl<D: SpanDecoder> Decodable<D> for Symbol {
+impl<D: BlobDecoder> Decodable<D> for Symbol {
     fn decode(s: &mut D) -> Symbol {
         s.decode_symbol()
+    }
+}
+
+impl<D: BlobDecoder> Decodable<D> for ByteSymbol {
+    fn decode(s: &mut D) -> ByteSymbol {
+        s.decode_byte_symbol()
     }
 }
 
@@ -1274,7 +1561,7 @@ impl<D: SpanDecoder> Decodable<D> for CrateNum {
     }
 }
 
-impl<D: SpanDecoder> Decodable<D> for DefIndex {
+impl<D: BlobDecoder> Decodable<D> for DefIndex {
     fn decode(s: &mut D) -> DefIndex {
         s.decode_def_index()
     }
@@ -1358,7 +1645,7 @@ pub enum ExternalSource {
 #[derive(PartialEq, Eq, Clone, Debug)]
 pub enum ExternalSourceKind {
     /// The external source has been loaded already.
-    Present(Lrc<String>),
+    Present(Arc<String>),
     /// No attempt has been made to load the external source.
     AbsentOk,
     /// A failed attempt has been made to load the external source.
@@ -1368,7 +1655,7 @@ pub enum ExternalSourceKind {
 impl ExternalSource {
     pub fn get_source(&self) -> Option<&str> {
         match self {
-            ExternalSource::Foreign { kind: ExternalSourceKind::Present(ref src), .. } => Some(src),
+            ExternalSource::Foreign { kind: ExternalSourceKind::Present(src), .. } => Some(src),
             _ => None,
         }
     }
@@ -1598,7 +1885,7 @@ pub struct SourceFile {
     /// (e.g., `<anon>`).
     pub name: FileName,
     /// The complete source code.
-    pub src: Option<Lrc<String>>,
+    pub src: Option<Arc<String>>,
     /// The source code's hash.
     pub src_hash: SourceFileHash,
     /// Used to enable cargo to use checksums to check if a crate is fresh rather
@@ -1610,8 +1897,10 @@ pub struct SourceFile {
     pub external_src: FreezeLock<ExternalSource>,
     /// The start position of this source in the `SourceMap`.
     pub start_pos: BytePos,
-    /// The byte length of this source.
-    pub source_len: RelativeBytePos,
+    /// The byte length of this source after normalization.
+    pub normalized_source_len: RelativeBytePos,
+    /// The byte length of this source before normalization.
+    pub unnormalized_source_len: u32,
     /// Locations of lines beginnings in the source code.
     pub lines: FreezeLock<SourceFileLines>,
     /// Locations of multi-byte characters in the source code.
@@ -1635,7 +1924,8 @@ impl Clone for SourceFile {
             checksum_hash: self.checksum_hash,
             external_src: self.external_src.clone(),
             start_pos: self.start_pos,
-            source_len: self.source_len,
+            normalized_source_len: self.normalized_source_len,
+            unnormalized_source_len: self.unnormalized_source_len,
             lines: self.lines.clone(),
             multibyte_chars: self.multibyte_chars.clone(),
             normalized_pos: self.normalized_pos.clone(),
@@ -1651,7 +1941,8 @@ impl<S: SpanEncoder> Encodable<S> for SourceFile {
         self.src_hash.encode(s);
         self.checksum_hash.encode(s);
         // Do not encode `start_pos` as it's global state for this session.
-        self.source_len.encode(s);
+        self.normalized_source_len.encode(s);
+        self.unnormalized_source_len.encode(s);
 
         // We are always in `Lines` form by the time we reach here.
         assert!(self.lines.read().is_lines());
@@ -1724,7 +2015,8 @@ impl<D: SpanDecoder> Decodable<D> for SourceFile {
         let name: FileName = Decodable::decode(d);
         let src_hash: SourceFileHash = Decodable::decode(d);
         let checksum_hash: Option<SourceFileHash> = Decodable::decode(d);
-        let source_len: RelativeBytePos = Decodable::decode(d);
+        let normalized_source_len: RelativeBytePos = Decodable::decode(d);
+        let unnormalized_source_len = Decodable::decode(d);
         let lines = {
             let num_lines: u32 = Decodable::decode(d);
             if num_lines > 0 {
@@ -1746,7 +2038,8 @@ impl<D: SpanDecoder> Decodable<D> for SourceFile {
         SourceFile {
             name,
             start_pos: BytePos::from_u32(0),
-            source_len,
+            normalized_source_len,
+            unnormalized_source_len,
             src: None,
             src_hash,
             checksum_hash,
@@ -1829,6 +2122,8 @@ impl StableSourceFileId {
 }
 
 impl SourceFile {
+    const MAX_FILE_SIZE: u32 = u32::MAX - 1;
+
     pub fn new(
         name: FileName,
         mut src: String,
@@ -1844,22 +2139,31 @@ impl SourceFile {
                 SourceFileHash::new_in_memory(checksum_hash_kind, src.as_bytes())
             }
         });
+        // Capture the original source length before normalization.
+        let unnormalized_source_len = u32::try_from(src.len()).map_err(|_| OffsetOverflowError)?;
+        if unnormalized_source_len > Self::MAX_FILE_SIZE {
+            return Err(OffsetOverflowError);
+        }
+
         let normalized_pos = normalize_src(&mut src);
 
         let stable_id = StableSourceFileId::from_filename_in_current_crate(&name);
-        let source_len = src.len();
-        let source_len = u32::try_from(source_len).map_err(|_| OffsetOverflowError)?;
+        let normalized_source_len = u32::try_from(src.len()).map_err(|_| OffsetOverflowError)?;
+        if normalized_source_len > Self::MAX_FILE_SIZE {
+            return Err(OffsetOverflowError);
+        }
 
         let (lines, multibyte_chars) = analyze_source_file::analyze_source_file(&src);
 
         Ok(SourceFile {
             name,
-            src: Some(Lrc::new(src)),
+            src: Some(Arc::new(src)),
             src_hash,
             checksum_hash,
             external_src: FreezeLock::frozen(ExternalSource::Unneeded),
             start_pos: BytePos::from_u32(0),
-            source_len: RelativeBytePos::from_u32(source_len),
+            normalized_source_len: RelativeBytePos::from_u32(normalized_source_len),
+            unnormalized_source_len,
             lines: FreezeLock::frozen(SourceFileLines::Lines(lines)),
             multibyte_chars,
             normalized_pos,
@@ -1973,7 +2277,7 @@ impl SourceFile {
                 } = &mut *external_src
                 {
                     *src_kind = if let Some(src) = src {
-                        ExternalSourceKind::Present(Lrc::new(src))
+                        ExternalSourceKind::Present(Arc::new(src))
                     } else {
                         ExternalSourceKind::AbsentErr
                     };
@@ -2043,7 +2347,7 @@ impl SourceFile {
 
     #[inline]
     pub fn end_position(&self) -> BytePos {
-        self.absolute_position(self.source_len)
+        self.absolute_position(self.normalized_source_len)
     }
 
     /// Finds the line containing the given position. The return value is the
@@ -2079,7 +2383,7 @@ impl SourceFile {
 
     #[inline]
     pub fn is_empty(&self) -> bool {
-        self.source_len.to_u32() == 0
+        self.normalized_source_len.to_u32() == 0
     }
 
     /// Calculates the original byte position relative to the start of the file
@@ -2109,14 +2413,12 @@ impl SourceFile {
     /// normalized one. Hence we need to convert those offsets to the normalized
     /// form when constructing spans.
     pub fn normalized_byte_pos(&self, offset: u32) -> BytePos {
-        let diff = match self
-            .normalized_pos
-            .binary_search_by(|np| (np.pos.0 + np.diff).cmp(&(self.start_pos.0 + offset)))
-        {
-            Ok(i) => self.normalized_pos[i].diff,
-            Err(0) => 0,
-            Err(i) => self.normalized_pos[i - 1].diff,
-        };
+        let diff =
+            match self.normalized_pos.binary_search_by(|np| (np.pos.0 + np.diff).cmp(&offset)) {
+                Ok(i) => self.normalized_pos[i].diff,
+                Err(0) => 0,
+                Err(i) => self.normalized_pos[i - 1].diff,
+            };
 
         BytePos::from_u32(self.start_pos.0 + offset - diff)
     }
@@ -2363,7 +2665,7 @@ impl_pos! {
     pub struct BytePos(pub u32);
 
     /// A byte offset relative to file beginning.
-    #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
+    #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug, HashStable_Generic)]
     pub struct RelativeBytePos(pub u32);
 
     /// A character offset.
@@ -2387,12 +2689,6 @@ impl<D: Decoder> Decodable<D> for BytePos {
     }
 }
 
-impl<H: HashStableContext> HashStable<H> for RelativeBytePos {
-    fn hash_stable(&self, hcx: &mut H, hasher: &mut StableHasher) {
-        self.0.hash_stable(hcx, hasher);
-    }
-}
-
 impl<S: Encoder> Encodable<S> for RelativeBytePos {
     fn encode(&self, s: &mut S) {
         s.emit_u32(self.0);
@@ -2413,7 +2709,7 @@ impl<D: Decoder> Decodable<D> for RelativeBytePos {
 #[derive(Debug, Clone)]
 pub struct Loc {
     /// Information about the original source.
-    pub file: Lrc<SourceFile>,
+    pub file: Arc<SourceFile>,
     /// The (1-based) line number.
     pub line: usize,
     /// The (0-based) column offset.
@@ -2425,13 +2721,13 @@ pub struct Loc {
 // Used to be structural records.
 #[derive(Debug)]
 pub struct SourceFileAndLine {
-    pub sf: Lrc<SourceFile>,
+    pub sf: Arc<SourceFile>,
     /// Index of line, starting from 0.
     pub line: usize,
 }
 #[derive(Debug)]
 pub struct SourceFileAndBytePos {
-    pub sf: Lrc<SourceFile>,
+    pub sf: Arc<SourceFile>,
     pub pos: BytePos,
 }
 
@@ -2448,7 +2744,7 @@ pub struct LineInfo {
 }
 
 pub struct FileLines {
-    pub file: Lrc<SourceFile>,
+    pub file: Arc<SourceFile>,
     pub lines: Vec<LineInfo>,
 }
 
@@ -2500,96 +2796,29 @@ impl InnerSpan {
     }
 }
 
-/// Requirements for a `StableHashingContext` to be used in this crate.
-///
-/// This is a hack to allow using the [`HashStable_Generic`] derive macro
-/// instead of implementing everything in rustc_middle.
+/// This trait lets `HashStable` and `derive(HashStable_Generic)` be used in
+/// this crate (and other crates upstream of `rustc_middle`), while leaving
+/// certain operations to be defined in `rustc_middle` where more things are
+/// visible.
 pub trait HashStableContext {
+    /// The main event: stable hashing of a span.
+    fn span_hash_stable(&mut self, span: Span, hasher: &mut StableHasher);
+
+    /// Compute a `DefPathHash`.
     fn def_path_hash(&self, def_id: DefId) -> DefPathHash;
-    fn hash_spans(&self) -> bool;
-    /// Accesses `sess.opts.unstable_opts.incremental_ignore_spans` since
-    /// we don't have easy access to a `Session`
-    fn unstable_opts_incremental_ignore_spans(&self) -> bool;
-    fn def_span(&self, def_id: LocalDefId) -> Span;
-    fn span_data_to_lines_and_cols(
-        &mut self,
-        span: &SpanData,
-    ) -> Option<(Lrc<SourceFile>, usize, BytePos, usize, BytePos)>;
-    fn hashing_controls(&self) -> HashingControls;
+
+    /// Assert that the provided `HashStableContext` is configured with the default
+    /// `HashingControls`. We should always have bailed out before getting to here with a
+    fn assert_default_hashing_controls(&self, msg: &str);
 }
 
-impl<CTX> HashStable<CTX> for Span
+impl<Hcx> HashStable<Hcx> for Span
 where
-    CTX: HashStableContext,
+    Hcx: HashStableContext,
 {
-    /// Hashes a span in a stable way. We can't directly hash the span's `BytePos`
-    /// fields (that would be similar to hashing pointers, since those are just
-    /// offsets into the `SourceMap`). Instead, we hash the (file name, line, column)
-    /// triple, which stays the same even if the containing `SourceFile` has moved
-    /// within the `SourceMap`.
-    ///
-    /// Also note that we are hashing byte offsets for the column, not unicode
-    /// codepoint offsets. For the purpose of the hash that's sufficient.
-    /// Also, hashing filenames is expensive so we avoid doing it twice when the
-    /// span starts and ends in the same file, which is almost always the case.
-    fn hash_stable(&self, ctx: &mut CTX, hasher: &mut StableHasher) {
-        const TAG_VALID_SPAN: u8 = 0;
-        const TAG_INVALID_SPAN: u8 = 1;
-        const TAG_RELATIVE_SPAN: u8 = 2;
-
-        if !ctx.hash_spans() {
-            return;
-        }
-
-        let span = self.data_untracked();
-        span.ctxt.hash_stable(ctx, hasher);
-        span.parent.hash_stable(ctx, hasher);
-
-        if span.is_dummy() {
-            Hash::hash(&TAG_INVALID_SPAN, hasher);
-            return;
-        }
-
-        if let Some(parent) = span.parent {
-            let def_span = ctx.def_span(parent).data_untracked();
-            if def_span.contains(span) {
-                // This span is enclosed in a definition: only hash the relative position.
-                Hash::hash(&TAG_RELATIVE_SPAN, hasher);
-                (span.lo - def_span.lo).to_u32().hash_stable(ctx, hasher);
-                (span.hi - def_span.lo).to_u32().hash_stable(ctx, hasher);
-                return;
-            }
-        }
-
-        // If this is not an empty or invalid span, we want to hash the last
-        // position that belongs to it, as opposed to hashing the first
-        // position past it.
-        let Some((file, line_lo, col_lo, line_hi, col_hi)) = ctx.span_data_to_lines_and_cols(&span)
-        else {
-            Hash::hash(&TAG_INVALID_SPAN, hasher);
-            return;
-        };
-
-        Hash::hash(&TAG_VALID_SPAN, hasher);
-        Hash::hash(&file.stable_id, hasher);
-
-        // Hash both the length and the end location (line/column) of a span. If we
-        // hash only the length, for example, then two otherwise equal spans with
-        // different end locations will have the same hash. This can cause a problem
-        // during incremental compilation wherein a previous result for a query that
-        // depends on the end location of a span will be incorrectly reused when the
-        // end location of the span it depends on has changed (see issue #74890). A
-        // similar analysis applies if some query depends specifically on the length
-        // of the span, but we only hash the end location. So hash both.
-
-        let col_lo_trunc = (col_lo.0 as u64) & 0xFF;
-        let line_lo_trunc = ((line_lo as u64) & 0xFF_FF_FF) << 8;
-        let col_hi_trunc = (col_hi.0 as u64) & 0xFF << 32;
-        let line_hi_trunc = ((line_hi as u64) & 0xFF_FF_FF) << 40;
-        let col_line = col_lo_trunc | line_lo_trunc | col_hi_trunc | line_hi_trunc;
-        let len = (span.hi - span.lo).0;
-        Hash::hash(&col_line, hasher);
-        Hash::hash(&len, hasher);
+    fn hash_stable(&self, hcx: &mut Hcx, hasher: &mut StableHasher) {
+        // `span_hash_stable` does all the work.
+        hcx.span_hash_stable(*self, hasher)
     }
 }
 
@@ -2607,6 +2836,10 @@ impl ErrorGuaranteed {
     #[deprecated = "should only be used in `DiagCtxtInner::emit_diagnostic`"]
     pub fn unchecked_error_guaranteed() -> Self {
         ErrorGuaranteed(())
+    }
+
+    pub fn raise_fatal(self) -> ! {
+        FatalError.raise()
     }
 }
 

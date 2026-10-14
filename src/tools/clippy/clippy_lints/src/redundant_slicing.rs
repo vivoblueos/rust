@@ -1,14 +1,39 @@
 use clippy_utils::diagnostics::span_lint_and_then;
+use clippy_utils::get_parent_expr;
+use clippy_utils::res::MaybeDef;
 use clippy_utils::source::snippet_with_context;
-use clippy_utils::ty::is_type_lang_item;
-use clippy_utils::{get_parent_expr, peel_middle_ty_refs};
-use rustc_ast::util::parser::PREC_PREFIX;
+use clippy_utils::ty::peel_and_count_ty_refs;
+use rustc_ast::util::parser::ExprPrecedence;
 use rustc_errors::Applicability;
 use rustc_hir::{BorrowKind, Expr, ExprKind, LangItem, Mutability};
 use rustc_lint::{LateContext, LateLintPass, Lint};
 use rustc_middle::ty::adjustment::{Adjust, AutoBorrow, AutoBorrowMutability};
 use rustc_middle::ty::{GenericArg, Ty};
 use rustc_session::declare_lint_pass;
+
+declare_clippy_lint! {
+    /// ### What it does
+    /// Checks for slicing expressions which are equivalent to dereferencing the
+    /// value.
+    ///
+    /// ### Why restrict this?
+    /// Some people may prefer to dereference rather than slice.
+    ///
+    /// ### Example
+    /// ```no_run
+    /// let vec = vec![1, 2, 3];
+    /// let slice = &vec[..];
+    /// ```
+    /// Use instead:
+    /// ```no_run
+    /// let vec = vec![1, 2, 3];
+    /// let slice = &*vec;
+    /// ```
+    #[clippy::version = "1.61.0"]
+    pub DEREF_BY_SLICING,
+    restriction,
+    "slicing instead of dereferencing"
+}
 
 declare_clippy_lint! {
     /// ### What it does
@@ -41,31 +66,7 @@ declare_clippy_lint! {
     "redundant slicing of the whole range of a type"
 }
 
-declare_clippy_lint! {
-    /// ### What it does
-    /// Checks for slicing expressions which are equivalent to dereferencing the
-    /// value.
-    ///
-    /// ### Why restrict this?
-    /// Some people may prefer to dereference rather than slice.
-    ///
-    /// ### Example
-    /// ```no_run
-    /// let vec = vec![1, 2, 3];
-    /// let slice = &vec[..];
-    /// ```
-    /// Use instead:
-    /// ```no_run
-    /// let vec = vec![1, 2, 3];
-    /// let slice = &*vec;
-    /// ```
-    #[clippy::version = "1.61.0"]
-    pub DEREF_BY_SLICING,
-    restriction,
-    "slicing instead of dereferencing"
-}
-
-declare_lint_pass!(RedundantSlicing => [REDUNDANT_SLICING, DEREF_BY_SLICING]);
+declare_lint_pass!(RedundantSlicing => [DEREF_BY_SLICING, REDUNDANT_SLICING]);
 
 static REDUNDANT_SLICING_LINT: (&Lint, &str) = (REDUNDANT_SLICING, "redundant slicing of the whole range");
 static DEREF_BY_SLICING_LINT: (&Lint, &str) = (DEREF_BY_SLICING, "slicing when dereferencing would work");
@@ -80,12 +81,16 @@ impl<'tcx> LateLintPass<'tcx> for RedundantSlicing {
         if let ExprKind::AddrOf(BorrowKind::Ref, mutability, addressee) = expr.kind
             && addressee.span.ctxt() == ctxt
             && let ExprKind::Index(indexed, range, _) = addressee.kind
-            && is_type_lang_item(cx, cx.typeck_results().expr_ty_adjusted(range), LangItem::RangeFull)
+            && cx
+                .typeck_results()
+                .expr_ty_adjusted(range)
+                .is_lang_item(cx, LangItem::RangeFull)
         {
-            let (expr_ty, expr_ref_count) = peel_middle_ty_refs(cx.typeck_results().expr_ty(expr));
-            let (indexed_ty, indexed_ref_count) = peel_middle_ty_refs(cx.typeck_results().expr_ty(indexed));
+            let (expr_ty, expr_ref_count, _) = peel_and_count_ty_refs(cx.typeck_results().expr_ty(expr));
+            let (indexed_ty, indexed_ref_count, _) = peel_and_count_ty_refs(cx.typeck_results().expr_ty(indexed));
             let parent_expr = get_parent_expr(cx, expr);
-            let needs_parens_for_prefix = parent_expr.is_some_and(|parent| parent.precedence().order() > PREC_PREFIX);
+            let needs_parens_for_prefix =
+                parent_expr.is_some_and(|parent| cx.precedence(parent) > ExprPrecedence::Prefix);
 
             if expr_ty == indexed_ty {
                 if expr_ref_count > indexed_ref_count {
@@ -134,25 +139,24 @@ impl<'tcx> LateLintPass<'tcx> for RedundantSlicing {
                     };
                     diag.span_suggestion(expr.span, help_msg, sugg, app);
                 });
-            } else if let Some(target_id) = cx.tcx.lang_items().deref_target() {
-                if let Ok(deref_ty) = cx.tcx.try_normalize_erasing_regions(
+            } else if let Some(target_id) = cx.tcx.lang_items().deref_target()
+                && let Ok(deref_ty) = cx.tcx.try_normalize_erasing_regions(
                     cx.typing_env(),
                     Ty::new_projection_from_args(cx.tcx, target_id, cx.tcx.mk_args(&[GenericArg::from(indexed_ty)])),
-                ) {
-                    if deref_ty == expr_ty {
-                        let (lint, msg) = DEREF_BY_SLICING_LINT;
-                        span_lint_and_then(cx, lint, expr.span, msg, |diag| {
-                            let mut app = Applicability::MachineApplicable;
-                            let snip = snippet_with_context(cx, indexed.span, ctxt, "..", &mut app).0;
-                            let sugg = if needs_parens_for_prefix {
-                                format!("(&{}{}*{snip})", mutability.prefix_str(), "*".repeat(indexed_ref_count))
-                            } else {
-                                format!("&{}{}*{snip}", mutability.prefix_str(), "*".repeat(indexed_ref_count))
-                            };
-                            diag.span_suggestion(expr.span, "dereference the original value instead", sugg, app);
-                        });
-                    }
-                }
+                )
+                && deref_ty == expr_ty
+            {
+                let (lint, msg) = DEREF_BY_SLICING_LINT;
+                span_lint_and_then(cx, lint, expr.span, msg, |diag| {
+                    let mut app = Applicability::MachineApplicable;
+                    let snip = snippet_with_context(cx, indexed.span, ctxt, "..", &mut app).0;
+                    let sugg = if needs_parens_for_prefix {
+                        format!("(&{}{}*{snip})", mutability.prefix_str(), "*".repeat(indexed_ref_count))
+                    } else {
+                        format!("&{}{}*{snip}", mutability.prefix_str(), "*".repeat(indexed_ref_count))
+                    };
+                    diag.span_suggestion(expr.span, "dereference the original value instead", sugg, app);
+                });
             }
         }
     }

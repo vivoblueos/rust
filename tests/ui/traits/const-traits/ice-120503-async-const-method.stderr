@@ -26,11 +26,7 @@ LL |       async const fn bar(&self) {
    |       |
    |  _____`async` because of this
    | |
-LL | |
-LL | |
-LL | |
 ...  |
-LL | |
 LL | |     }
    | |_____-
 
@@ -38,11 +34,7 @@ error[E0407]: method `bar` is not a member of trait `MyTrait`
   --> $DIR/ice-120503-async-const-method.rs:6:5
    |
 LL | /     async const fn bar(&self) {
-LL | |
-LL | |
-LL | |
 ...  |
-LL | |
 LL | |     }
    | |_____^ not a member of trait `MyTrait`
 
@@ -50,10 +42,16 @@ error[E0425]: cannot find function `main8` in this scope
   --> $DIR/ice-120503-async-const-method.rs:11:9
    |
 LL |         main8().await;
-   |         ^^^^^ help: a function with a similar name exists: `main`
+   |         ^^^^^
 ...
 LL | fn main() {}
    | --------- similarly named function `main` defined here
+   |
+help: a function with a similar name exists
+   |
+LL -         main8().await;
+LL +         main().await;
+   |
 
 error: aborting due to 5 previous errors
 

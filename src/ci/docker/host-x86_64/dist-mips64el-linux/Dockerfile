@@ -11,7 +11,6 @@ RUN sh /scripts/rustbuild-setup.sh
 WORKDIR /tmp
 
 COPY scripts/crosstool-ng-build.sh /scripts/
-COPY host-x86_64/dist-mips-linux/patches/ /tmp/patches/
 COPY host-x86_64/dist-mips64el-linux/mips64el-linux-gnu.defconfig /tmp/crosstool.defconfig
 RUN /scripts/crosstool-ng-build.sh
 
@@ -27,5 +26,5 @@ ENV \
 
 ENV HOSTS=mips64el-unknown-linux-gnuabi64
 
-ENV RUST_CONFIGURE_ARGS --enable-extended --disable-docs
-ENV SCRIPT python3 ../x.py dist --host $HOSTS --target $HOSTS
+ENV RUST_CONFIGURE_ARGS="--enable-extended --disable-docs"
+ENV SCRIPT="python3 ../x.py dist --host $HOSTS --target $HOSTS"

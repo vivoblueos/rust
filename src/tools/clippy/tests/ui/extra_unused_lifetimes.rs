@@ -1,4 +1,5 @@
 //@aux-build:proc_macro_derive.rs
+//@aux-build:proc_macros.rs
 
 #![allow(
     unused,
@@ -11,12 +12,14 @@
 
 #[macro_use]
 extern crate proc_macro_derive;
+extern crate proc_macros;
 
 fn empty() {}
 
 fn used_lt<'a>(x: &'a u8) {}
 
 fn unused_lt<'a>(x: u8) {}
+//~^ extra_unused_lifetimes
 
 fn unused_lt_transitive<'a, 'b: 'a>(x: &'b u8) {
     // 'a is useless here since it's not directly bound
@@ -44,6 +47,7 @@ struct Bar;
 
 impl Bar {
     fn x<'a>(&self) {}
+    //~^ extra_unused_lifetimes
 }
 
 // test for #489 (used lifetimes in bounds)
@@ -70,6 +74,7 @@ impl X {
 mod issue4291 {
     trait BadTrait {
         fn unused_lt<'a>(x: u8) {}
+        //~^ extra_unused_lifetimes
     }
 
     impl BadTrait for () {
@@ -81,13 +86,16 @@ mod issue6437 {
     pub struct Scalar;
 
     impl<'a> std::ops::AddAssign<&Scalar> for &mut Scalar {
+        //~^ extra_unused_lifetimes
         fn add_assign(&mut self, _rhs: &Scalar) {
             unimplemented!();
         }
     }
 
     impl<'b> Scalar {
+        //~^ extra_unused_lifetimes
         pub fn something<'c>() -> Self {
+            //~^ extra_unused_lifetimes
             Self
         }
     }
@@ -117,6 +125,7 @@ mod second_case {
     // Should lint. The response to the above comment incorrectly called this a false positive. The
     // lifetime `'a` can be removed, as demonstrated below.
     impl<'a, T: Source + ?Sized + 'a> Source for Box<T> {
+        //~^ extra_unused_lifetimes
         fn hey() {}
     }
 
@@ -132,6 +141,43 @@ mod second_case {
 struct Human<'a> {
     pub bones: i32,
     pub name: &'a str,
+}
+
+// https://github.com/rust-lang/rust-clippy/issues/13578
+mod issue_13578 {
+    pub trait Foo {}
+
+    impl<'a, T: 'a> Foo for Option<T> where &'a T: Foo {}
+}
+
+// no lint on proc macro generated code
+mod proc_macro_generated {
+    use proc_macros::external;
+
+    // no lint on external macro (extra unused lifetimes in impl block)
+    external! {
+        struct ExternalImplStruct;
+
+        impl<'a> ExternalImplStruct {
+            fn foo() {}
+        }
+    }
+
+    // no lint on external macro (extra unused lifetimes in method)
+    external! {
+        struct ExternalMethodStruct;
+
+        impl ExternalMethodStruct {
+            fn bar<'a>(&self) {}
+        }
+    }
+
+    // no lint on external macro (extra unused lifetimes in trait method)
+    external! {
+        trait ExternalUnusedLifetimeTrait {
+            fn unused_lt<'a>(x: u8) {}
+        }
+    }
 }
 
 fn main() {}

@@ -3,7 +3,7 @@
 //
 //@ build-fail
 //@ stderr-per-bitwidth
-
+//@ ignore-parallel-frontend different alloc ids
 use std::cell::Cell;
 use std::mem::ManuallyDrop;
 
@@ -31,7 +31,7 @@ const C: S = {
     s
 };
 
-fn main() { //~ ERROR it is undefined behavior to use this value
-    // FIXME the span here is wrong, sould be pointing at the line below, not above.
+fn main() { //~ ERROR encountered `UnsafeCell` in read-only memory
+    // FIXME the span here is wrong, should be pointing at the line below, not above.
     let _: &'static _ = &C;
 }

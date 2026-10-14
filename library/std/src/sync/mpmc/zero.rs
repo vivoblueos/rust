@@ -10,7 +10,7 @@ use super::waker::Waker;
 use crate::cell::UnsafeCell;
 use crate::marker::PhantomData;
 use crate::sync::Mutex;
-use crate::sync::atomic::{AtomicBool, Ordering};
+use crate::sync::atomic::{Atomic, AtomicBool, Ordering};
 use crate::time::Instant;
 use crate::{fmt, ptr};
 
@@ -35,7 +35,7 @@ struct Packet<T> {
     on_stack: bool,
 
     /// Equals `true` once the packet is ready for reading or writing.
-    ready: AtomicBool,
+    ready: Atomic<bool>,
 
     /// The message.
     msg: UnsafeCell<Option<T>>,
@@ -190,7 +190,8 @@ impl<T> Channel<T> {
             drop(inner);
 
             // Block the current thread.
-            let sel = cx.wait_until(deadline);
+            // SAFETY: the context belongs to the current thread.
+            let sel = unsafe { cx.wait_until(deadline) };
 
             match sel {
                 Selected::Waiting => unreachable!(),
@@ -257,7 +258,8 @@ impl<T> Channel<T> {
             drop(inner);
 
             // Block the current thread.
-            let sel = cx.wait_until(deadline);
+            // SAFETY: the context belongs to the current thread.
+            let sel = unsafe { cx.wait_until(deadline) };
 
             match sel {
                 Selected::Waiting => unreachable!(),
@@ -313,5 +315,11 @@ impl<T> Channel<T> {
     /// Returns `true` if the channel is full.
     pub(crate) fn is_full(&self) -> bool {
         true
+    }
+
+    /// Returns `true` if the channel is disconnected.
+    pub(crate) fn is_disconnected(&self) -> bool {
+        let inner = self.inner.lock().unwrap();
+        inner.is_disconnected
     }
 }

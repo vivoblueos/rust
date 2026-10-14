@@ -21,27 +21,22 @@
 
 // tidy-alphabetical-start
 #![allow(internal_features)]
-#![doc(html_root_url = "https://doc.rust-lang.org/nightly/nightly-rustc/")]
-#![doc(rust_logo)]
-#![feature(array_windows)]
-#![feature(assert_matches)]
+#![cfg_attr(bootstrap, feature(assert_matches))]
 #![feature(box_patterns)]
-#![feature(extract_if)]
-#![feature(if_let_guard)]
 #![feature(iter_order_by)]
-#![feature(let_chains)]
 #![feature(rustc_attrs)]
-#![feature(rustdoc_internals)]
-#![feature(trait_upcasting)]
-#![warn(unreachable_pub)]
+#![feature(try_blocks)]
 // tidy-alphabetical-end
 
 mod async_closures;
 mod async_fn_in_trait;
+mod autorefs;
 pub mod builtin;
 mod context;
 mod dangling;
+mod default_could_be_derived;
 mod deref_into_dyn_supertrait;
+mod disallowed_pass_by_ref;
 mod drop_forget_useless;
 mod early;
 mod enum_intrinsics_non_enums;
@@ -49,14 +44,17 @@ mod errors;
 mod expect;
 mod for_loops_over_fallibles;
 mod foreign_modules;
-pub mod hidden_unicode_codepoints;
+mod function_cast_as_integer;
+mod gpukernel_abi;
 mod if_let_rescope;
 mod impl_trait_overcaptures;
+mod interior_mutable_consts;
 mod internal;
 mod invalid_from_utf8;
 mod late;
 mod let_underscore;
 mod levels;
+pub mod lifetime_syntax;
 mod lints;
 mod macro_expr_fragment_specifier_2024_migration;
 mod map_unit_fn;
@@ -67,7 +65,6 @@ mod non_local_def;
 mod nonstandard_style;
 mod noop_method_call;
 mod opaque_hidden_inferred_bound;
-mod pass_by_value;
 mod passes;
 mod precedence;
 mod ptr_nulls;
@@ -76,25 +73,33 @@ mod reference_casting;
 mod shadowed_into_iter;
 mod static_mut_refs;
 mod traits;
+mod transmute;
 mod types;
 mod unit_bindings;
 mod unqualified_local_imports;
-mod unused;
+pub mod unused;
+mod utils;
 
 use async_closures::AsyncClosureUsage;
 use async_fn_in_trait::AsyncFnInTrait;
+use autorefs::*;
 use builtin::*;
 use dangling::*;
+use default_could_be_derived::DefaultCouldBeDerived;
 use deref_into_dyn_supertrait::*;
+use disallowed_pass_by_ref::*;
 use drop_forget_useless::*;
 use enum_intrinsics_non_enums::EnumIntrinsicsNonEnums;
 use for_loops_over_fallibles::*;
-use hidden_unicode_codepoints::*;
+use function_cast_as_integer::*;
+use gpukernel_abi::*;
 use if_let_rescope::IfLetRescope;
 use impl_trait_overcaptures::ImplTraitOvercaptures;
+use interior_mutable_consts::*;
 use internal::*;
 use invalid_from_utf8::*;
 use let_underscore::*;
+use lifetime_syntax::*;
 use macro_expr_fragment_specifier_2024_migration::*;
 use map_unit_fn::*;
 use multiple_supertrait_upcastable::*;
@@ -104,7 +109,6 @@ use non_local_def::*;
 use nonstandard_style::*;
 use noop_method_call::*;
 use opaque_hidden_inferred_bound::*;
-use pass_by_value::*;
 use precedence::*;
 use ptr_nulls::*;
 use redundant_semicolon::*;
@@ -116,25 +120,24 @@ use shadowed_into_iter::ShadowedIntoIter;
 pub use shadowed_into_iter::{ARRAY_INTO_ITER, BOXED_SLICE_INTO_ITER};
 use static_mut_refs::*;
 use traits::*;
+use transmute::CheckTransmutes;
 use types::*;
 use unit_bindings::*;
 use unqualified_local_imports::*;
+use unused::must_use::*;
 use unused::*;
 
 #[rustfmt::skip]
 pub use builtin::{MissingDoc, SoftLints};
-pub use context::{
-    CheckLintNameResult, EarlyContext, FindLintError, LateContext, LintContext, LintStore,
-};
+pub use context::{CheckLintNameResult, EarlyContext, LateContext, LintContext, LintStore};
+pub use early::diagnostics::{DecorateAttrLint, DiagAndSess};
 pub use early::{EarlyCheckNode, check_ast_node};
 pub use late::{check_crate, late_lint_mod, unerased_lint_store};
+pub use levels::LintLevelsBuilder;
 pub use passes::{EarlyLintPass, LateLintPass};
+pub use rustc_errors::BufferedEarlyLint;
 pub use rustc_session::lint::Level::{self, *};
-pub use rustc_session::lint::{
-    BufferedEarlyLint, FutureIncompatibleInfo, Lint, LintId, LintPass, LintVec,
-};
-
-rustc_fluent_macro::fluent_messages! { "../messages.ftl" }
+pub use rustc_session::lint::{FutureIncompatibleInfo, Lint, LintId, LintPass, LintVec};
 
 pub fn provide(providers: &mut Providers) {
     levels::provide(providers);
@@ -170,15 +173,14 @@ early_lint_methods!(
             AnonymousParameters: AnonymousParameters,
             EllipsisInclusiveRangePatterns: EllipsisInclusiveRangePatterns::default(),
             NonCamelCaseTypes: NonCamelCaseTypes,
-            DeprecatedAttr: DeprecatedAttr::default(),
             WhileTrue: WhileTrue,
             NonAsciiIdents: NonAsciiIdents,
-            HiddenUnicodeCodepoints: HiddenUnicodeCodepoints,
             IncompleteInternalFeatures: IncompleteInternalFeatures,
             RedundantSemicolons: RedundantSemicolons,
             UnusedDocComment: UnusedDocComment,
             Expr2024: Expr2024,
             Precedence: Precedence,
+            DoubleNegations: DoubleNegations,
         ]
     ]
 );
@@ -189,15 +191,17 @@ late_lint_methods!(
         BuiltinCombinedModuleLateLintPass,
         [
             ForLoopsOverFallibles: ForLoopsOverFallibles,
+            DefaultCouldBeDerived: DefaultCouldBeDerived,
             DerefIntoDynSupertrait: DerefIntoDynSupertrait,
             DropForgetUseless: DropForgetUseless,
-            ImproperCTypesDeclarations: ImproperCTypesDeclarations,
-            ImproperCTypesDefinitions: ImproperCTypesDefinitions,
+            ImproperCTypesLint: ImproperCTypesLint,
+            ImproperGpuKernelLint: ImproperGpuKernelLint,
             InvalidFromUtf8: InvalidFromUtf8,
             VariantSizeDifferences: VariantSizeDifferences,
             PathStatements: PathStatements,
             LetUnderscore: LetUnderscore,
             InvalidReferenceCasting: InvalidReferenceCasting,
+            ImplicitAutorefs: ImplicitAutorefs,
             // Depends on referenced function signatures in expressions
             UnusedResults: UnusedResults,
             UnitBindings: UnitBindings,
@@ -237,10 +241,15 @@ late_lint_methods!(
             AsyncClosureUsage: AsyncClosureUsage,
             AsyncFnInTrait: AsyncFnInTrait,
             NonLocalDefinitions: NonLocalDefinitions::default(),
+            InteriorMutableConsts: InteriorMutableConsts,
             ImplTraitOvercaptures: ImplTraitOvercaptures,
             IfLetRescope: IfLetRescope::default(),
             StaticMutRefs: StaticMutRefs,
             UnqualifiedLocalImports: UnqualifiedLocalImports,
+            FunctionCastsAsInteger: FunctionCastsAsInteger,
+            CheckTransmutes: CheckTransmutes,
+            LifetimeSyntax: LifetimeSyntax,
+            InternalEqTraitMethodImpls: InternalEqTraitMethodImpls,
         ]
     ]
 );
@@ -283,9 +292,13 @@ fn register_builtins(store: &mut LintStore) {
         "unused",
         UNUSED_IMPORTS,
         UNUSED_VARIABLES,
+        UNUSED_VISIBILITIES,
         UNUSED_ASSIGNMENTS,
         DEAD_CODE,
         UNUSED_MUT,
+        // FIXME: add this lint when it becomes stable,
+        // see https://github.com/rust-lang/rust/issues/115585.
+        // UNREACHABLE_CFG_SELECT_PREDICATES,
         UNREACHABLE_CODE,
         UNREACHABLE_PATTERNS,
         UNUSED_MUST_USE,
@@ -332,6 +345,14 @@ fn register_builtins(store: &mut LintStore) {
 
     add_lint_group!("deprecated_safe", DEPRECATED_SAFE_2024);
 
+    add_lint_group!(
+        "unknown_or_malformed_diagnostic_attributes",
+        MALFORMED_DIAGNOSTIC_ATTRIBUTES,
+        MALFORMED_DIAGNOSTIC_FORMAT_LITERALS,
+        MISPLACED_DIAGNOSTIC_ATTRIBUTES,
+        UNKNOWN_DIAGNOSTIC_ATTRIBUTES
+    );
+
     // Register renamed and removed lints.
     store.register_renamed("single_use_lifetime", "single_use_lifetimes");
     store.register_renamed("elided_lifetime_in_path", "elided_lifetimes_in_paths");
@@ -348,6 +369,11 @@ fn register_builtins(store: &mut LintStore) {
     store.register_renamed("unused_tuple_struct_fields", "dead_code");
     store.register_renamed("static_mut_ref", "static_mut_refs");
     store.register_renamed("temporary_cstring_as_ptr", "dangling_pointers_from_temporaries");
+    store.register_renamed("elided_named_lifetimes", "mismatched_lifetime_syntaxes");
+    store.register_renamed(
+        "repr_transparent_external_private_fields",
+        "repr_transparent_non_zst_fields",
+    );
 
     // These were moved to tool lints, but rustc still sees them when compiling normally, before
     // tool lints are registered, so `check_tool_name_for_backwards_compat` doesn't work. Use
@@ -590,7 +616,34 @@ fn register_builtins(store: &mut LintStore) {
         "converted into hard error, see PR #125380 \
          <https://github.com/rust-lang/rust/pull/125380> for more information",
     );
-    store.register_removed("unsupported_calling_conventions", "converted into hard error");
+    store.register_removed(
+        "cenum_impl_drop_cast",
+        "converted into hard error, \
+         see <https://github.com/rust-lang/rust/issues/73333> for more information",
+    );
+    store.register_removed(
+        "ptr_cast_add_auto_to_object",
+        "converted into hard error, see issue #127323 \
+         <https://github.com/rust-lang/rust/issues/127323> for more information",
+    );
+    store.register_removed("unsupported_fn_ptr_calling_conventions", "converted into hard error");
+    store.register_removed(
+        "undefined_naked_function_abi",
+        "converted into hard error, see PR #139001 \
+         <https://github.com/rust-lang/rust/issues/139001> for more information",
+    );
+    store.register_removed(
+        "abi_unsupported_vector_types",
+        "converted into hard error, \
+         see <https://github.com/rust-lang/rust/issues/116558> for more information",
+    );
+    store.register_removed(
+        "missing_fragment_specifier",
+        "converted into hard error, \
+         see <https://github.com/rust-lang/rust/issues/40107> for more information",
+    );
+    store.register_removed("wasm_c_abi", "the wasm C ABI has been fixed");
+    store.register_removed("soft_unstable", "the general soft-unstable mechanism has been removed");
 }
 
 fn register_internals(store: &mut LintStore) {
@@ -600,37 +653,47 @@ fn register_internals(store: &mut LintStore) {
     store.register_late_mod_pass(|_| Box::new(DefaultHashTypes));
     store.register_lints(&QueryStability::lint_vec());
     store.register_late_mod_pass(|_| Box::new(QueryStability));
-    store.register_lints(&ExistingDocKeyword::lint_vec());
-    store.register_late_mod_pass(|_| Box::new(ExistingDocKeyword));
     store.register_lints(&TyTyKind::lint_vec());
     store.register_late_mod_pass(|_| Box::new(TyTyKind));
     store.register_lints(&TypeIr::lint_vec());
     store.register_late_mod_pass(|_| Box::new(TypeIr));
-    store.register_lints(&Diagnostics::lint_vec());
-    store.register_late_mod_pass(|_| Box::new(Diagnostics));
     store.register_lints(&BadOptAccess::lint_vec());
     store.register_late_mod_pass(|_| Box::new(BadOptAccess));
-    store.register_lints(&PassByValue::lint_vec());
-    store.register_late_mod_pass(|_| Box::new(PassByValue));
+    store.register_lints(&DisallowedPassByRef::lint_vec());
+    store.register_late_mod_pass(|_| Box::new(DisallowedPassByRef));
     store.register_lints(&SpanUseEqCtxt::lint_vec());
     store.register_late_mod_pass(|_| Box::new(SpanUseEqCtxt));
-    // FIXME(davidtwco): deliberately do not include `UNTRANSLATABLE_DIAGNOSTIC` and
-    // `DIAGNOSTIC_OUTSIDE_OF_IMPL` here because `-Wrustc::internal` is provided to every crate and
-    // these lints will trigger all of the time - change this once migration to diagnostic structs
-    // and translation is completed
-    store.register_group(false, "rustc::internal", None, vec![
-        LintId::of(DEFAULT_HASH_TYPES),
-        LintId::of(POTENTIAL_QUERY_INSTABILITY),
-        LintId::of(UNTRACKED_QUERY_INFORMATION),
-        LintId::of(USAGE_OF_TY_TYKIND),
-        LintId::of(PASS_BY_VALUE),
-        LintId::of(LINT_PASS_IMPL_WITHOUT_MACRO),
-        LintId::of(USAGE_OF_QUALIFIED_TY),
-        LintId::of(NON_GLOB_IMPORT_OF_TYPE_IR_INHERENT),
-        LintId::of(EXISTING_DOC_KEYWORD),
-        LintId::of(BAD_OPT_ACCESS),
-        LintId::of(SPAN_USE_EQ_CTXT),
-    ]);
+    store.register_lints(&SymbolInternStringLiteral::lint_vec());
+    store.register_late_mod_pass(|_| Box::new(SymbolInternStringLiteral));
+    store.register_lints(&ImplicitSysrootCrateImport::lint_vec());
+    store.register_early_pass(|| Box::new(ImplicitSysrootCrateImport));
+    store.register_lints(&BadUseOfFindAttr::lint_vec());
+    store.register_early_pass(|| Box::new(BadUseOfFindAttr));
+    store.register_lints(&RustcMustMatchExhaustively::lint_vec());
+    store.register_late_pass(|_| Box::new(RustcMustMatchExhaustively));
+    store.register_group(
+        false,
+        "rustc::internal",
+        None,
+        vec![
+            LintId::of(DEFAULT_HASH_TYPES),
+            LintId::of(POTENTIAL_QUERY_INSTABILITY),
+            LintId::of(UNTRACKED_QUERY_INFORMATION),
+            LintId::of(USAGE_OF_TY_TYKIND),
+            LintId::of(DISALLOWED_PASS_BY_REF),
+            LintId::of(LINT_PASS_IMPL_WITHOUT_MACRO),
+            LintId::of(USAGE_OF_QUALIFIED_TY),
+            LintId::of(NON_GLOB_IMPORT_OF_TYPE_IR_INHERENT),
+            LintId::of(USAGE_OF_TYPE_IR_INHERENT),
+            LintId::of(USAGE_OF_TYPE_IR_TRAITS),
+            LintId::of(BAD_OPT_ACCESS),
+            LintId::of(SPAN_USE_EQ_CTXT),
+            LintId::of(DIRECT_USE_OF_RUSTC_TYPE_IR),
+            LintId::of(IMPLICIT_SYSROOT_CRATE_IMPORT),
+            LintId::of(BAD_USE_OF_FIND_ATTR),
+            LintId::of(RUSTC_MUST_MATCH_EXHAUSTIVELY),
+        ],
+    );
 }
 
 #[cfg(test)]

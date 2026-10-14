@@ -313,8 +313,9 @@ pub struct Error<O, E> {
 
 mod helper {
     use super::*;
-    pub type ObligationTreeIdGenerator = impl Iterator<Item = ObligationTreeId>;
+    pub(super) type ObligationTreeIdGenerator = impl Iterator<Item = ObligationTreeId>;
     impl<O: ForestObligation> ObligationForest<O> {
+        #[define_opaque(ObligationTreeIdGenerator)]
         pub fn new() -> ObligationForest<O> {
             ObligationForest {
                 nodes: vec![],
@@ -413,6 +414,10 @@ impl<O: ForestObligation> ObligationForest<O> {
             .filter(|node| node.state.get() == NodeState::Pending)
             .map(|node| f(&node.obligation))
             .collect()
+    }
+
+    pub fn has_pending_obligations(&self) -> bool {
+        self.nodes.iter().any(|node| node.state.get() == NodeState::Pending)
     }
 
     fn insert_into_error_cache(&mut self, index: usize) {
@@ -697,7 +702,7 @@ impl<O: ForestObligation> ObligationForest<O> {
             self.apply_rewrites(&node_rewrites);
         }
 
-        node_rewrites.truncate(0);
+        node_rewrites.clear();
         self.reused_node_vec = node_rewrites;
     }
 

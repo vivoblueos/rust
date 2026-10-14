@@ -20,6 +20,7 @@ pub fn basic_test() -> Result<i32, i32> {
     // To avoid warnings during rustfix
     if true {
         Err(err)?;
+        //~^ try_err
     }
     Ok(0)
 }
@@ -30,6 +31,7 @@ pub fn into_test() -> Result<i32, i32> {
     // To avoid warnings during rustfix
     if true {
         Err(err)?;
+        //~^ try_err
     }
     Ok(0)
 }
@@ -50,6 +52,7 @@ pub fn closure_matches_test() -> Result<i32, i32> {
             // To avoid warnings during rustfix
             if true {
                 Err(err)?;
+                //~^ try_err
             }
             Ok(i)
         })
@@ -69,6 +72,7 @@ pub fn closure_into_test() -> Result<i32, i32> {
             // To avoid warnings during rustfix
             if true {
                 Err(err)?;
+                //~^ try_err
             }
             Ok(i)
         })
@@ -89,6 +93,7 @@ fn calling_macro() -> Result<i32, i32> {
         match $(Ok::<_, i32>(5)) {
             Ok(_) => 0,
             Err(_) => Err(1)?,
+            //~^ try_err
         }
     );
     // `Err` arg is another macro
@@ -96,33 +101,28 @@ fn calling_macro() -> Result<i32, i32> {
         match $(Ok::<_, i32>(5)) {
             Ok(_) => 0,
             Err(_) => Err(inline!(1))?,
+            //~^ try_err
         }
     );
     Ok(5)
 }
 
-fn main() {
-    basic_test().unwrap();
-    into_test().unwrap();
-    negative_test().unwrap();
-    closure_matches_test().unwrap();
-    closure_into_test().unwrap();
-    calling_macro().unwrap();
-
-    // We don't want to lint in external macros
-    external! {
-        pub fn try_err_fn() -> Result<i32, i32> {
-            let err: i32 = 1;
-            // To avoid warnings during rustfix
-            if true { Err(err)? } else { Ok(2) }
-        }
+// We don't want to lint in external macros
+external! {
+    pub fn try_err_fn() -> Result<i32, i32> {
+        let err: i32 = 1;
+        // To avoid warnings during rustfix
+        if true { Err(err)? } else { Ok(2) }
     }
 }
+
+fn main() {}
 
 #[inline_macros]
 pub fn macro_inside(fail: bool) -> Result<i32, String> {
     if fail {
         Err(inline!(inline!(String::from("aasdfasdfasdfa"))))?;
+        //~^ try_err
     }
     Ok(0)
 }
@@ -130,8 +130,10 @@ pub fn macro_inside(fail: bool) -> Result<i32, String> {
 pub fn poll_write(n: usize) -> Poll<io::Result<usize>> {
     if n == 0 {
         Err(io::ErrorKind::WriteZero)?
+        //~^ try_err
     } else if n == 1 {
         Err(io::Error::new(io::ErrorKind::InvalidInput, "error"))?
+        //~^ try_err
     };
 
     Poll::Ready(Ok(n))
@@ -140,6 +142,7 @@ pub fn poll_write(n: usize) -> Poll<io::Result<usize>> {
 pub fn poll_next(ready: bool) -> Poll<Option<io::Result<()>>> {
     if !ready {
         Err(io::ErrorKind::NotFound)?
+        //~^ try_err
     }
 
     Poll::Ready(None)
@@ -149,6 +152,7 @@ pub fn poll_next(ready: bool) -> Poll<Option<io::Result<()>>> {
 pub fn try_return(x: bool) -> Result<i32, i32> {
     if x {
         return Err(42)?;
+        //~^ try_err
     }
     Ok(0)
 }

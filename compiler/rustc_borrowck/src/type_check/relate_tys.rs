@@ -1,5 +1,6 @@
 use rustc_data_structures::fx::FxHashMap;
 use rustc_errors::ErrorGuaranteed;
+use rustc_hir::def_id::DefId;
 use rustc_infer::infer::relate::{
     PredicateEmittingRelation, Relate, RelateResult, StructurallyRelateAliases, TypeRelation,
 };
@@ -7,14 +8,13 @@ use rustc_infer::infer::{InferCtxt, NllRegionVariableOrigin};
 use rustc_infer::traits::Obligation;
 use rustc_infer::traits::solve::Goal;
 use rustc_middle::mir::ConstraintCategory;
-use rustc_middle::span_bug;
 use rustc_middle::traits::ObligationCause;
 use rustc_middle::traits::query::NoSolution;
-use rustc_middle::ty::fold::FnMutDelegate;
-use rustc_middle::ty::relate::combine::{super_combine_consts, super_combine_tys};
-use rustc_middle::ty::{self, Ty, TyCtxt, TypeVisitableExt};
-use rustc_span::symbol::sym;
-use rustc_span::{Span, Symbol};
+use rustc_middle::ty::relate::combine::{combine_ty_args, super_combine_consts, super_combine_tys};
+use rustc_middle::ty::relate::relate_args_invariantly;
+use rustc_middle::ty::{self, FnMutDelegate, Ty, TyCtxt, TypeVisitableExt};
+use rustc_middle::{bug, span_bug};
+use rustc_span::{Span, Symbol, sym};
 use tracing::{debug, instrument};
 
 use crate::constraints::OutlivesConstraint;
@@ -126,8 +126,13 @@ impl<'a, 'b, 'tcx> NllTypeRelating<'a, 'b, 'tcx> {
         // by using `ty_vid rel B` and then finally and end by equating `ty_vid` to
         // the opaque.
         let mut enable_subtyping = |ty, opaque_is_expected| {
-            let ty_vid = infcx.next_ty_var_id_in_universe(self.span(), ty::UniverseIndex::ROOT);
-
+            // We create the fresh inference variable in the highest universe.
+            // In theory we could limit it to the highest universe in the args of
+            // the opaque but that isn't really worth the effort.
+            //
+            // We'll make sure that the opaque type can actually name everything
+            // in its hidden type later on.
+            let ty_vid = infcx.next_ty_vid(self.span());
             let variance = if opaque_is_expected {
                 self.ambient_variance
             } else {
@@ -145,8 +150,12 @@ impl<'a, 'b, 'tcx> NllTypeRelating<'a, 'b, 'tcx> {
         };
 
         let (a, b) = match (a.kind(), b.kind()) {
-            (&ty::Alias(ty::Opaque, ..), _) => (a, enable_subtyping(b, true)?),
-            (_, &ty::Alias(ty::Opaque, ..)) => (enable_subtyping(a, false)?, b),
+            (&ty::Alias(ty::AliasTy { kind: ty::Opaque { .. }, .. }), _) => {
+                (a, enable_subtyping(b, true)?)
+            }
+            (_, &ty::Alias(ty::AliasTy { kind: ty::Opaque { .. }, .. })) => {
+                (enable_subtyping(a, false)?, b)
+            }
             _ => unreachable!(
                 "expected at least one opaque type in `relate_opaques`, got {a} and {b}."
             ),
@@ -169,7 +178,7 @@ impl<'a, 'b, 'tcx> NllTypeRelating<'a, 'b, 'tcx> {
             let infcx = self.type_checker.infcx;
             let mut lazy_universe = None;
             let delegate = FnMutDelegate {
-                regions: &mut |br: ty::BoundRegion| {
+                regions: &mut |br: ty::BoundRegion<'tcx>| {
                     // The first time this closure is called, create a
                     // new universe for the placeholders we will make
                     // from here out.
@@ -179,17 +188,17 @@ impl<'a, 'b, 'tcx> NllTypeRelating<'a, 'b, 'tcx> {
                         universe
                     });
 
-                    let placeholder = ty::PlaceholderRegion { universe, bound: br };
+                    let placeholder = ty::PlaceholderRegion::new(universe, br);
                     debug!(?placeholder);
                     let placeholder_reg = self.next_placeholder_region(placeholder);
                     debug!(?placeholder_reg);
 
                     placeholder_reg
                 },
-                types: &mut |_bound_ty: ty::BoundTy| {
+                types: &mut |_bound_ty: ty::BoundTy<'tcx>| {
                     unreachable!("we only replace regions in nll_relate, not types")
                 },
-                consts: &mut |_bound_var: ty::BoundVar| {
+                consts: &mut |_bound_const: ty::BoundConst<'tcx>| {
                     unreachable!("we only replace regions in nll_relate, not consts")
                 },
             };
@@ -213,21 +222,22 @@ impl<'a, 'b, 'tcx> NllTypeRelating<'a, 'b, 'tcx> {
         let infcx = self.type_checker.infcx;
         let mut reg_map = FxHashMap::default();
         let delegate = FnMutDelegate {
-            regions: &mut |br: ty::BoundRegion| {
+            regions: &mut |br: ty::BoundRegion<'tcx>| {
                 if let Some(ex_reg_var) = reg_map.get(&br) {
                     *ex_reg_var
                 } else {
-                    let ex_reg_var = self.next_existential_region_var(true, br.kind.get_name());
+                    let ex_reg_var =
+                        self.next_existential_region_var(br.kind.get_name(infcx.infcx.tcx));
                     debug!(?ex_reg_var);
                     reg_map.insert(br, ex_reg_var);
 
                     ex_reg_var
                 }
             },
-            types: &mut |_bound_ty: ty::BoundTy| {
+            types: &mut |_bound_ty: ty::BoundTy<'tcx>| {
                 unreachable!("we only replace regions in nll_relate, not types")
             },
-            consts: &mut |_bound_var: ty::BoundVar| {
+            consts: &mut |_bound_const: ty::BoundConst<'tcx>| {
                 unreachable!("we only replace regions in nll_relate, not consts")
             },
         };
@@ -245,28 +255,24 @@ impl<'a, 'b, 'tcx> NllTypeRelating<'a, 'b, 'tcx> {
     }
 
     #[instrument(skip(self), level = "debug")]
-    fn next_existential_region_var(
-        &mut self,
-        from_forall: bool,
-        name: Option<Symbol>,
-    ) -> ty::Region<'tcx> {
-        let origin = NllRegionVariableOrigin::Existential { from_forall };
-
-        let reg_var =
-            self.type_checker.infcx.next_nll_region_var(origin, || RegionCtxt::Existential(name));
-
-        reg_var
+    fn next_existential_region_var(&mut self, name: Option<Symbol>) -> ty::Region<'tcx> {
+        let origin = NllRegionVariableOrigin::Existential { name };
+        self.type_checker.infcx.next_nll_region_var(origin, || RegionCtxt::Existential(name))
     }
 
     #[instrument(skip(self), level = "debug")]
-    fn next_placeholder_region(&mut self, placeholder: ty::PlaceholderRegion) -> ty::Region<'tcx> {
+    fn next_placeholder_region(
+        &mut self,
+        placeholder: ty::PlaceholderRegion<'tcx>,
+    ) -> ty::Region<'tcx> {
         let reg =
             self.type_checker.constraints.placeholder_region(self.type_checker.infcx, placeholder);
 
         let reg_info = match placeholder.bound.kind {
             ty::BoundRegionKind::Anon => sym::anon,
-            ty::BoundRegionKind::Named(_, name) => name,
+            ty::BoundRegionKind::Named(def_id) => self.type_checker.tcx().item_name(def_id),
             ty::BoundRegionKind::ClosureEnv => sym::env,
+            ty::BoundRegionKind::NamedForPrinting(_) => bug!("only used for pretty printing"),
         };
 
         if cfg!(debug_assertions) {
@@ -306,6 +312,35 @@ impl<'b, 'tcx> TypeRelation<TyCtxt<'tcx>> for NllTypeRelating<'_, 'b, 'tcx> {
         self.type_checker.infcx.tcx
     }
 
+    fn relate_ty_args(
+        &mut self,
+        a_ty: Ty<'tcx>,
+        b_ty: Ty<'tcx>,
+        def_id: DefId,
+        a_args: ty::GenericArgsRef<'tcx>,
+        b_args: ty::GenericArgsRef<'tcx>,
+        _: impl FnOnce(ty::GenericArgsRef<'tcx>) -> Ty<'tcx>,
+    ) -> RelateResult<'tcx, Ty<'tcx>> {
+        if self.ambient_variance == ty::Invariant {
+            // Avoid fetching the variance if we are in an invariant context,
+            // slightly improves perf.
+            relate_args_invariantly(self, a_args, b_args)?;
+            Ok(a_ty)
+        } else {
+            let variances = self.cx().variances_of(def_id);
+            combine_ty_args(
+                &self.type_checker.infcx.infcx,
+                self,
+                a_ty,
+                b_ty,
+                variances,
+                a_args,
+                b_args,
+                |_| a_ty,
+            )
+        }
+    }
+
     #[instrument(skip(self, info), level = "trace", ret)]
     fn relate_with_variance<T: Relate<TyCtxt<'tcx>>>(
         &mut self,
@@ -331,7 +366,7 @@ impl<'b, 'tcx> TypeRelation<TyCtxt<'tcx>> for NllTypeRelating<'_, 'b, 'tcx> {
     fn tys(&mut self, a: Ty<'tcx>, b: Ty<'tcx>) -> RelateResult<'tcx, Ty<'tcx>> {
         let infcx = self.type_checker.infcx;
 
-        let a = self.type_checker.infcx.shallow_resolve(a);
+        let a = infcx.shallow_resolve(a);
         assert!(!b.has_non_region_infer(), "unexpected inference var {:?}", b);
 
         if a == b {
@@ -351,8 +386,8 @@ impl<'b, 'tcx> TypeRelation<TyCtxt<'tcx>> for NllTypeRelating<'_, 'b, 'tcx> {
             }
 
             (
-                &ty::Alias(ty::Opaque, ty::AliasTy { def_id: a_def_id, .. }),
-                &ty::Alias(ty::Opaque, ty::AliasTy { def_id: b_def_id, .. }),
+                &ty::Alias(ty::AliasTy { kind: ty::Opaque { def_id: a_def_id }, .. }),
+                &ty::Alias(ty::AliasTy { kind: ty::Opaque { def_id: b_def_id }, .. }),
             ) if a_def_id == b_def_id || infcx.next_trait_solver() => {
                 super_combine_tys(&infcx.infcx, self, a, b).map(|_| ()).or_else(|err| {
                     // This behavior is only there for the old solver, the new solver
@@ -366,8 +401,8 @@ impl<'b, 'tcx> TypeRelation<TyCtxt<'tcx>> for NllTypeRelating<'_, 'b, 'tcx> {
                     if a_def_id.is_local() { self.relate_opaques(a, b) } else { Err(err) }
                 })?;
             }
-            (&ty::Alias(ty::Opaque, ty::AliasTy { def_id, .. }), _)
-            | (_, &ty::Alias(ty::Opaque, ty::AliasTy { def_id, .. }))
+            (&ty::Alias(ty::AliasTy { kind: ty::Opaque { def_id }, .. }), _)
+            | (_, &ty::Alias(ty::AliasTy { kind: ty::Opaque { def_id }, .. }))
                 if def_id.is_local() && !self.type_checker.infcx.next_trait_solver() =>
             {
                 self.relate_opaques(a, b)?;

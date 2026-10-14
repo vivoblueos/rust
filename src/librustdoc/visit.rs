@@ -35,8 +35,8 @@ pub(crate) trait DocVisitor<'a>: Sized {
             | StaticItem(_)
             | ConstantItem(..)
             | TraitAliasItem(_)
-            | TyMethodItem(_)
-            | MethodItem(_, _)
+            | RequiredMethodItem(..)
+            | MethodItem(..)
             | StructFieldItem(_)
             | ForeignFunctionItem(..)
             | ForeignStaticItem(..)
@@ -44,18 +44,21 @@ pub(crate) trait DocVisitor<'a>: Sized {
             | MacroItem(_)
             | ProcMacroItem(_)
             | PrimitiveItem(_)
-            | TyAssocConstItem(..)
-            | AssocConstItem(..)
-            | TyAssocTypeItem(..)
+            | RequiredAssocConstItem(..)
+            | ProvidedAssocConstItem(..)
+            | ImplAssocConstItem(..)
+            | RequiredAssocTypeItem(..)
             | AssocTypeItem(..)
-            | KeywordItem => {}
+            | KeywordItem
+            | AttributeItem
+            | PlaceholderImplItem => {}
         }
     }
 
     /// Don't override!
     fn visit_item_recur(&mut self, item: &'a Item) {
         match &item.kind {
-            StrippedItem(i) => self.visit_inner_recur(&*i),
+            StrippedItem(i) => self.visit_inner_recur(i),
             _ => self.visit_inner_recur(&item.kind),
         }
     }

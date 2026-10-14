@@ -1,21 +1,21 @@
 //@ stderr-per-bitwidth
 //@ compile-flags: -Zunleash-the-miri-inside-of-you
-
+//@ ignore-parallel-frontend different alloc ids
 // All "inner" allocations that come with a `static` are interned immutably. This means it is
 // crucial that we do not accept any form of (interior) mutability there.
 use std::sync::atomic::*;
 
 static REF: &AtomicI32 = &AtomicI32::new(42);
-//~^ ERROR it is undefined behavior to use this value
+//~^ ERROR `UnsafeCell` in read-only memory
 
 static REFMUT: &mut i32 = &mut 0;
-//~^ ERROR it is undefined behavior to use this value
+//~^ ERROR mutable reference or box pointing to read-only memory
 
 // Different way of writing this that avoids promotion.
 static REF2: &AtomicI32 = {let x = AtomicI32::new(42); &{x}};
-//~^ ERROR it is undefined behavior to use this value
+//~^ ERROR `UnsafeCell` in read-only memory
 static REFMUT2: &mut i32 = {let mut x = 0; &mut {x}};
-//~^ ERROR it is undefined behavior to use this value
+//~^ ERROR mutable reference or box pointing to read-only memory
 
 // This one is obvious, since it is non-Sync. (It also suppresses the other errors, so it is
 // commented out.)
@@ -38,3 +38,5 @@ static RAW_MUT_COERCE: SyncPtr<i32> = SyncPtr { x: &mut 0 };
 //~^ ERROR mutable pointer in final value
 
 fn main() {}
+
+//~? WARN skipping const checks

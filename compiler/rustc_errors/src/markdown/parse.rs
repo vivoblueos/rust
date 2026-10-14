@@ -40,11 +40,13 @@ type ParseResult<'a> = Option<Parsed<'a>>;
 
 /// Parsing context
 #[derive(Clone, Copy, Debug, PartialEq)]
+// The default values are the most common setting for non top-level parsing: not top block, not at
+// line start (yes leading whitespace, not escaped).
 struct Context {
     /// If true, we are at a the topmost level (not recursing a nested tt)
-    top_block: bool,
+    top_block: bool = false,
     /// Previous character
-    prev: Prev,
+    prev: Prev = Prev::Whitespace,
 }
 
 /// Character class preceding this one
@@ -55,14 +57,6 @@ enum Prev {
     Whitespace,
     Escape,
     Any,
-}
-
-impl Default for Context {
-    /// Most common setting for non top-level parsing: not top block, not at
-    /// line start (yes leading whitespace, not escaped)
-    fn default() -> Self {
-        Self { top_block: false, prev: Prev::Whitespace }
-    }
 }
 
 /// Flags to simple parser function
@@ -226,7 +220,7 @@ fn parse_codeblock(buf: &[u8]) -> Parsed<'_> {
     let mut found = None;
     for idx in (0..working.len()).filter(|idx| working[*idx..].starts_with(&end_pat)) {
         let (eol_txt, rest) = parse_to_newline(&working[(idx + end_pat.len())..]);
-        if !eol_txt.iter().any(u8::is_ascii_whitespace) {
+        if eol_txt.iter().all(u8::is_ascii_whitespace) {
             found = Some((&working[..idx], rest));
             break;
         }
@@ -248,7 +242,7 @@ fn parse_heading(buf: &[u8]) -> ParseResult<'_> {
     }
 
     let (txt, rest) = parse_to_newline(&buf[1..]);
-    let ctx = Context { top_block: false, prev: Prev::Whitespace };
+    let ctx = Context { .. };
     let stream = parse_recursive(txt, ctx);
 
     Some((MdTree::Heading(level.try_into().unwrap(), stream), rest))
@@ -257,7 +251,7 @@ fn parse_heading(buf: &[u8]) -> ParseResult<'_> {
 /// Bulleted list
 fn parse_unordered_li(buf: &[u8]) -> Parsed<'_> {
     let (txt, rest) = get_indented_section(&buf[2..]);
-    let ctx = Context { top_block: false, prev: Prev::Whitespace };
+    let ctx = Context { .. };
     let stream = parse_recursive(trim_ascii_start(txt), ctx);
     (MdTree::UnorderedListItem(stream), rest)
 }
@@ -266,7 +260,7 @@ fn parse_unordered_li(buf: &[u8]) -> Parsed<'_> {
 fn parse_ordered_li(buf: &[u8]) -> Parsed<'_> {
     let (num, pos) = ord_list_start(buf).unwrap(); // success tested in caller
     let (txt, rest) = get_indented_section(&buf[pos..]);
-    let ctx = Context { top_block: false, prev: Prev::Whitespace };
+    let ctx = Context { .. };
     let stream = parse_recursive(trim_ascii_start(txt), ctx);
     (MdTree::OrderedListItem(num, stream), rest)
 }
@@ -346,7 +340,7 @@ fn parse_with_end_pat<'a>(
     None
 }
 
-/// Resturn `(match, residual)` to end of line. The EOL is returned with the
+/// Return `(match, residual)` to end of line. The EOL is returned with the
 /// residual.
 fn parse_to_newline(buf: &[u8]) -> (&[u8], &[u8]) {
     buf.iter().position(|ch| *ch == b'\n').map_or((buf, &[]), |pos| buf.split_at(pos))
@@ -358,7 +352,7 @@ fn normalize<'a>(MdStream(stream): MdStream<'a>, linkdefs: &mut Vec<MdTree<'a>>)
     let new_defs = stream.iter().filter(|tt| matches!(tt, MdTree::LinkDef { .. }));
     linkdefs.extend(new_defs.cloned());
 
-    // Run plaintest expansions on types that need it, call this function on nested types
+    // Run plaintext expansions on types that need it, call this function on nested types
     for item in stream {
         match item {
             MdTree::PlainText(txt) => expand_plaintext(txt, &mut new_stream, MdTree::PlainText),

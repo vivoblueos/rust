@@ -20,7 +20,7 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
         OperandRef::from_const(bx, val, ty)
     }
 
-    pub fn eval_mir_constant(&self, constant: &mir::ConstOperand<'tcx>) -> mir::ConstValue<'tcx> {
+    pub fn eval_mir_constant(&self, constant: &mir::ConstOperand<'tcx>) -> mir::ConstValue {
         // `MirUsedCollector` visited all required_consts before codegen began, so if we got here
         // there can be no more constants that fail to evaluate.
         self.monomorphize(constant.const_)
@@ -43,7 +43,7 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
             mir::Const::Ty(_, c) => match c.kind() {
                 // A constant that came from a const generic but was then used as an argument to
                 // old-style simd_shuffle (passing as argument instead of as a generic param).
-                rustc_type_ir::ConstKind::Value(_, valtree) => return Ok(Ok(valtree)),
+                ty::ConstKind::Value(cv) => return Ok(Ok(cv.valtree)),
                 other => span_bug!(constant.span, "{other:#?}"),
             },
             // We should never encounter `Const::Val` unless MIR opts (like const prop) evaluate
@@ -77,22 +77,21 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
             .flatten()
             .map(|val| {
                 // A SIMD type has a single field, which is an array.
-                let fields = val.unwrap_branch();
+                let fields = val.to_branch();
                 assert_eq!(fields.len(), 1);
-                let array = fields[0].unwrap_branch();
+                let array = fields[0].to_branch();
                 // Iterate over the array elements to obtain the values in the vector.
                 let values: Vec<_> = array
                     .iter()
                     .map(|field| {
-                        if let Some(prim) = field.try_to_scalar() {
-                            let layout = bx.layout_of(field_ty);
-                            let BackendRepr::Scalar(scalar) = layout.backend_repr else {
-                                bug!("from_const: invalid ByVal layout: {:#?}", layout);
-                            };
-                            bx.scalar_to_backend(prim, scalar, bx.immediate_backend_type(layout))
-                        } else {
+                        let Some(prim) = field.try_to_scalar() else {
                             bug!("field is not a scalar {:?}", field)
-                        }
+                        };
+                        let layout = bx.layout_of(field_ty);
+                        let BackendRepr::Scalar(scalar) = layout.backend_repr else {
+                            bug!("from_const: invalid ByVal layout: {:#?}", layout);
+                        };
+                        bx.scalar_to_backend(prim, scalar, bx.immediate_backend_type(layout))
                     })
                     .collect();
                 bx.const_vector(&values)

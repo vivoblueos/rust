@@ -17,9 +17,9 @@ fn hash<T: HashStable<()>>(t: &T) -> Hash128 {
 // Check that bit set hash includes the domain size.
 #[test]
 fn test_hash_bit_set() {
-    use rustc_index::bit_set::BitSet;
-    let a: BitSet<usize> = BitSet::new_empty(1);
-    let b: BitSet<usize> = BitSet::new_empty(2);
+    use rustc_index::bit_set::DenseBitSet;
+    let a: DenseBitSet<usize> = DenseBitSet::new_empty(1);
+    let b: DenseBitSet<usize> = DenseBitSet::new_empty(2);
     assert_ne!(a, b);
     assert_ne!(hash(&a), hash(&b));
 }
@@ -44,8 +44,8 @@ fn test_attribute_permutation() {
                 b: $ty,
             }
 
-            impl<CTX> HashStable<CTX> for Foo {
-                fn hash_stable(&self, hcx: &mut CTX, hasher: &mut StableHasher) {
+            impl<Hcx> HashStable<Hcx> for Foo {
+                fn hash_stable(&self, hcx: &mut Hcx, hasher: &mut StableHasher) {
                     self.a.hash_stable(hcx, hasher);
                     self.b.hash_stable(hcx, hasher);
                 }

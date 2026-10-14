@@ -2,16 +2,19 @@ use std::fmt;
 
 use derive_where::derive_where;
 #[cfg(feature = "nightly")]
-use rustc_macros::{Decodable, Encodable, HashStable_NoContext, TyDecodable, TyEncodable};
-use rustc_type_ir_macros::{TypeFoldable_Generic, TypeVisitable_Generic};
+use rustc_macros::{Decodable_NoContext, Encodable_NoContext, HashStable_NoContext};
+use rustc_type_ir_macros::{GenericTypeVisitable, TypeFoldable_Generic, TypeVisitable_Generic};
 
 use crate::{self as ty, Interner};
 
 /// A clause is something that can appear in where bounds or be inferred
 /// by implied bounds.
-#[derive_where(Clone, Copy, Hash, PartialEq, Eq; I: Interner)]
-#[derive(TypeVisitable_Generic, TypeFoldable_Generic)]
-#[cfg_attr(feature = "nightly", derive(TyEncodable, TyDecodable, HashStable_NoContext))]
+#[derive_where(Clone, Copy, Hash, PartialEq; I: Interner)]
+#[derive(TypeVisitable_Generic, GenericTypeVisitable, TypeFoldable_Generic)]
+#[cfg_attr(
+    feature = "nightly",
+    derive(Encodable_NoContext, Decodable_NoContext, HashStable_NoContext)
+)]
 pub enum ClauseKind<I: Interner> {
     /// Corresponds to `where Foo: Bar<A, B, C>`. `Foo` here would be
     /// the `Self` type of the trait reference and `A`, `B`, and `C`
@@ -33,7 +36,7 @@ pub enum ClauseKind<I: Interner> {
     ConstArgHasType(I::Const, I::Ty),
 
     /// No syntax: `T` well-formed.
-    WellFormed(I::GenericArg),
+    WellFormed(I::Term),
 
     /// Constant initializer must evaluate successfully.
     ConstEvaluatable(I::Const),
@@ -43,17 +46,29 @@ pub enum ClauseKind<I: Interner> {
     /// corresponding trait clause; this just enforces the *constness* of that
     /// implementation.
     HostEffect(ty::HostEffectPredicate<I>),
+
+    /// Support marking impl as unstable.
+    UnstableFeature(
+        #[type_foldable(identity)]
+        #[type_visitable(ignore)]
+        I::Symbol,
+    ),
 }
 
-#[derive_where(Clone, Copy, Hash, PartialEq, Eq; I: Interner)]
-#[derive(TypeVisitable_Generic, TypeFoldable_Generic)]
-#[cfg_attr(feature = "nightly", derive(TyEncodable, TyDecodable, HashStable_NoContext))]
+impl<I: Interner> Eq for ClauseKind<I> {}
+
+#[derive_where(Clone, Copy, Hash, PartialEq; I: Interner)]
+#[derive(TypeVisitable_Generic, GenericTypeVisitable, TypeFoldable_Generic)]
+#[cfg_attr(
+    feature = "nightly",
+    derive(Encodable_NoContext, Decodable_NoContext, HashStable_NoContext)
+)]
 pub enum PredicateKind<I: Interner> {
     /// Prove a clause
     Clause(ClauseKind<I>),
 
     /// Trait must be dyn-compatible.
-    DynCompatible(I::DefId),
+    DynCompatible(I::TraitId),
 
     /// `T1 <: T2`
     ///
@@ -96,8 +111,13 @@ pub enum PredicateKind<I: Interner> {
     AliasRelate(I::Term, I::Term, AliasRelationDirection),
 }
 
+impl<I: Interner> Eq for PredicateKind<I> {}
+
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Copy)]
-#[cfg_attr(feature = "nightly", derive(HashStable_NoContext, Encodable, Decodable))]
+#[cfg_attr(
+    feature = "nightly",
+    derive(HashStable_NoContext, Encodable_NoContext, Decodable_NoContext)
+)]
 pub enum AliasRelationDirection {
     Equate,
     Subtype,
@@ -124,6 +144,9 @@ impl<I: Interner> fmt::Debug for ClauseKind<I> {
             ClauseKind::WellFormed(data) => write!(f, "WellFormed({data:?})"),
             ClauseKind::ConstEvaluatable(ct) => {
                 write!(f, "ConstEvaluatable({ct:?})")
+            }
+            ClauseKind::UnstableFeature(feature_name) => {
+                write!(f, "UnstableFeature({feature_name:?})")
             }
         }
     }

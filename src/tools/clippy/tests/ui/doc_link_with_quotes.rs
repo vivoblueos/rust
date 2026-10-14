@@ -1,18 +1,15 @@
 #![warn(clippy::doc_link_with_quotes)]
 
-fn main() {
-    foo()
-}
+fn main() {}
 
 /// Calls ['bar'] uselessly
-//~^ ERROR: possible intra-doc link using quotes instead of backticks
-//~| NOTE: `-D clippy::doc-link-with-quotes` implied by `-D warnings`
+//~^ doc_link_with_quotes
 pub fn foo() {
     bar()
 }
 
 /// Calls ["bar"] uselessly
-//~^ ERROR: possible intra-doc link using quotes instead of backticks
+//~^ doc_link_with_quotes
 pub fn foo2() {
     bar()
 }

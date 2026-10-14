@@ -3,10 +3,10 @@
 //@[noopt] compile-flags: -Copt-level=0
 //@[opt] compile-flags: -O
 //! This fails without optimizations, so it should also fail with optimizations.
-
+//@ ignore-parallel-frontend post-monomorphization errors
 struct Fail<T>(T);
 impl<T> Fail<T> {
-    const C: () = panic!(); //~ERROR evaluation of `Fail::<i32>::C` failed
+    const C: () = panic!(); //~ERROR evaluation panicked: explicit panic
 }
 
 // This function is not actually called, but is mentioned implicitly as destructor in dead code in a

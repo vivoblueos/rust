@@ -3,10 +3,10 @@
 //@ revisions:cfail1 cfail2
 //@ compile-flags: -Z query-dep-graph
 //@ build-pass
+//@ ignore-backends: gcc
 
 #![crate_type = "rlib"]
 #![feature(rustc_attrs)]
-#![feature(stmt_expr_attributes)]
 #![allow(dead_code)]
 
 // These are expected to require codegen.
@@ -52,7 +52,7 @@ pub mod point {
 pub mod fn_calls_changed_method {
     use point::Point;
 
-    #[rustc_clean(except="typeck,optimized_mir", cfg="cfail2")]
+    #[rustc_clean(except="typeck_root,optimized_mir", cfg="cfail2")]
     pub fn check() {
         let p = Point { x: 2.0, y: 2.0 };
         p.distance_from_point(None);

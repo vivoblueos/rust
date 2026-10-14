@@ -1,11 +1,17 @@
 //@ run-pass
 //@ check-run-results
+//@ needs-subprocess
 //@ ignore-windows
-//@ ignore-wasm32
 //@ ignore-fuchsia
 //@ ignore-horizon
 //@ ignore-android
-//@ normalize-stderr-test: ".rs:\d+:\d+" -> ".rs:LL:CC"
+//@ ignore-ios no 'head'
+//@ ignore-tvos no 'head'
+//@ ignore-watchos no 'head'
+//@ ignore-visionos no 'head'
+//@ ignore-backends: gcc
+//@ normalize-stderr: ".rs:\d+:\d+" -> ".rs:LL:CC"
+//@ normalize-stderr: "/rustc(?:-dev)?/[a-z0-9.]+/" -> ""
 //@ compile-flags: -Zon-broken-pipe=error
 
 // Test what the error message looks like when `println!()` panics because of

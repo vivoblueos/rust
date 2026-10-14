@@ -1,6 +1,6 @@
 //! Maps syntax elements through disjoint syntax nodes.
 //!
-//! [`SyntaxMappingBuilder`] should be used to create mappings to add to a [`SyntaxEditor`]
+//! [`SyntaxMappingBuilder`] should be used to create mappings to add to a `SyntaxEditor`
 
 use itertools::Itertools;
 use rustc_hash::FxHashMap;
@@ -20,10 +20,6 @@ pub struct SyntaxMapping {
 }
 
 impl SyntaxMapping {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
     /// Like [`SyntaxMapping::upmap_child`] but for syntax elements.
     pub fn upmap_child_element(
         &self,
@@ -165,7 +161,7 @@ impl SyntaxMapping {
         // Try to follow the mapping tree, if it exists
         let input_mapping = self.upmap_node_single(input);
         let input_ancestor =
-            input.ancestors().find_map(|ancestor| self.upmap_node_single(&ancestor));
+            input.ancestors().find(|ancestor| self.upmap_node_single(ancestor).is_some());
 
         match (input_mapping, input_ancestor) {
             (Some(input_mapping), _) => {
@@ -239,10 +235,10 @@ impl SyntaxMappingBuilder {
 
     pub fn map_children(
         &mut self,
-        input: impl Iterator<Item = SyntaxNode>,
-        output: impl Iterator<Item = SyntaxNode>,
+        input: impl IntoIterator<Item = SyntaxNode>,
+        output: impl IntoIterator<Item = SyntaxNode>,
     ) {
-        for pairs in input.zip_longest(output) {
+        for pairs in input.into_iter().zip_longest(output) {
             let (input, output) = match pairs {
                 itertools::EitherOrBoth::Both(l, r) => (l, r),
                 itertools::EitherOrBoth::Left(_) => {

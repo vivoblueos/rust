@@ -3,7 +3,7 @@
 //@revisions: isolation no_isolation
 //@[no_isolation]compile-flags: -Zmiri-disable-isolation
 
-/// Test direct calls of getrandom 0.1 and 0.2.
+/// Test direct calls of getrandom 0.1, 0.2 and 0.3.
 fn main() {
     let mut data = vec![0; 16];
 
@@ -12,5 +12,9 @@ fn main() {
     #[cfg(not(target_os = "solaris"))]
     getrandom_01::getrandom(&mut data).unwrap();
 
+    // On Windows, getrandom 0.2 uses the wrong return type for BCryptGenRandom
+    #[cfg(not(target_os = "windows"))]
     getrandom_02::getrandom(&mut data).unwrap();
+
+    getrandom_03::fill(&mut data).unwrap();
 }

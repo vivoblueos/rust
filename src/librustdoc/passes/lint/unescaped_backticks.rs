@@ -2,10 +2,10 @@
 
 use std::ops::Range;
 
-use pulldown_cmark::{BrokenLink, Event, Parser};
 use rustc_errors::Diag;
 use rustc_hir::HirId;
 use rustc_lint_defs::Applicability;
+use rustc_resolve::rustdoc::pulldown_cmark::{BrokenLink, Event, Parser};
 use rustc_resolve::rustdoc::source_span_for_markdown_range;
 
 use crate::clean::Item;
@@ -22,7 +22,7 @@ pub(crate) fn visit_item(cx: &DocContext<'_>, item: &Item, hir_id: HirId, dox: &
             .find(|link| *link.original_text == *broken_link.reference)
             .map(|link| ((*link.href).into(), (*link.new_text).into()))
     };
-    let parser = Parser::new_with_broken_link_callback(&dox, main_body_opts(), Some(&mut replacer))
+    let parser = Parser::new_with_broken_link_callback(dox, main_body_opts(), Some(&mut replacer))
         .into_offset_iter();
 
     let mut element_stack = Vec::new();
@@ -42,15 +42,17 @@ pub(crate) fn visit_item(cx: &DocContext<'_>, item: &Item, hir_id: HirId, dox: &
 
                 // If we can't get a span of the backtick, because it is in a `#[doc = ""]` attribute,
                 // use the span of the entire attribute as a fallback.
-                let span = source_span_for_markdown_range(
+                let span = match source_span_for_markdown_range(
                     tcx,
-                    &dox,
+                    dox,
                     &(backtick_index..backtick_index + 1),
                     &item.attrs.doc_strings,
-                )
-                .unwrap_or_else(|| item.attr_span(tcx));
+                ) {
+                    Some((sp, _)) => sp,
+                    None => item.attr_span(tcx),
+                };
 
-                tcx.node_span_lint(crate::lint::UNESCAPED_BACKTICKS, hir_id, span, |lint| {
+                tcx.emit_node_span_lint(crate::lint::UNESCAPED_BACKTICKS, hir_id, span, rustc_errors::DiagDecorator(|lint| {
                     lint.primary_message("unescaped backtick");
 
                     let mut help_emitted = false;
@@ -61,12 +63,12 @@ pub(crate) fn visit_item(cx: &DocContext<'_>, item: &Item, hir_id: HirId, dox: &
                             // "foo` `bar`" -> "`foo` `bar`"
                             if let Some(suggest_index) =
                                 clamp_start(guess, &element.suggestible_ranges)
-                                && can_suggest_backtick(&dox, suggest_index)
+                                && can_suggest_backtick(dox, suggest_index)
                             {
                                 suggest_insertion(
                                     cx,
                                     item,
-                                    &dox,
+                                    dox,
                                     lint,
                                     suggest_index,
                                     '`',
@@ -80,11 +82,11 @@ pub(crate) fn visit_item(cx: &DocContext<'_>, item: &Item, hir_id: HirId, dox: &
                             // Don't `clamp_end` here, because the suggestion is guaranteed to be inside
                             // an inline code node and we intentionally "break" the inline code here.
                             let suggest_index = guess;
-                            if can_suggest_backtick(&dox, suggest_index) {
+                            if can_suggest_backtick(dox, suggest_index) {
                                 suggest_insertion(
                                     cx,
                                     item,
-                                    &dox,
+                                    dox,
                                     lint,
                                     suggest_index,
                                     '`',
@@ -98,15 +100,15 @@ pub(crate) fn visit_item(cx: &DocContext<'_>, item: &Item, hir_id: HirId, dox: &
                     if !element.prev_code_guess.is_confident() {
                         // "`foo` bar`" -> "`foo` `bar`"
                         if let Some(guess) =
-                            guess_start_of_code(&dox, element.element_range.start..backtick_index)
+                            guess_start_of_code(dox, element.element_range.start..backtick_index)
                             && let Some(suggest_index) =
                                 clamp_start(guess, &element.suggestible_ranges)
-                            && can_suggest_backtick(&dox, suggest_index)
+                            && can_suggest_backtick(dox, suggest_index)
                         {
                             suggest_insertion(
                                 cx,
                                 item,
-                                &dox,
+                                dox,
                                 lint,
                                 suggest_index,
                                 '`',
@@ -120,16 +122,16 @@ pub(crate) fn visit_item(cx: &DocContext<'_>, item: &Item, hir_id: HirId, dox: &
                         // if we already suggested opening backtick. For example:
                         // "foo`." -> "`foo`." or "foo`s" -> "`foo`s".
                         if let Some(guess) =
-                            guess_end_of_code(&dox, backtick_index + 1..element.element_range.end)
+                            guess_end_of_code(dox, backtick_index + 1..element.element_range.end)
                             && let Some(suggest_index) =
                                 clamp_end(guess, &element.suggestible_ranges)
-                            && can_suggest_backtick(&dox, suggest_index)
+                            && can_suggest_backtick(dox, suggest_index)
                             && (!help_emitted || suggest_index - backtick_index > 2)
                         {
                             suggest_insertion(
                                 cx,
                                 item,
-                                &dox,
+                                dox,
                                 lint,
                                 suggest_index,
                                 '`',
@@ -148,13 +150,13 @@ pub(crate) fn visit_item(cx: &DocContext<'_>, item: &Item, hir_id: HirId, dox: &
                     suggest_insertion(
                         cx,
                         item,
-                        &dox,
+                        dox,
                         lint,
                         backtick_index,
                         '\\',
                         "if you meant to use a literal backtick, escape it",
                     );
-                });
+                }));
             }
             Event::Code(_) => {
                 let element = element_stack
@@ -177,13 +179,13 @@ pub(crate) fn visit_item(cx: &DocContext<'_>, item: &Item, hir_id: HirId, dox: &
                     let is_confident = text_inside.starts_with(char::is_whitespace)
                         || text_inside.ends_with(char::is_whitespace);
 
-                    if let Some(guess) = guess_end_of_code(&dox, range_inside) {
+                    if let Some(guess) = guess_end_of_code(dox, range_inside) {
                         // Find earlier end of code.
                         element.prev_code_guess = PrevCodeGuess::End { guess, is_confident };
                     } else {
                         // Find alternate start of code.
                         let range_before = element.element_range.start..event_range.start;
-                        if let Some(guess) = guess_start_of_code(&dox, range_before) {
+                        if let Some(guess) = guess_start_of_code(dox, range_before) {
                             element.prev_code_guess = PrevCodeGuess::Start { guess, is_confident };
                         }
                     }
@@ -419,9 +421,9 @@ fn suggest_insertion(
     /// Maximum bytes of context to show around the insertion.
     const CONTEXT_MAX_LEN: usize = 80;
 
-    if let Some(span) = source_span_for_markdown_range(
+    if let Some((span, _)) = source_span_for_markdown_range(
         cx.tcx,
-        &dox,
+        dox,
         &(insert_index..insert_index),
         &item.attrs.doc_strings,
     ) {

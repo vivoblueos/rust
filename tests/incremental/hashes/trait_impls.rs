@@ -11,6 +11,7 @@
 //@ [cfail1]compile-flags: -Zincremental-ignore-spans
 //@ [cfail2]compile-flags: -Zincremental-ignore-spans
 //@ [cfail3]compile-flags: -Zincremental-ignore-spans
+//@ ignore-backends: gcc
 
 #![allow(warnings)]
 #![feature(rustc_attrs)]
@@ -34,7 +35,7 @@ impl ChangeMethodNameTrait for Foo {
 #[cfg(not(any(cfail1,cfail4)))]
 #[rustc_clean(except="opt_hir_owner_nodes,associated_item_def_ids", cfg="cfail2")]
 #[rustc_clean(cfg="cfail3")]
-#[rustc_clean(except="opt_hir_owner_nodes,associated_item_def_ids", cfg="cfail5")]
+#[rustc_clean(except="opt_hir_owner_nodes,associated_item_def_ids,predicates_of", cfg="cfail5")]
 #[rustc_clean(cfg="cfail6")]
 pub trait ChangeMethodNameTrait {
     #[rustc_clean(cfg="cfail3")]
@@ -75,12 +76,12 @@ impl ChangeMethodBodyTrait for Foo {
 #[cfg(not(any(cfail1,cfail4)))]
 #[rustc_clean(cfg="cfail2")]
 #[rustc_clean(cfg="cfail3")]
-#[rustc_clean(cfg="cfail5")]
+#[rustc_clean(except="opt_hir_owner_nodes", cfg="cfail5")]
 #[rustc_clean(cfg="cfail6")]
 impl ChangeMethodBodyTrait for Foo {
-    #[rustc_clean(except="opt_hir_owner_nodes,typeck", cfg="cfail2")]
+    #[rustc_clean(except="opt_hir_owner_nodes,typeck_root", cfg="cfail2")]
     #[rustc_clean(cfg="cfail3")]
-    #[rustc_clean(except="opt_hir_owner_nodes,typeck", cfg="cfail5")]
+    #[rustc_clean(except="opt_hir_owner_nodes,typeck_root", cfg="cfail5")]
     #[rustc_clean(cfg="cfail6")]
     fn method_name() {
         ()
@@ -110,12 +111,12 @@ impl ChangeMethodBodyTraitInlined for Foo {
 #[cfg(not(any(cfail1,cfail4)))]
 #[rustc_clean(cfg="cfail2")]
 #[rustc_clean(cfg="cfail3")]
-#[rustc_clean(cfg="cfail5")]
+#[rustc_clean(except="opt_hir_owner_nodes", cfg="cfail5")]
 #[rustc_clean(cfg="cfail6")]
 impl ChangeMethodBodyTraitInlined for Foo {
-    #[rustc_clean(except="opt_hir_owner_nodes,typeck,optimized_mir", cfg="cfail2")]
+    #[rustc_clean(except="opt_hir_owner_nodes,typeck_root,optimized_mir", cfg="cfail2")]
     #[rustc_clean(cfg="cfail3")]
-    #[rustc_clean(except="opt_hir_owner_nodes,typeck,optimized_mir", cfg="cfail5")]
+    #[rustc_clean(except="opt_hir_owner_nodes,typeck_root,optimized_mir", cfg="cfail5")]
     #[rustc_clean(cfg="cfail6")]
     #[inline]
     fn method_name() {
@@ -141,18 +142,18 @@ pub trait ChangeMethodSelfnessTrait {
 }
 
 #[cfg(not(any(cfail1,cfail4)))]
-#[rustc_clean(except="opt_hir_owner_nodes", cfg="cfail2")]
+#[rustc_clean(cfg="cfail2")]
 #[rustc_clean(cfg="cfail3")]
 #[rustc_clean(except="opt_hir_owner_nodes", cfg="cfail5")]
 #[rustc_clean(cfg="cfail6")]
 impl ChangeMethodSelfnessTrait for Foo {
     #[rustc_clean(
-        except="opt_hir_owner_nodes,associated_item,generics_of,fn_sig,typeck,optimized_mir",
+        except="opt_hir_owner_nodes,associated_item,generics_of,fn_sig,typeck_root,optimized_mir",
         cfg="cfail2",
     )]
     #[rustc_clean(cfg="cfail3")]
     #[rustc_clean(
-        except="opt_hir_owner_nodes,associated_item,generics_of,fn_sig,typeck,optimized_mir",
+        except="opt_hir_owner_nodes,associated_item,generics_of,fn_sig,typeck_root,optimized_mir",
         cfg="cfail5",
     )]
     #[rustc_clean(cfg="cfail6")]
@@ -179,18 +180,18 @@ pub trait RemoveMethodSelfnessTrait {
 }
 
 #[cfg(not(any(cfail1,cfail4)))]
-#[rustc_clean(except="opt_hir_owner_nodes", cfg="cfail2")]
+#[rustc_clean(cfg="cfail2")]
 #[rustc_clean(cfg="cfail3")]
 #[rustc_clean(except="opt_hir_owner_nodes", cfg="cfail5")]
 #[rustc_clean(cfg="cfail6")]
 impl RemoveMethodSelfnessTrait for Foo {
     #[rustc_clean(
-        except="opt_hir_owner_nodes,associated_item,generics_of,fn_sig,typeck,optimized_mir",
+        except="opt_hir_owner_nodes,associated_item,generics_of,fn_sig,typeck_root,optimized_mir",
         cfg="cfail2",
     )]
     #[rustc_clean(cfg="cfail3")]
     #[rustc_clean(
-        except="opt_hir_owner_nodes,associated_item,generics_of,fn_sig,typeck,optimized_mir",
+        except="opt_hir_owner_nodes,associated_item,generics_of,fn_sig,typeck_root,optimized_mir",
         cfg="cfail5",
     )]
     #[rustc_clean(cfg="cfail6")]
@@ -221,12 +222,12 @@ pub trait ChangeMethodSelfmutnessTrait {
 #[cfg(not(any(cfail1,cfail4)))]
 #[rustc_clean(cfg="cfail2")]
 #[rustc_clean(cfg="cfail3")]
-#[rustc_clean(cfg="cfail5")]
+#[rustc_clean(except="opt_hir_owner_nodes", cfg="cfail5")]
 #[rustc_clean(cfg="cfail6")]
 impl ChangeMethodSelfmutnessTrait for Foo {
-    #[rustc_clean(except="opt_hir_owner_nodes,fn_sig,typeck,optimized_mir", cfg="cfail2")]
+    #[rustc_clean(except="opt_hir_owner_nodes,fn_sig,typeck_root,optimized_mir", cfg="cfail2")]
     #[rustc_clean(cfg="cfail3")]
-    #[rustc_clean(except="opt_hir_owner_nodes,fn_sig,typeck,optimized_mir", cfg="cfail5")]
+    #[rustc_clean(except="opt_hir_owner_nodes,fn_sig,typeck_root,optimized_mir", cfg="cfail5")]
     #[rustc_clean(cfg="cfail6")]
     fn method_name(&mut self) {}
 }
@@ -403,12 +404,12 @@ pub trait AddArgumentTrait {
 #[cfg(not(any(cfail1,cfail4)))]
 #[rustc_clean(cfg="cfail2")]
 #[rustc_clean(cfg="cfail3")]
-#[rustc_clean(cfg="cfail5")]
+#[rustc_clean(except="opt_hir_owner_nodes", cfg="cfail5")]
 #[rustc_clean(cfg="cfail6")]
 impl AddArgumentTrait for Foo {
-    #[rustc_clean(except="opt_hir_owner_nodes,fn_sig,typeck,optimized_mir", cfg="cfail2")]
+    #[rustc_clean(except="opt_hir_owner_nodes,fn_sig,typeck_root,optimized_mir", cfg="cfail2")]
     #[rustc_clean(cfg="cfail3")]
-    #[rustc_clean(except="opt_hir_owner_nodes,fn_sig,typeck,optimized_mir", cfg="cfail5")]
+    #[rustc_clean(except="opt_hir_owner_nodes,fn_sig,typeck_root,optimized_mir", cfg="cfail5")]
     #[rustc_clean(cfg="cfail6")]
     fn method_name(&self, _x: u32) { }
 }
@@ -437,12 +438,12 @@ pub trait ChangeArgumentTypeTrait {
 #[cfg(not(any(cfail1,cfail4)))]
 #[rustc_clean(cfg="cfail2")]
 #[rustc_clean(cfg="cfail3")]
-#[rustc_clean(cfg="cfail5")]
+#[rustc_clean(except="opt_hir_owner_nodes", cfg="cfail5")]
 #[rustc_clean(cfg="cfail6")]
 impl ChangeArgumentTypeTrait for Foo {
-    #[rustc_clean(except="opt_hir_owner_nodes,fn_sig,typeck,optimized_mir", cfg="cfail2")]
+    #[rustc_clean(except="opt_hir_owner_nodes,fn_sig,typeck_root,optimized_mir", cfg="cfail2")]
     #[rustc_clean(cfg="cfail3")]
-    #[rustc_clean(except="opt_hir_owner_nodes,fn_sig,typeck,optimized_mir", cfg="cfail5")]
+    #[rustc_clean(except="opt_hir_owner_nodes,fn_sig,typeck_root,optimized_mir", cfg="cfail5")]
     #[rustc_clean(cfg="cfail6")]
     fn method_name(&self, _x: char) { }
 }
@@ -468,12 +469,12 @@ impl AddTypeParameterToImpl<u32> for Bar<u32> {
 #[rustc_clean(cfg="cfail6")]
 impl<TTT> AddTypeParameterToImpl<TTT> for Bar<TTT> {
     #[rustc_clean(
-        except="opt_hir_owner_nodes,generics_of,fn_sig,type_of,typeck,optimized_mir",
+        except="opt_hir_owner_nodes,generics_of,fn_sig,type_of,typeck_root,optimized_mir",
         cfg="cfail2",
     )]
     #[rustc_clean(cfg="cfail3")]
     #[rustc_clean(
-        except="opt_hir_owner_nodes,generics_of,fn_sig,type_of,typeck,optimized_mir",
+        except="opt_hir_owner_nodes,generics_of,fn_sig,type_of,typeck_root,optimized_mir",
         cfg="cfail5",
     )]
     #[rustc_clean(cfg="cfail6")]
@@ -498,9 +499,9 @@ impl ChangeSelfTypeOfImpl for u32 {
 #[rustc_clean(except="opt_hir_owner_nodes,impl_trait_header", cfg="cfail5")]
 #[rustc_clean(cfg="cfail6")]
 impl ChangeSelfTypeOfImpl for u64 {
-    #[rustc_clean(except="fn_sig,typeck,optimized_mir", cfg="cfail2")]
+    #[rustc_clean(except="fn_sig,typeck_root,optimized_mir", cfg="cfail2")]
     #[rustc_clean(cfg="cfail3")]
-    #[rustc_clean(except="fn_sig,typeck,optimized_mir", cfg="cfail5")]
+    #[rustc_clean(except="fn_sig,typeck_root,optimized_mir", cfg="cfail5")]
     #[rustc_clean(cfg="cfail6")]
     fn id(self) -> Self { self }
 }
@@ -568,7 +569,7 @@ impl AddNoMangleToMethod for Foo {
     // -------------------------
     // -------------------------
     // -------------------------
-    // ---------
+    // -----------------
     fn add_no_mangle_to_method(&self) { }
 }
 
@@ -582,7 +583,7 @@ impl AddNoMangleToMethod for Foo {
     #[rustc_clean(cfg="cfail3")]
     #[rustc_clean(cfg="cfail5")]
     #[rustc_clean(cfg="cfail6")]
-    #[no_mangle]
+    #[unsafe(no_mangle)]
     fn add_no_mangle_to_method(&self) { }
 }
 

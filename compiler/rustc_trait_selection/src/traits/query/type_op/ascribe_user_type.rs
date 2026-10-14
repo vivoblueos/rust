@@ -1,9 +1,10 @@
+use rustc_hir::def::DefKind;
 use rustc_hir::def_id::{CRATE_DEF_ID, DefId};
 use rustc_infer::traits::Obligation;
 use rustc_middle::traits::query::NoSolution;
 pub use rustc_middle::traits::query::type_op::AscribeUserType;
 use rustc_middle::traits::{ObligationCause, ObligationCauseCode};
-use rustc_middle::ty::{self, ParamEnvAnd, Ty, TyCtxt, UserArgs, UserSelfTy, UserType};
+use rustc_middle::ty::{self, ParamEnvAnd, Ty, TyCtxt, UserArgs, UserSelfTy, UserTypeKind};
 use rustc_span::{DUMMY_SP, Span};
 use tracing::{debug, instrument};
 
@@ -30,8 +31,9 @@ impl<'tcx> super::QueryTypeOp<'tcx> for AscribeUserType<'tcx> {
     fn perform_locally_with_next_solver(
         ocx: &ObligationCtxt<'_, 'tcx>,
         key: ParamEnvAnd<'tcx, Self>,
+        span: Span,
     ) -> Result<Self::QueryResponse, NoSolution> {
-        type_op_ascribe_user_type_with_span(ocx, key, None)
+        type_op_ascribe_user_type_with_span(ocx, key, span)
     }
 }
 
@@ -41,17 +43,22 @@ impl<'tcx> super::QueryTypeOp<'tcx> for AscribeUserType<'tcx> {
 pub fn type_op_ascribe_user_type_with_span<'tcx>(
     ocx: &ObligationCtxt<'_, 'tcx>,
     key: ParamEnvAnd<'tcx, AscribeUserType<'tcx>>,
-    span: Option<Span>,
+    span: Span,
 ) -> Result<(), NoSolution> {
-    let (param_env, AscribeUserType { mir_ty, user_ty }) = key.into_parts();
+    let ty::ParamEnvAnd { param_env, value: AscribeUserType { mir_ty, user_ty } } = key;
     debug!("type_op_ascribe_user_type: mir_ty={:?} user_ty={:?}", mir_ty, user_ty);
-    let span = span.unwrap_or(DUMMY_SP);
-    match user_ty {
-        UserType::Ty(user_ty) => relate_mir_and_user_ty(ocx, param_env, span, mir_ty, user_ty)?,
-        UserType::TypeOf(def_id, user_args) => {
+    match user_ty.kind {
+        UserTypeKind::Ty(user_ty) => relate_mir_and_user_ty(ocx, param_env, span, mir_ty, user_ty)?,
+        UserTypeKind::TypeOf(def_id, user_args) => {
             relate_mir_and_user_args(ocx, param_env, span, mir_ty, def_id, user_args)?
         }
     };
+
+    // Enforce any bounds that come from impl trait in bindings.
+    ocx.register_obligations(user_ty.bounds.iter().map(|clause| {
+        Obligation::new(ocx.infcx.tcx, ObligationCause::dummy_with_span(span), param_env, clause)
+    }));
+
     Ok(())
 }
 
@@ -90,6 +97,26 @@ fn relate_mir_and_user_args<'tcx>(
     let tcx = ocx.infcx.tcx;
     let cause = ObligationCause::dummy_with_span(span);
 
+    // For IACs, the user args are in the format [SelfTy, GAT_args...] but type_of expects [impl_args..., GAT_args...].
+    // We need to infer the impl args by equating the impl's self type with the user-provided self type.
+    let is_inherent_assoc_const = matches!(tcx.def_kind(def_id), DefKind::AssocConst { .. })
+        && tcx.def_kind(tcx.parent(def_id)) == DefKind::Impl { of_trait: false }
+        && tcx.is_type_const(def_id);
+
+    let args = if is_inherent_assoc_const {
+        let impl_def_id = tcx.parent(def_id);
+        let impl_args = ocx.infcx.fresh_args_for_item(span, impl_def_id);
+        let impl_self_ty =
+            ocx.normalize(&cause, param_env, tcx.type_of(impl_def_id).instantiate(tcx, impl_args));
+        let user_self_ty = ocx.normalize(&cause, param_env, args[0].expect_ty());
+        ocx.eq(&cause, param_env, impl_self_ty, user_self_ty)?;
+
+        let gat_args = &args[1..];
+        tcx.mk_args_from_iter(impl_args.iter().chain(gat_args.iter().copied()))
+    } else {
+        args
+    };
+
     let ty = tcx.type_of(def_id).instantiate(tcx, args);
     let ty = ocx.normalize(&cause, param_env, ty);
     debug!("relate_type_and_user_type: ty of def-id is {:?}", ty);
@@ -111,8 +138,7 @@ fn relate_mir_and_user_args<'tcx>(
             CRATE_DEF_ID,
             ObligationCauseCode::AscribeUserTypeProvePredicate(predicate_span),
         );
-        let instantiated_predicate =
-            ocx.normalize(&cause.clone(), param_env, instantiated_predicate);
+        let instantiated_predicate = ocx.normalize(&cause, param_env, instantiated_predicate);
 
         ocx.register_obligation(Obligation::new(tcx, cause, param_env, instantiated_predicate));
     }
@@ -126,12 +152,12 @@ fn relate_mir_and_user_args<'tcx>(
     //     const CONST: () = { /* arbitrary code that depends on T being WF */ };
     // }
     // ```
-    for arg in args {
+    for term in args.iter().filter_map(ty::GenericArg::as_term) {
         ocx.register_obligation(Obligation::new(
             tcx,
             cause.clone(),
             param_env,
-            ty::ClauseKind::WellFormed(arg),
+            ty::ClauseKind::WellFormed(term),
         ));
     }
 

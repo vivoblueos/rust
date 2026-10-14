@@ -6,9 +6,9 @@
 //@ compile-flags: -Z query-dep-graph
 //@ aux-build:point.rs
 //@ build-pass
+//@ ignore-backends: gcc
 
 #![feature(rustc_attrs)]
-#![feature(stmt_expr_attributes)]
 #![allow(dead_code)]
 #![crate_type = "rlib"]
 

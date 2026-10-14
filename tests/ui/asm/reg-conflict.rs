@@ -1,15 +1,13 @@
+//@ add-minicore
 //@ compile-flags: --target armv7-unknown-linux-gnueabihf
 //@ needs-llvm-components: arm
+//@ ignore-backends: gcc
 
-#![feature(no_core, lang_items, rustc_attrs)]
+#![feature(no_core)]
 #![no_core]
 
-#[rustc_builtin_macro]
-macro_rules! asm {
-    () => {};
-}
-#[lang = "sized"]
-trait Sized {}
+extern crate minicore;
+use minicore::*;
 
 fn main() {
     unsafe {

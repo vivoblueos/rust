@@ -3,9 +3,9 @@
 use itertools::Itertools;
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::{cmp, fmt, iter, str};
 
-use rustc_data_structures::sync::Lrc;
 use rustc_span::SourceFile;
 use serde::{Deserialize, Deserializer, Serialize, Serializer, ser};
 use serde_json as json;
@@ -13,7 +13,7 @@ use thiserror::Error;
 
 /// A range of lines in a file, inclusive of both ends.
 pub struct LineRange {
-    pub(crate) file: Lrc<SourceFile>,
+    pub(crate) file: Arc<SourceFile>,
     pub(crate) lo: usize,
     pub(crate) hi: usize,
 }
@@ -28,7 +28,15 @@ pub enum FileName {
 impl From<rustc_span::FileName> for FileName {
     fn from(name: rustc_span::FileName) -> FileName {
         match name {
-            rustc_span::FileName::Real(rustc_span::RealFileName::LocalPath(p)) => FileName::Real(p),
+            rustc_span::FileName::Real(real) => {
+                if let Some(p) = real.into_local_path() {
+                    FileName::Real(p)
+                } else {
+                    // rustfmt does not remap filenames; the local path should always
+                    // remain accessible.
+                    unreachable!()
+                }
+            }
             rustc_span::FileName::Custom(ref f) if f == "stdin" => FileName::Stdin,
             _ => unreachable!(),
         }
@@ -188,7 +196,7 @@ fn normalize_ranges(ranges: &mut HashMap<FileName, Vec<Range>>) {
                     break;
                 }
             }
-            result.push(next)
+            result.push(next);
         }
         *ranges = result;
     }

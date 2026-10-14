@@ -1,12 +1,12 @@
 // Same as rustc's `tests/ui/async-await/async-closures/captures.rs`, keep in sync
 
-#![feature(async_closure, noop_waker)]
+#![feature(async_trait_bounds)]
 
 use std::future::Future;
 use std::pin::pin;
 use std::task::*;
 
-pub fn block_on<T>(fut: impl Future<Output = T>) -> T {
+fn block_on<T>(fut: impl Future<Output = T>) -> T {
     let mut fut = pin!(fut);
     let ctx = &mut Context::from_waker(Waker::noop());
 

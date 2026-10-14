@@ -3,9 +3,6 @@
 //! This primitive is meant to be used to run one-time initialization. An
 //! example use case would be for initializing an FFI library.
 
-#[cfg(all(test, not(any(target_os = "emscripten", target_os = "wasi"))))]
-mod tests;
-
 use crate::fmt;
 use crate::panic::{RefUnwindSafe, UnwindSafe};
 use crate::sys::sync as sys;
@@ -52,7 +49,9 @@ pub struct OnceState {
     pub(crate) inner: sys::OnceState,
 }
 
-pub(crate) enum ExclusiveState {
+/// Used for the internal implementation of `sys::sync::once` on different platforms and the
+/// [`LazyLock`](crate::sync::LazyLock) implementation.
+pub(crate) enum OnceExclusiveState {
     Incomplete,
     Poisoned,
     Complete,
@@ -83,6 +82,13 @@ impl Once {
     #[must_use]
     pub const fn new() -> Once {
         Once { inner: sys::Once::new() }
+    }
+
+    /// Creates a new `Once` value that starts already completed.
+    #[inline]
+    #[must_use]
+    pub(crate) const fn new_complete() -> Once {
+        Once { inner: sys::Once::new_complete() }
     }
 
     /// Performs an initialization routine once and only once. The given closure
@@ -139,12 +145,14 @@ impl Once {
     /// it will *poison* this [`Once`] instance, causing all future invocations of
     /// `call_once` to also panic.
     ///
-    /// This is similar to [poisoning with mutexes][poison].
+    /// This is similar to [poisoning with mutexes][poison], but this mechanism
+    /// is guaranteed to never skip panics within `f`.
     ///
     /// [poison]: struct.Mutex.html#poisoning
     #[inline]
     #[stable(feature = "rust1", since = "1.0.0")]
     #[track_caller]
+    #[rustc_should_not_be_called_on_const_items]
     pub fn call_once<F>(&self, f: F)
     where
         F: FnOnce(),
@@ -204,6 +212,7 @@ impl Once {
     /// ```
     #[inline]
     #[stable(feature = "once_poison", since = "1.51.0")]
+    #[rustc_should_not_be_called_on_const_items]
     pub fn call_once_force<F>(&self, f: F)
     where
         F: FnOnce(&OnceState),
@@ -269,8 +278,6 @@ impl Once {
     /// # Example
     ///
     /// ```rust
-    /// #![feature(once_wait)]
-    ///
     /// use std::sync::Once;
     /// use std::thread;
     ///
@@ -289,7 +296,8 @@ impl Once {
     /// If this [`Once`] has been poisoned because an initialization closure has
     /// panicked, this method will also panic. Use [`wait_force`](Self::wait_force)
     /// if this behavior is not desired.
-    #[unstable(feature = "once_wait", issue = "127527")]
+    #[stable(feature = "once_wait", since = "1.86.0")]
+    #[rustc_should_not_be_called_on_const_items]
     pub fn wait(&self) {
         if !self.inner.is_completed() {
             self.inner.wait(false);
@@ -298,7 +306,11 @@ impl Once {
 
     /// Blocks the current thread until initialization has completed, ignoring
     /// poisoning.
-    #[unstable(feature = "once_wait", issue = "127527")]
+    ///
+    /// If this [`Once`] has been poisoned, this function blocks until it
+    /// becomes completed, unlike [`Once::wait()`], which panics in this case.
+    #[stable(feature = "once_wait", since = "1.86.0")]
+    #[rustc_should_not_be_called_on_const_items]
     pub fn wait_force(&self) {
         if !self.inner.is_completed() {
             self.inner.wait(true);
@@ -311,7 +323,7 @@ impl Once {
     /// be running, so the state must be either "incomplete", "poisoned" or
     /// "complete".
     #[inline]
-    pub(crate) fn state(&mut self) -> ExclusiveState {
+    pub(crate) fn state(&mut self) -> OnceExclusiveState {
         self.inner.state()
     }
 
@@ -321,7 +333,7 @@ impl Once {
     /// be running, so the state must be either "incomplete", "poisoned" or
     /// "complete".
     #[inline]
-    pub(crate) fn set_state(&mut self, new_state: ExclusiveState) {
+    pub(crate) fn set_state(&mut self, new_state: OnceExclusiveState) {
         self.inner.set_state(new_state);
     }
 }

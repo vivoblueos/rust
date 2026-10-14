@@ -21,23 +21,24 @@ use crate::traits::{ObligationCause, ObligationCauseCode};
 // HACK(eddyb) maybe move this in a more central location.
 #[derive(Copy, Clone)]
 pub struct Highlighted<'tcx, T> {
-    tcx: TyCtxt<'tcx>,
-    highlight: RegionHighlightMode<'tcx>,
-    value: T,
+    pub tcx: TyCtxt<'tcx>,
+    pub highlight: RegionHighlightMode<'tcx>,
+    pub value: T,
+    pub ns: Namespace,
 }
 
 impl<'tcx, T> IntoDiagArg for Highlighted<'tcx, T>
 where
     T: for<'a> Print<'tcx, FmtPrinter<'a, 'tcx>>,
 {
-    fn into_diag_arg(self) -> rustc_errors::DiagArgValue {
+    fn into_diag_arg(self, _: &mut Option<std::path::PathBuf>) -> rustc_errors::DiagArgValue {
         rustc_errors::DiagArgValue::Str(self.to_string().into())
     }
 }
 
 impl<'tcx, T> Highlighted<'tcx, T> {
     fn map<U>(self, f: impl FnOnce(T) -> U) -> Highlighted<'tcx, U> {
-        Highlighted { tcx: self.tcx, highlight: self.highlight, value: f(self.value) }
+        Highlighted { tcx: self.tcx, highlight: self.highlight, value: f(self.value), ns: self.ns }
     }
 }
 
@@ -46,11 +47,11 @@ where
     T: for<'a> Print<'tcx, FmtPrinter<'a, 'tcx>>,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let mut printer = ty::print::FmtPrinter::new(self.tcx, Namespace::TypeNS);
-        printer.region_highlight_mode = self.highlight;
+        let mut p = ty::print::FmtPrinter::new(self.tcx, self.ns);
+        p.region_highlight_mode = self.highlight;
 
-        self.value.print(&mut printer)?;
-        f.write_str(&printer.into_buffer())
+        self.value.print(&mut p)?;
+        f.write_str(&p.into_buffer())
     }
 }
 
@@ -163,7 +164,7 @@ impl<'tcx> NiceRegionError<'_, 'tcx> {
                 sub_region @ Region(Interned(RePlaceholder(_), _)),
                 sup_region,
             )) => self.try_report_trait_placeholder_mismatch(
-                (!sup_region.has_name()).then_some(*sup_region),
+                (!sup_region.is_named(self.tcx())).then_some(*sup_region),
                 cause,
                 Some(*sub_region),
                 None,
@@ -175,7 +176,7 @@ impl<'tcx> NiceRegionError<'_, 'tcx> {
                 sub_region,
                 sup_region @ Region(Interned(RePlaceholder(_), _)),
             )) => self.try_report_trait_placeholder_mismatch(
-                (!sub_region.has_name()).then_some(*sub_region),
+                (!sub_region.is_named(self.tcx())).then_some(*sub_region),
                 cause,
                 None,
                 Some(*sup_region),
@@ -381,6 +382,7 @@ impl<'tcx> NiceRegionError<'_, 'tcx> {
             tcx: self.tcx(),
             highlight: RegionHighlightMode::default(),
             value: trait_ref,
+            ns: Namespace::TypeNS,
         };
 
         let same_self_type = actual_trait_ref.self_ty() == expected_trait_ref.self_ty();

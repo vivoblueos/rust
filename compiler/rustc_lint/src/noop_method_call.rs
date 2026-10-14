@@ -1,9 +1,9 @@
 use rustc_hir::def::DefKind;
 use rustc_hir::{Expr, ExprKind};
 use rustc_middle::ty;
-use rustc_middle::ty::adjustment::Adjust;
+use rustc_middle::ty::adjustment::{Adjust, DerefAdjustKind};
 use rustc_session::{declare_lint, declare_lint_pass};
-use rustc_span::symbol::sym;
+use rustc_span::sym;
 
 use crate::context::LintContext;
 use crate::lints::{
@@ -84,7 +84,7 @@ impl<'tcx> LateLintPass<'tcx> for NoopMethodCall {
             return;
         };
 
-        let Some(trait_id) = cx.tcx.trait_of_item(did) else { return };
+        let Some(trait_id) = cx.tcx.trait_of_assoc(did) else { return };
 
         let Some(trait_) = cx.tcx.get_diagnostic_name(trait_id) else { return };
 
@@ -114,7 +114,10 @@ impl<'tcx> LateLintPass<'tcx> for NoopMethodCall {
 
         // If there is any user defined auto-deref step, then we don't want to warn.
         // https://github.com/rust-lang/rust-clippy/issues/9272
-        if arg_adjustments.iter().any(|adj| matches!(adj.kind, Adjust::Deref(Some(_)))) {
+        if arg_adjustments
+            .iter()
+            .any(|adj| matches!(adj.kind, Adjust::Deref(DerefAdjustKind::Overloaded(_))))
+        {
             return;
         }
 
@@ -128,13 +131,17 @@ impl<'tcx> LateLintPass<'tcx> for NoopMethodCall {
                 ty::Adt(def, _) => Some(cx.tcx.def_span(def.did()).shrink_to_lo()),
                 _ => None,
             };
-            cx.emit_span_lint(NOOP_METHOD_CALL, span, NoopMethodCallDiag {
-                method: call.ident.name,
-                orig_ty,
-                trait_,
-                label: span,
-                suggest_derive,
-            });
+            cx.emit_span_lint(
+                NOOP_METHOD_CALL,
+                span,
+                NoopMethodCallDiag {
+                    method: call.ident,
+                    orig_ty,
+                    trait_,
+                    label: span,
+                    suggest_derive,
+                },
+            );
         } else {
             match name {
                 // If `type_of(x) == T` and `x.borrow()` is used to get `&T`,

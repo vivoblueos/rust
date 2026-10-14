@@ -1,5 +1,6 @@
 // Test that loads into registers x16..=x31 are never generated for riscv32{e,em,emc} targets
 //
+//@ add-minicore
 //@ build-fail
 //@ revisions: riscv32e riscv32em riscv32emc
 //
@@ -10,20 +11,16 @@
 //@ [riscv32em] compile-flags: --target=riscv32em-unknown-none-elf
 //@ [riscv32emc] needs-llvm-components: riscv
 //@ [riscv32emc] compile-flags: --target=riscv32emc-unknown-none-elf
+//@ ignore-backends: gcc
 
 // Unlike bad-reg.rs, this tests if the assembler can reject invalid registers
 // usage in assembly code.
 
 #![no_core]
-#![feature(no_core, lang_items, rustc_attrs)]
+#![feature(no_core)]
 
-#[rustc_builtin_macro]
-macro_rules! asm {
-    () => {};
-}
-
-#[lang = "sized"]
-trait Sized {}
+extern crate minicore;
+use minicore::*;
 
 // Verify registers x1..=x15 are addressable on riscv32e, but registers x16..=x31 are not
 #[no_mangle]

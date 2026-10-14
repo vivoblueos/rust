@@ -1,8 +1,6 @@
-//@ force-host
-//@ no-prefer-dynamic
+//@ edition:2015
 
 #![deny(unused)]
-#![crate_type = "proc-macro"]
 
 extern crate proc_macro;
 use proc_macro::*;

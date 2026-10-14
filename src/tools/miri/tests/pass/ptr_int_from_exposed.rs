@@ -1,7 +1,6 @@
+//@compile-flags: -Zmiri-permissive-provenance
 //@revisions: stack tree
-// Tree Borrows doesn't support int2ptr casts, but let's make sure we don't immediately crash either.
 //@[tree]compile-flags: -Zmiri-tree-borrows
-//@[stack]compile-flags: -Zmiri-permissive-provenance
 
 use std::ptr;
 

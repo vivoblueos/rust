@@ -14,13 +14,13 @@ use rustc_hir::{
 };
 use rustc_index::IndexVec;
 use rustc_macros::{HashStable, TyDecodable, TyEncodable, TypeFoldable, TypeVisitable};
-use rustc_middle::mir::FakeReadCause;
 use rustc_session::Session;
 use rustc_span::Span;
 
-use super::RvalueScopes;
 use crate::hir::place::Place as HirPlace;
 use crate::infer::canonical::Canonical;
+use crate::mir::FakeReadCause;
+use crate::thir::DerefPatBorrowMode;
 use crate::traits::ObligationCause;
 use crate::ty::{
     self, BoundVar, CanonicalPolyFnSig, ClosureSizeProfileData, GenericArgKind, GenericArgs,
@@ -73,13 +73,12 @@ pub struct TypeckResults<'tcx> {
     /// Stores the actual binding mode for all instances of [`BindingMode`].
     pat_binding_modes: ItemLocalMap<BindingMode>,
 
-    /// Top-level patterns whose match ergonomics need to be desugared by the Rust 2021 -> 2024
-    /// migration lint. The boolean indicates whether the emitted diagnostic should be a hard error
-    /// (if any of the incompatible pattern elements are in edition 2024).
-    rust_2024_migration_desugared_pats: ItemLocalMap<bool>,
+    /// Top-level patterns incompatible with Rust 2024's match ergonomics. These will be translated
+    /// to a form valid in all Editions, either as a lint diagnostic or hard error.
+    rust_2024_migration_desugared_pats: ItemLocalMap<Rust2024IncompatiblePatInfo>,
 
-    /// Stores the types which were implicitly dereferenced in pattern binding modes
-    /// for later usage in THIR lowering. For example,
+    /// Stores the types which were implicitly dereferenced in pattern binding modes or deref
+    /// patterns for later usage in THIR lowering. For example,
     ///
     /// ```
     /// match &&Some(5i32) {
@@ -87,11 +86,20 @@ pub struct TypeckResults<'tcx> {
     ///     _ => {},
     /// }
     /// ```
-    /// leads to a `vec![&&Option<i32>, &Option<i32>]`. Empty vectors are not stored.
+    /// leads to a `vec![&&Option<i32>, &Option<i32>]` and
+    ///
+    /// ```
+    /// #![feature(deref_patterns)]
+    /// match &Box::new(Some(5i32)) {
+    ///     Some(n) => {},
+    ///     _ => {},
+    /// }
+    /// ```
+    /// leads to a `vec![&Box<Option<i32>>, Box<Option<i32>>]`. Empty vectors are not stored.
     ///
     /// See:
     /// <https://github.com/rust-lang/rfcs/blob/master/text/2005-match-ergonomics.md#definitions>
-    pat_adjustments: ItemLocalMap<Vec<Ty<'tcx>>>,
+    pat_adjustments: ItemLocalMap<Vec<ty::adjustment::PatAdjustment<'tcx>>>,
 
     /// Set of reference patterns that match against a match-ergonomics inserted reference
     /// (as opposed to against a reference in the scrutinee type).
@@ -148,9 +156,7 @@ pub struct TypeckResults<'tcx> {
     coercion_casts: ItemLocalSet,
 
     /// Set of trait imports actually used in the method resolution.
-    /// This is used for warning unused imports. During type
-    /// checking, this `Lrc` should not be cloned: it must have a ref-count
-    /// of 1 so that we can insert things into the set mutably.
+    /// This is used for warning unused imports.
     pub used_trait_imports: UnordSet<LocalDefId>,
 
     /// If any errors occurred while type-checking this body,
@@ -161,7 +167,7 @@ pub struct TypeckResults<'tcx> {
     /// We also store the type here, so that the compiler can use it as a hint
     /// for figuring out hidden types, even if they are only set in dead code
     /// (which doesn't show up in MIR).
-    pub concrete_opaque_types: FxIndexMap<ty::OpaqueTypeKey<'tcx>, ty::OpaqueHiddenType<'tcx>>,
+    pub hidden_types: FxIndexMap<LocalDefId, ty::DefinitionSiteHiddenType<'tcx>>,
 
     /// Tracks the minimum captures required for a closure;
     /// see `MinCaptureInformationMap` for more details.
@@ -191,27 +197,31 @@ pub struct TypeckResults<'tcx> {
     /// issue by fake reading `t`.
     pub closure_fake_reads: LocalDefIdMap<Vec<(HirPlace<'tcx>, FakeReadCause, HirId)>>,
 
-    /// Tracks the rvalue scoping rules which defines finer scoping for rvalue expressions
-    /// by applying extended parameter rules.
-    /// Details may be find in `rustc_hir_analysis::check::rvalue_scopes`.
-    pub rvalue_scopes: RvalueScopes,
-
     /// Stores the predicates that apply on coroutine witness types.
     /// formatting modified file tests/ui/coroutine/retain-resume-ref.rs
     pub coroutine_stalled_predicates: FxIndexSet<(ty::Predicate<'tcx>, ObligationCause<'tcx>)>,
 
-    /// We sometimes treat byte string literals (which are of type `&[u8; N]`)
-    /// as `&[u8]`, depending on the pattern in which they are used.
-    /// This hashset records all instances where we behave
-    /// like this to allow `const_to_pat` to reliably handle this situation.
-    pub treat_byte_string_as_slice: ItemLocalSet,
+    /// Goals proven during HIR typeck which may be potentially region dependent.
+    ///
+    /// Borrowck *uniquifies* regions which may cause these goal to be ambiguous in MIR
+    /// type check. We ICE if goals fail in borrowck to detect bugs during MIR building or
+    /// missed checks in HIR typeck. To avoid ICE due to region dependence we store all
+    /// goals which may be region dependent and reprove them in case borrowck encounters
+    /// an error.
+    pub potentially_region_dependent_goals:
+        FxIndexSet<(ty::Predicate<'tcx>, ObligationCause<'tcx>)>,
 
     /// Contains the data for evaluating the effect of feature `capture_disjoint_fields`
     /// on closure size.
     pub closure_size_eval: LocalDefIdMap<ClosureSizeProfileData<'tcx>>,
 
+    /// Stores the types involved in calls to `transmute` intrinsic. These are meant to be checked
+    /// outside of typeck and borrowck to avoid cycles with opaque types and coroutine layout
+    /// computation.
+    pub transmutes_to_check: Vec<(Ty<'tcx>, Ty<'tcx>, HirId)>,
+
     /// Container types and field indices of `offset_of!` expressions
-    offset_of_data: ItemLocalMap<(Ty<'tcx>, Vec<(VariantIdx, FieldIdx)>)>,
+    offset_of_data: ItemLocalMap<Vec<(Ty<'tcx>, VariantIdx, FieldIdx)>>,
 }
 
 impl<'tcx> TypeckResults<'tcx> {
@@ -235,13 +245,13 @@ impl<'tcx> TypeckResults<'tcx> {
             coercion_casts: Default::default(),
             used_trait_imports: Default::default(),
             tainted_by_errors: None,
-            concrete_opaque_types: Default::default(),
+            hidden_types: Default::default(),
             closure_min_captures: Default::default(),
             closure_fake_reads: Default::default(),
-            rvalue_scopes: Default::default(),
             coroutine_stalled_predicates: Default::default(),
-            treat_byte_string_as_slice: Default::default(),
+            potentially_region_dependent_goals: Default::default(),
             closure_size_eval: Default::default(),
+            transmutes_to_check: Default::default(),
             offset_of_data: Default::default(),
         }
     }
@@ -250,7 +260,7 @@ impl<'tcx> TypeckResults<'tcx> {
     pub fn qpath_res(&self, qpath: &hir::QPath<'_>, id: HirId) -> Res {
         match *qpath {
             hir::QPath::Resolved(_, path) => path.res,
-            hir::QPath::TypeRelative(..) | hir::QPath::LangItem(..) => self
+            hir::QPath::TypeRelative(..) => self
                 .type_dependent_def(id)
                 .map_or(Res::Err, |(kind, def_id)| Res::Def(kind, def_id)),
         }
@@ -313,7 +323,7 @@ impl<'tcx> TypeckResults<'tcx> {
 
     pub fn node_type(&self, id: HirId) -> Ty<'tcx> {
         self.node_type_opt(id).unwrap_or_else(|| {
-            bug!("node_type: no type for node {}", tls::with(|tcx| tcx.hir().node_to_string(id)))
+            bug!("node_type: no type for node {}", tls::with(|tcx| tcx.hir_id_to_string(id)))
         })
     }
 
@@ -397,8 +407,10 @@ impl<'tcx> TypeckResults<'tcx> {
         matches!(self.type_dependent_defs().get(expr.hir_id), Some(Ok((DefKind::AssocFn, _))))
     }
 
-    pub fn extract_binding_mode(&self, s: &Session, id: HirId, sp: Span) -> Option<BindingMode> {
-        self.pat_binding_modes().get(id).copied().or_else(|| {
+    /// Returns the computed binding mode for a `PatKind::Binding` pattern
+    /// (after match ergonomics adjustments).
+    pub fn extract_binding_mode(&self, s: &Session, id: HirId, sp: Span) -> BindingMode {
+        self.pat_binding_modes().get(id).copied().unwrap_or_else(|| {
             s.dcx().span_bug(sp, "missing binding mode");
         })
     }
@@ -411,22 +423,30 @@ impl<'tcx> TypeckResults<'tcx> {
         LocalTableInContextMut { hir_owner: self.hir_owner, data: &mut self.pat_binding_modes }
     }
 
-    pub fn pat_adjustments(&self) -> LocalTableInContext<'_, Vec<Ty<'tcx>>> {
+    pub fn pat_adjustments(
+        &self,
+    ) -> LocalTableInContext<'_, Vec<ty::adjustment::PatAdjustment<'tcx>>> {
         LocalTableInContext { hir_owner: self.hir_owner, data: &self.pat_adjustments }
     }
 
-    pub fn pat_adjustments_mut(&mut self) -> LocalTableInContextMut<'_, Vec<Ty<'tcx>>> {
+    pub fn pat_adjustments_mut(
+        &mut self,
+    ) -> LocalTableInContextMut<'_, Vec<ty::adjustment::PatAdjustment<'tcx>>> {
         LocalTableInContextMut { hir_owner: self.hir_owner, data: &mut self.pat_adjustments }
     }
 
-    pub fn rust_2024_migration_desugared_pats(&self) -> LocalTableInContext<'_, bool> {
+    pub fn rust_2024_migration_desugared_pats(
+        &self,
+    ) -> LocalTableInContext<'_, Rust2024IncompatiblePatInfo> {
         LocalTableInContext {
             hir_owner: self.hir_owner,
             data: &self.rust_2024_migration_desugared_pats,
         }
     }
 
-    pub fn rust_2024_migration_desugared_pats_mut(&mut self) -> LocalTableInContextMut<'_, bool> {
+    pub fn rust_2024_migration_desugared_pats_mut(
+        &mut self,
+    ) -> LocalTableInContextMut<'_, Rust2024IncompatiblePatInfo> {
         LocalTableInContextMut {
             hir_owner: self.hir_owner,
             data: &mut self.rust_2024_migration_desugared_pats,
@@ -453,7 +473,7 @@ impl<'tcx> TypeckResults<'tcx> {
         let mut has_ref_mut = false;
         pat.walk(|pat| {
             if let hir::PatKind::Binding(_, id, _, _) = pat.kind
-                && let Some(BindingMode(ByRef::Yes(Mutability::Mut), _)) =
+                && let Some(BindingMode(ByRef::Yes(_, Mutability::Mut), _)) =
                     self.pat_binding_modes().get(id)
             {
                 has_ref_mut = true;
@@ -464,6 +484,26 @@ impl<'tcx> TypeckResults<'tcx> {
             }
         });
         has_ref_mut
+    }
+
+    /// How should a deref pattern find the place for its inner pattern to match on?
+    ///
+    /// In most cases, if the pattern recursively contains a `ref mut` binding, we find the inner
+    /// pattern's scrutinee by calling `DerefMut::deref_mut`, and otherwise we call `Deref::deref`.
+    /// However, for boxes we can use a built-in deref instead, which doesn't borrow the scrutinee;
+    /// in this case, we return `DerefPatBorrowMode::Box`.
+    pub fn deref_pat_borrow_mode(
+        &self,
+        pointer_ty: Ty<'_>,
+        inner: &hir::Pat<'_>,
+    ) -> DerefPatBorrowMode {
+        if pointer_ty.is_box() {
+            DerefPatBorrowMode::Box
+        } else {
+            let mutability =
+                if self.pat_has_ref_mut_binding(inner) { Mutability::Mut } else { Mutability::Not };
+            DerefPatBorrowMode::Borrow(mutability)
+        }
     }
 
     /// For a given closure, returns the iterator of `ty::CapturedPlace`s that are captured
@@ -518,15 +558,13 @@ impl<'tcx> TypeckResults<'tcx> {
         &self.coercion_casts
     }
 
-    pub fn offset_of_data(
-        &self,
-    ) -> LocalTableInContext<'_, (Ty<'tcx>, Vec<(VariantIdx, FieldIdx)>)> {
+    pub fn offset_of_data(&self) -> LocalTableInContext<'_, Vec<(Ty<'tcx>, VariantIdx, FieldIdx)>> {
         LocalTableInContext { hir_owner: self.hir_owner, data: &self.offset_of_data }
     }
 
     pub fn offset_of_data_mut(
         &mut self,
-    ) -> LocalTableInContextMut<'_, (Ty<'tcx>, Vec<(VariantIdx, FieldIdx)>)> {
+    ) -> LocalTableInContextMut<'_, Vec<(Ty<'tcx>, VariantIdx, FieldIdx)>> {
         LocalTableInContextMut { hir_owner: self.hir_owner, data: &mut self.offset_of_data }
     }
 }
@@ -551,7 +589,7 @@ fn invalid_hir_id_for_typeck_results(hir_owner: OwnerId, hir_id: HirId) {
     ty::tls::with(|tcx| {
         bug!(
             "node {} cannot be placed in TypeckResults with hir_owner {:?}",
-            tcx.hir().node_to_string(hir_id),
+            tcx.hir_id_to_string(hir_id),
             hir_owner
         )
     });
@@ -574,7 +612,7 @@ impl<'a, V> LocalTableInContext<'a, V> {
     }
 
     pub fn items(
-        &'a self,
+        &self,
     ) -> UnordItems<(hir::ItemLocalId, &'a V), impl Iterator<Item = (hir::ItemLocalId, &'a V)>>
     {
         self.data.items().map(|(id, value)| (*id, value))
@@ -678,7 +716,7 @@ impl<'a> LocalSetInContextMut<'a> {
 }
 
 rustc_index::newtype_index! {
-    #[derive(HashStable)]
+    #[stable_hash]
     #[encodable]
     #[debug_format = "UserType({})"]
     pub struct UserTypeAnnotationIndex {
@@ -692,6 +730,8 @@ pub type CanonicalUserTypeAnnotations<'tcx> =
 
 #[derive(Clone, Debug, TyEncodable, TyDecodable, HashStable, TypeFoldable, TypeVisitable)]
 pub struct CanonicalUserTypeAnnotation<'tcx> {
+    #[type_foldable(identity)]
+    #[type_visitable(ignore)]
     pub user_ty: Box<CanonicalUserType<'tcx>>,
     pub span: Span,
     pub inferred_ty: Ty<'tcx>,
@@ -700,12 +740,31 @@ pub struct CanonicalUserTypeAnnotation<'tcx> {
 /// Canonical user type annotation.
 pub type CanonicalUserType<'tcx> = Canonical<'tcx, UserType<'tcx>>;
 
+#[derive(Copy, Clone, Debug, PartialEq, TyEncodable, TyDecodable)]
+#[derive(Eq, Hash, HashStable, TypeFoldable, TypeVisitable)]
+pub struct UserType<'tcx> {
+    pub kind: UserTypeKind<'tcx>,
+    pub bounds: ty::Clauses<'tcx>,
+}
+
+impl<'tcx> UserType<'tcx> {
+    pub fn new(kind: UserTypeKind<'tcx>) -> UserType<'tcx> {
+        UserType { kind, bounds: ty::ListWithCachedTypeInfo::empty() }
+    }
+
+    /// A user type annotation with additional bounds that need to be enforced.
+    /// These bounds are lowered from `impl Trait` in bindings.
+    pub fn new_with_bounds(kind: UserTypeKind<'tcx>, bounds: ty::Clauses<'tcx>) -> UserType<'tcx> {
+        UserType { kind, bounds }
+    }
+}
+
 /// A user-given type annotation attached to a constant. These arise
 /// from constants that are named via paths, like `Foo::<A>::new` and
 /// so forth.
 #[derive(Copy, Clone, Debug, PartialEq, TyEncodable, TyDecodable)]
 #[derive(Eq, Hash, HashStable, TypeFoldable, TypeVisitable)]
-pub enum UserType<'tcx> {
+pub enum UserTypeKind<'tcx> {
     Ty(Ty<'tcx>),
 
     /// The canonical type is the result of `type_of(def_id)` with the
@@ -721,38 +780,42 @@ impl<'tcx> IsIdentity for CanonicalUserType<'tcx> {
     /// Returns `true` if this represents the generic parameters of the form `[?0, ?1, ?2]`,
     /// i.e., each thing is mapped to a canonical variable with the same index.
     fn is_identity(&self) -> bool {
-        match self.value {
-            UserType::Ty(_) => false,
-            UserType::TypeOf(_, user_args) => {
+        if !self.value.bounds.is_empty() {
+            return false;
+        }
+
+        match self.value.kind {
+            UserTypeKind::Ty(_) => false,
+            UserTypeKind::TypeOf(_, user_args) => {
                 if user_args.user_self_ty.is_some() {
                     return false;
                 }
 
-                iter::zip(user_args.args, BoundVar::ZERO..).all(|(kind, cvar)| {
-                    match kind.unpack() {
+                iter::zip(user_args.args, BoundVar::ZERO..).all(|(arg, cvar)| {
+                    match arg.kind() {
                         GenericArgKind::Type(ty) => match ty.kind() {
                             ty::Bound(debruijn, b) => {
-                                // We only allow a `ty::INNERMOST` index in generic parameters.
-                                assert_eq!(*debruijn, ty::INNERMOST);
+                                // We only allow a `ty::BoundVarIndexKind::Canonical` index in generic parameters.
+                                assert_eq!(*debruijn, ty::BoundVarIndexKind::Canonical);
                                 cvar == b.var
                             }
                             _ => false,
                         },
 
-                        GenericArgKind::Lifetime(r) => match *r {
-                            ty::ReBound(debruijn, br) => {
-                                // We only allow a `ty::INNERMOST` index in generic parameters.
-                                assert_eq!(debruijn, ty::INNERMOST);
-                                cvar == br.var
+                        GenericArgKind::Lifetime(r) => match r.kind() {
+                            ty::ReBound(debruijn, b) => {
+                                // We only allow a `ty::BoundVarIndexKind::Canonical` index in generic parameters.
+                                assert_eq!(debruijn, ty::BoundVarIndexKind::Canonical);
+                                cvar == b.var
                             }
                             _ => false,
                         },
 
                         GenericArgKind::Const(ct) => match ct.kind() {
                             ty::ConstKind::Bound(debruijn, b) => {
-                                // We only allow a `ty::INNERMOST` index in generic parameters.
-                                assert_eq!(debruijn, ty::INNERMOST);
-                                cvar == b
+                                // We only allow a `ty::BoundVarIndexKind::Canonical` index in generic parameters.
+                                assert_eq!(debruijn, ty::BoundVarIndexKind::Canonical);
+                                cvar == b.var
                             }
                             _ => false,
                         },
@@ -765,6 +828,18 @@ impl<'tcx> IsIdentity for CanonicalUserType<'tcx> {
 
 impl<'tcx> std::fmt::Display for UserType<'tcx> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.bounds.is_empty() {
+            self.kind.fmt(f)
+        } else {
+            self.kind.fmt(f)?;
+            write!(f, " + ")?;
+            std::fmt::Debug::fmt(&self.bounds, f)
+        }
+    }
+}
+
+impl<'tcx> std::fmt::Display for UserTypeKind<'tcx> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Ty(arg0) => {
                 ty::print::with_no_trimmed_paths!(write!(f, "Ty({})", arg0))
@@ -772,4 +847,20 @@ impl<'tcx> std::fmt::Display for UserType<'tcx> {
             Self::TypeOf(arg0, arg1) => write!(f, "TypeOf({:?}, {:?})", arg0, arg1),
         }
     }
+}
+
+/// Information on a pattern incompatible with Rust 2024, for use by the error/migration diagnostic
+/// emitted during THIR construction.
+#[derive(TyEncodable, TyDecodable, Debug, HashStable)]
+pub struct Rust2024IncompatiblePatInfo {
+    /// Labeled spans for `&`s, `&mut`s, and binding modifiers incompatible with Rust 2024.
+    pub primary_labels: Vec<(Span, String)>,
+    /// Whether any `mut` binding modifiers occur under a non-`move` default binding mode.
+    pub bad_mut_modifiers: bool,
+    /// Whether any `ref`/`ref mut` binding modifiers occur under a non-`move` default binding mode.
+    pub bad_ref_modifiers: bool,
+    /// Whether any `&` or `&mut` patterns occur under a non-`move` default binding mode.
+    pub bad_ref_pats: bool,
+    /// If `true`, we can give a simpler suggestion solely by eliding explicit binding modifiers.
+    pub suggest_eliding_modes: bool,
 }

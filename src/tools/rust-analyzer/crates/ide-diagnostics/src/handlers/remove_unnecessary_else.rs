@@ -1,17 +1,17 @@
-use hir::{db::ExpandDatabase, diagnostics::RemoveUnnecessaryElse, HirFileIdExt};
+use hir::{db::ExpandDatabase, diagnostics::RemoveUnnecessaryElse};
 use ide_db::text_edit::TextEdit;
 use ide_db::{assists::Assist, source_change::SourceChange};
 use itertools::Itertools;
 use syntax::{
+    AstNode, SyntaxToken, TextRange,
     ast::{
         self,
         edit::{AstNodeEdit, IndentLevel},
     },
-    AstNode, SyntaxToken, TextRange,
 };
 
 use crate::{
-    adjusted_display_range, fix, Diagnostic, DiagnosticCode, DiagnosticsContext, Severity,
+    Diagnostic, DiagnosticCode, DiagnosticsContext, Severity, adjusted_display_range, fix,
 };
 
 // Diagnostic: remove-unnecessary-else
@@ -36,7 +36,6 @@ pub(crate) fn remove_unnecessary_else(
             "remove unnecessary else block",
             display_range,
         )
-        .experimental()
         .with_fixes(fixes(ctx, d)),
     )
 }
@@ -49,7 +48,7 @@ fn fixes(ctx: &DiagnosticsContext<'_>, d: &RemoveUnnecessaryElse) -> Option<Vec<
     let mut indent = IndentLevel::from_node(if_expr.syntax());
     let has_parent_if_expr = if_expr.syntax().parent().and_then(ast::IfExpr::cast).is_some();
     if has_parent_if_expr {
-        indent = indent + 1;
+        indent += 1;
     }
     let else_replacement = match if_expr.else_branch()? {
         ast::ElseBranch::Block(block) => block
@@ -90,8 +89,10 @@ fn fixes(ctx: &DiagnosticsContext<'_>, d: &RemoveUnnecessaryElse) -> Option<Vec<
     };
 
     let edit = TextEdit::replace(range, replacement);
-    let source_change =
-        SourceChange::from_text_edit(d.if_expr.file_id.original_file(ctx.sema.db), edit);
+    let source_change = SourceChange::from_text_edit(
+        d.if_expr.file_id.original_file(ctx.sema.db).file_id(ctx.sema.db),
+        edit,
+    );
 
     Some(vec![fix(
         "remove_unnecessary_else",

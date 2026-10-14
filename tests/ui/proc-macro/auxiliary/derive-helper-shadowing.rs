@@ -1,8 +1,6 @@
-//@ force-host
-//@ no-prefer-dynamic
-
-#![crate_type = "proc-macro"]
-
+//@revisions: edition2015 edition2018
+//@[edition2015] edition:2015
+//@[edition2018] edition:2018
 extern crate proc_macro;
 use proc_macro::*;
 

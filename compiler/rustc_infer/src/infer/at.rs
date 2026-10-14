@@ -28,7 +28,7 @@
 use relate::lattice::{LatticeOp, LatticeOpKind};
 use rustc_middle::bug;
 use rustc_middle::ty::relate::solver_relating::RelateExt as NextSolverRelate;
-use rustc_middle::ty::{Const, ImplSubject, TypingMode};
+use rustc_middle::ty::{Const, TypingMode};
 
 use super::*;
 use crate::infer::relate::type_relating::TypeRelating;
@@ -71,6 +71,7 @@ impl<'tcx> InferCtxt<'tcx> {
             tcx: self.tcx,
             typing_mode: self.typing_mode,
             considering_regions: self.considering_regions,
+            in_hir_typeck: self.in_hir_typeck,
             skip_leak_check: self.skip_leak_check,
             inner: self.inner.clone(),
             lexical_region_resolutions: self.lexical_region_resolutions.clone(),
@@ -95,6 +96,7 @@ impl<'tcx> InferCtxt<'tcx> {
             tcx: self.tcx,
             typing_mode,
             considering_regions: self.considering_regions,
+            in_hir_typeck: self.in_hir_typeck,
             skip_leak_check: self.skip_leak_check,
             inner: self.inner.clone(),
             lexical_region_resolutions: self.lexical_region_resolutions.clone(),
@@ -137,6 +139,7 @@ impl<'a, 'tcx> At<'a, 'tcx> {
                 expected,
                 ty::Contravariant,
                 actual,
+                self.cause.span,
             )
             .map(|goals| self.goals_to_obligations(goals))
         } else {
@@ -163,8 +166,15 @@ impl<'a, 'tcx> At<'a, 'tcx> {
         T: ToTrace<'tcx>,
     {
         if self.infcx.next_trait_solver {
-            NextSolverRelate::relate(self.infcx, self.param_env, expected, ty::Covariant, actual)
-                .map(|goals| self.goals_to_obligations(goals))
+            NextSolverRelate::relate(
+                self.infcx,
+                self.param_env,
+                expected,
+                ty::Covariant,
+                actual,
+                self.cause.span,
+            )
+            .map(|goals| self.goals_to_obligations(goals))
         } else {
             let mut op = TypeRelating::new(
                 self.infcx,
@@ -208,8 +218,15 @@ impl<'a, 'tcx> At<'a, 'tcx> {
         T: Relate<TyCtxt<'tcx>>,
     {
         if self.infcx.next_trait_solver {
-            NextSolverRelate::relate(self.infcx, self.param_env, expected, ty::Invariant, actual)
-                .map(|goals| self.goals_to_obligations(goals))
+            NextSolverRelate::relate(
+                self.infcx,
+                self.param_env,
+                expected,
+                ty::Invariant,
+                actual,
+                self.cause.span,
+            )
+            .map(|goals| self.goals_to_obligations(goals))
         } else {
             let mut op = TypeRelating::new(
                 self.infcx,
@@ -287,38 +304,18 @@ impl<'a, 'tcx> At<'a, 'tcx> {
     }
 }
 
-impl<'tcx> ToTrace<'tcx> for ImplSubject<'tcx> {
-    fn to_trace(cause: &ObligationCause<'tcx>, a: Self, b: Self) -> TypeTrace<'tcx> {
-        match (a, b) {
-            (ImplSubject::Trait(trait_ref_a), ImplSubject::Trait(trait_ref_b)) => {
-                ToTrace::to_trace(cause, trait_ref_a, trait_ref_b)
-            }
-            (ImplSubject::Inherent(ty_a), ImplSubject::Inherent(ty_b)) => {
-                ToTrace::to_trace(cause, ty_a, ty_b)
-            }
-            (ImplSubject::Trait(_), ImplSubject::Inherent(_))
-            | (ImplSubject::Inherent(_), ImplSubject::Trait(_)) => {
-                bug!("can not trace TraitRef and Ty");
-            }
-        }
-    }
-}
-
 impl<'tcx> ToTrace<'tcx> for Ty<'tcx> {
     fn to_trace(cause: &ObligationCause<'tcx>, a: Self, b: Self) -> TypeTrace<'tcx> {
         TypeTrace {
             cause: cause.clone(),
-            values: ValuePairs::Terms(ExpectedFound::new(true, a.into(), b.into())),
+            values: ValuePairs::Terms(ExpectedFound::new(a.into(), b.into())),
         }
     }
 }
 
 impl<'tcx> ToTrace<'tcx> for ty::Region<'tcx> {
     fn to_trace(cause: &ObligationCause<'tcx>, a: Self, b: Self) -> TypeTrace<'tcx> {
-        TypeTrace {
-            cause: cause.clone(),
-            values: ValuePairs::Regions(ExpectedFound::new(true, a, b)),
-        }
+        TypeTrace { cause: cause.clone(), values: ValuePairs::Regions(ExpectedFound::new(a, b)) }
     }
 }
 
@@ -326,7 +323,7 @@ impl<'tcx> ToTrace<'tcx> for Const<'tcx> {
     fn to_trace(cause: &ObligationCause<'tcx>, a: Self, b: Self) -> TypeTrace<'tcx> {
         TypeTrace {
             cause: cause.clone(),
-            values: ValuePairs::Terms(ExpectedFound::new(true, a.into(), b.into())),
+            values: ValuePairs::Terms(ExpectedFound::new(a.into(), b.into())),
         }
     }
 }
@@ -335,15 +332,15 @@ impl<'tcx> ToTrace<'tcx> for ty::GenericArg<'tcx> {
     fn to_trace(cause: &ObligationCause<'tcx>, a: Self, b: Self) -> TypeTrace<'tcx> {
         TypeTrace {
             cause: cause.clone(),
-            values: match (a.unpack(), b.unpack()) {
+            values: match (a.kind(), b.kind()) {
                 (GenericArgKind::Lifetime(a), GenericArgKind::Lifetime(b)) => {
-                    ValuePairs::Regions(ExpectedFound::new(true, a, b))
+                    ValuePairs::Regions(ExpectedFound::new(a, b))
                 }
                 (GenericArgKind::Type(a), GenericArgKind::Type(b)) => {
-                    ValuePairs::Terms(ExpectedFound::new(true, a.into(), b.into()))
+                    ValuePairs::Terms(ExpectedFound::new(a.into(), b.into()))
                 }
                 (GenericArgKind::Const(a), GenericArgKind::Const(b)) => {
-                    ValuePairs::Terms(ExpectedFound::new(true, a.into(), b.into()))
+                    ValuePairs::Terms(ExpectedFound::new(a.into(), b.into()))
                 }
                 _ => bug!("relating different kinds: {a:?} {b:?}"),
             },
@@ -353,19 +350,13 @@ impl<'tcx> ToTrace<'tcx> for ty::GenericArg<'tcx> {
 
 impl<'tcx> ToTrace<'tcx> for ty::Term<'tcx> {
     fn to_trace(cause: &ObligationCause<'tcx>, a: Self, b: Self) -> TypeTrace<'tcx> {
-        TypeTrace {
-            cause: cause.clone(),
-            values: ValuePairs::Terms(ExpectedFound::new(true, a, b)),
-        }
+        TypeTrace { cause: cause.clone(), values: ValuePairs::Terms(ExpectedFound::new(a, b)) }
     }
 }
 
 impl<'tcx> ToTrace<'tcx> for ty::TraitRef<'tcx> {
     fn to_trace(cause: &ObligationCause<'tcx>, a: Self, b: Self) -> TypeTrace<'tcx> {
-        TypeTrace {
-            cause: cause.clone(),
-            values: ValuePairs::TraitRefs(ExpectedFound::new(true, a, b)),
-        }
+        TypeTrace { cause: cause.clone(), values: ValuePairs::TraitRefs(ExpectedFound::new(a, b)) }
     }
 }
 
@@ -373,17 +364,14 @@ impl<'tcx> ToTrace<'tcx> for ty::AliasTy<'tcx> {
     fn to_trace(cause: &ObligationCause<'tcx>, a: Self, b: Self) -> TypeTrace<'tcx> {
         TypeTrace {
             cause: cause.clone(),
-            values: ValuePairs::Aliases(ExpectedFound::new(true, a.into(), b.into())),
+            values: ValuePairs::Aliases(ExpectedFound::new(a.into(), b.into())),
         }
     }
 }
 
 impl<'tcx> ToTrace<'tcx> for ty::AliasTerm<'tcx> {
     fn to_trace(cause: &ObligationCause<'tcx>, a: Self, b: Self) -> TypeTrace<'tcx> {
-        TypeTrace {
-            cause: cause.clone(),
-            values: ValuePairs::Aliases(ExpectedFound::new(true, a, b)),
-        }
+        TypeTrace { cause: cause.clone(), values: ValuePairs::Aliases(ExpectedFound::new(a, b)) }
     }
 }
 
@@ -392,7 +380,6 @@ impl<'tcx> ToTrace<'tcx> for ty::FnSig<'tcx> {
         TypeTrace {
             cause: cause.clone(),
             values: ValuePairs::PolySigs(ExpectedFound::new(
-                true,
                 ty::Binder::dummy(a),
                 ty::Binder::dummy(b),
             )),
@@ -402,10 +389,7 @@ impl<'tcx> ToTrace<'tcx> for ty::FnSig<'tcx> {
 
 impl<'tcx> ToTrace<'tcx> for ty::PolyFnSig<'tcx> {
     fn to_trace(cause: &ObligationCause<'tcx>, a: Self, b: Self) -> TypeTrace<'tcx> {
-        TypeTrace {
-            cause: cause.clone(),
-            values: ValuePairs::PolySigs(ExpectedFound::new(true, a, b)),
-        }
+        TypeTrace { cause: cause.clone(), values: ValuePairs::PolySigs(ExpectedFound::new(a, b)) }
     }
 }
 
@@ -413,7 +397,19 @@ impl<'tcx> ToTrace<'tcx> for ty::PolyExistentialTraitRef<'tcx> {
     fn to_trace(cause: &ObligationCause<'tcx>, a: Self, b: Self) -> TypeTrace<'tcx> {
         TypeTrace {
             cause: cause.clone(),
-            values: ValuePairs::ExistentialTraitRef(ExpectedFound::new(true, a, b)),
+            values: ValuePairs::ExistentialTraitRef(ExpectedFound::new(a, b)),
+        }
+    }
+}
+
+impl<'tcx> ToTrace<'tcx> for ty::ExistentialTraitRef<'tcx> {
+    fn to_trace(cause: &ObligationCause<'tcx>, a: Self, b: Self) -> TypeTrace<'tcx> {
+        TypeTrace {
+            cause: cause.clone(),
+            values: ValuePairs::ExistentialTraitRef(ExpectedFound::new(
+                ty::Binder::dummy(a),
+                ty::Binder::dummy(b),
+            )),
         }
     }
 }
@@ -422,7 +418,19 @@ impl<'tcx> ToTrace<'tcx> for ty::PolyExistentialProjection<'tcx> {
     fn to_trace(cause: &ObligationCause<'tcx>, a: Self, b: Self) -> TypeTrace<'tcx> {
         TypeTrace {
             cause: cause.clone(),
-            values: ValuePairs::ExistentialProjection(ExpectedFound::new(true, a, b)),
+            values: ValuePairs::ExistentialProjection(ExpectedFound::new(a, b)),
+        }
+    }
+}
+
+impl<'tcx> ToTrace<'tcx> for ty::ExistentialProjection<'tcx> {
+    fn to_trace(cause: &ObligationCause<'tcx>, a: Self, b: Self) -> TypeTrace<'tcx> {
+        TypeTrace {
+            cause: cause.clone(),
+            values: ValuePairs::ExistentialProjection(ExpectedFound::new(
+                ty::Binder::dummy(a),
+                ty::Binder::dummy(b),
+            )),
         }
     }
 }

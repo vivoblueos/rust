@@ -3,8 +3,10 @@ use std::ops::ControlFlow;
 
 use derive_where::derive_where;
 use rustc_type_ir::inherent::*;
-use rustc_type_ir::visit::{TypeVisitable, TypeVisitableExt, TypeVisitor};
-use rustc_type_ir::{self as ty, InferCtxtLike, Interner};
+use rustc_type_ir::{
+    self as ty, InferCtxtLike, Interner, TrivialTypeTraversalImpls, TypeVisitable,
+    TypeVisitableExt, TypeVisitor,
+};
 use tracing::instrument;
 
 /// Whether we do the orphan check relative to this crate or to some remote crate.
@@ -93,6 +95,8 @@ where
 pub fn trait_ref_is_local_or_fundamental<I: Interner>(tcx: I, trait_ref: ty::TraitRef<I>) -> bool {
     trait_ref.def_id.is_local() || tcx.trait_is_fundamental(trait_ref.def_id)
 }
+
+TrivialTypeTraversalImpls! { IsFirstInputType, }
 
 #[derive(Debug, Copy, Clone)]
 pub enum IsFirstInputType {
@@ -291,7 +295,7 @@ where
         ControlFlow::Break(OrphanCheckEarlyExit::UncoveredTyParam(ty))
     }
 
-    fn def_id_is_local(&mut self, def_id: I::DefId) -> bool {
+    fn def_id_is_local(&mut self, def_id: impl DefId<I>) -> bool {
         match self.in_crate {
             InCrate::Local { .. } => def_id.is_local(),
             InCrate::Remote => false,
@@ -332,14 +336,15 @@ where
             | ty::Uint(..)
             | ty::Float(..)
             | ty::Str
-            | ty::FnDef(..)
             | ty::Pat(..)
             | ty::FnPtr(..)
             | ty::Array(..)
             | ty::Slice(..)
             | ty::RawPtr(..)
             | ty::Never
-            | ty::Tuple(..) => self.found_non_local_ty(ty),
+            | ty::Tuple(..)
+            // FIXME(unsafe_binders): Non-local?
+            | ty::UnsafeBinder(_) => self.found_non_local_ty(ty),
 
             ty::Param(..) => panic!("unexpected ty param"),
 
@@ -357,7 +362,7 @@ where
             //   normalize to that, so we have to treat it as an uncovered ty param.
             // * Otherwise it may normalize to any non-type-generic type
             //   be it local or non-local.
-            ty::Alias(kind, _) => {
+            ty::Alias(ty::AliasTy { kind, .. }) => {
                 if ty.has_type_flags(
                     ty::TypeFlags::HAS_TY_PLACEHOLDER
                         | ty::TypeFlags::HAS_TY_BOUND
@@ -365,7 +370,7 @@ where
                 ) {
                     match self.in_crate {
                         InCrate::Local { mode } => match kind {
-                            ty::Projection => {
+                            ty::Projection { .. } => {
                                 if let OrphanCheckMode::Compat = mode {
                                     ControlFlow::Continue(())
                                 } else {
@@ -397,7 +402,6 @@ where
                     // implement, so we don't use this behavior.
                     // Addendum: Moreover, revealing the underlying type is likely to cause cycle
                     // errors as we rely on coherence / the specialization graph during typeck.
-
                     self.found_non_local_ty(ty)
                 }
             }
@@ -421,7 +425,7 @@ where
                 }
             }
             ty::Dynamic(tt, ..) => {
-                let principal = tt.principal().map(|p| p.def_id());
+                let principal = tt.principal_def_id();
                 if principal.is_some_and(|p| self.def_id_is_local(p)) {
                     ControlFlow::Break(OrphanCheckEarlyExit::LocalTy(ty))
                 } else {
@@ -429,17 +433,14 @@ where
                 }
             }
             ty::Error(_) => ControlFlow::Break(OrphanCheckEarlyExit::LocalTy(ty)),
-            ty::Closure(did, ..) | ty::CoroutineClosure(did, ..) | ty::Coroutine(did, ..) => {
-                if self.def_id_is_local(did) {
-                    ControlFlow::Break(OrphanCheckEarlyExit::LocalTy(ty))
-                } else {
-                    self.found_non_local_ty(ty)
-                }
+
+            ty::FnDef(..)
+            | ty::Closure(..)
+            | ty::CoroutineClosure(..)
+            | ty::Coroutine(..)
+            | ty::CoroutineWitness(..) => {
+                unreachable!("unnameable type in coherence: {ty:?}");
             }
-            // This should only be created when checking whether we have to check whether some
-            // auto trait impl applies. There will never be multiple impls, so we can just
-            // act as if it were a local type here.
-            ty::CoroutineWitness(..) => ControlFlow::Break(OrphanCheckEarlyExit::LocalTy(ty)),
         };
         // A bit of a hack, the `OrphanChecker` is only used to visit a `TraitRef`, so
         // the first type we visit is always the self type.

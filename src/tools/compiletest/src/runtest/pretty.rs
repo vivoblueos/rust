@@ -1,14 +1,13 @@
 use std::fs;
 
 use super::{ProcRes, ReadFrom, TestCx};
-use crate::util::logv;
 
 impl TestCx<'_> {
     pub(super) fn run_pretty_test(&self) {
         if self.props.pp_exact.is_some() {
-            logv(self.config, "testing for exact pretty-printing".to_owned());
+            self.logv("testing for exact pretty-printing");
         } else {
-            logv(self.config, "testing for converging pretty-printing".to_owned());
+            self.logv("testing for converging pretty-printing");
         }
 
         let rounds = match self.props.pp_exact {
@@ -21,10 +20,7 @@ impl TestCx<'_> {
 
         let mut round = 0;
         while round < rounds {
-            logv(
-                self.config,
-                format!("pretty-printing round {} revision {:?}", round, self.revision),
-            );
+            self.logv(format_args!("pretty-printing round {round} revision {:?}", self.revision));
             let read_from =
                 if round == 0 { ReadFrom::Path } else { ReadFrom::Stdin(srcs[round].to_owned()) };
 
@@ -83,22 +79,6 @@ impl TestCx<'_> {
         let proc_res = self.typecheck_source(actual);
         if !proc_res.status.success() {
             self.fatal_proc_rec("pretty-printed source does not typecheck", &proc_res);
-        }
-
-        if !self.props.pretty_expanded {
-            return;
-        }
-
-        // additionally, run `-Zunpretty=expanded` and try to build it.
-        let proc_res = self.print_source(ReadFrom::Path, "expanded");
-        if !proc_res.status.success() {
-            self.fatal_proc_rec("pretty-printing (expanded) failed", &proc_res);
-        }
-
-        let ProcRes { stdout: expanded_src, .. } = proc_res;
-        let proc_res = self.typecheck_source(expanded_src);
-        if !proc_res.status.success() {
-            self.fatal_proc_rec("pretty-printed source (expanded) does not typecheck", &proc_res);
         }
     }
 }

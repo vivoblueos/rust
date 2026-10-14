@@ -6,18 +6,30 @@
 //! loop instruction to be missed. This test therefore contains a simple loop
 //! with trivial instructions in it, to see, where the label is placed.
 //!
-//! This must be a `rmake`-test and cannot be a `tests/assembly`-test, since the
+//! This must be a `rmake`-test and cannot be a `tests/assembly-llvm/`-test, since the
 //! wrong output is only produced with direct assembly generation, but not when
 //! "emit-asm" is used, as described in the issue description of #129301:
 //! https://github.com/rust-lang/rust/issues/129301#issue-2475070770
-use run_make_support::{llvm_objdump, rustc};
+
+// FIXME(#133480): this has been randomly failing on `x86_64-mingw` due to linker hangs or
+// crashes... so I'm going to disable this test for windows for now.
+//@ ignore-windows-gnu
+
+use run_make_support::{llvm_objdump, path, rustc, rustc_minicore};
 
 fn main() {
+    rustc_minicore().target("avr-none").target_cpu("avr").output("libminicore.rlib").run();
+
     rustc()
         .input("avr-rjmp-offsets.rs")
         .opt_level("s")
         .panic("abort")
-        .target("avr-unknown-gnu-atmega328")
+        .target("avr-none")
+        // rust-lld has some troubles understanding the -mmcu flag, so for the
+        // time being let's tell rustc to emit binary that's compatible with the
+        // target CPU that lld defaults to, i.e. just `avr` (that's simply the
+        // minimal common instruction set across all AVRs)
+        .target_cpu("avr")
         // normally one links with `avr-gcc`, but this is not available in CI,
         // hence this test diverges from the default behavior to enable linking
         // at all, which is necessary for the test (to resolve the labels). To
@@ -26,6 +38,7 @@ fn main() {
         .linker("rust-lld")
         .link_arg("--entry=main")
         .output("compiled")
+        .extern_("minicore", path("libminicore.rlib"))
         .run();
 
     let disassembly = llvm_objdump().disassemble().input("compiled").run().stdout_utf8();
@@ -44,6 +57,7 @@ fn main() {
     // of the Rust compiler did produce a label `rjmp .-4` (misses the first
     // instruction in the loop).
     assert!(disassembly.contains("<main>"), "no main function in output");
+
     disassembly
         .trim()
         .lines()

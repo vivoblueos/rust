@@ -1,9 +1,8 @@
-//@no-rustfix
+//@no-rustfix: multiple suggestions add `-> !` to the same fn
 //@aux-build:proc_macros.rs
 
-#![allow(clippy::never_loop)]
+#![allow(clippy::never_loop, clippy::while_let_loop)]
 #![warn(clippy::infinite_loop)]
-#![feature(async_closure)]
 
 extern crate proc_macros;
 use proc_macros::{external, with_span};
@@ -12,18 +11,18 @@ fn do_something() {}
 
 fn no_break() {
     loop {
-        //~^ ERROR: infinite loop detected
+        //~^ infinite_loop
         do_something();
     }
 }
 
 fn all_inf() {
     loop {
-        //~^ ERROR: infinite loop detected
+        //~^ infinite_loop
         loop {
-            //~^ ERROR: infinite loop detected
+            //~^ infinite_loop
             loop {
-                //~^ ERROR: infinite loop detected
+                //~^ infinite_loop
                 do_something();
             }
         }
@@ -37,7 +36,7 @@ fn no_break_return_some_ty() -> Option<u8> {
         return None;
     }
     loop {
-        //~^ ERROR: infinite loop detected
+        //~^ infinite_loop
         do_something();
     }
 }
@@ -50,6 +49,7 @@ fn no_break_never_ret() -> ! {
 
 fn no_break_never_ret_noise() {
     loop {
+        //~^ infinite_loop
         fn inner_fn() -> ! {
             std::process::exit(0);
         }
@@ -93,7 +93,7 @@ fn has_indirect_break_2(stop_num: i32) {
 
 fn break_inner_but_not_outer_1(cond: bool) {
     loop {
-        //~^ ERROR: infinite loop detected
+        //~^ infinite_loop
         loop {
             if cond {
                 break;
@@ -104,7 +104,7 @@ fn break_inner_but_not_outer_1(cond: bool) {
 
 fn break_inner_but_not_outer_2(cond: bool) {
     loop {
-        //~^ ERROR: infinite loop detected
+        //~^ infinite_loop
         'inner: loop {
             loop {
                 if cond {
@@ -118,7 +118,7 @@ fn break_inner_but_not_outer_2(cond: bool) {
 fn break_outer_but_not_inner() {
     loop {
         loop {
-            //~^ ERROR: infinite loop detected
+            //~^ infinite_loop
             do_something();
         }
         break;
@@ -141,7 +141,7 @@ fn break_wrong_loop(cond: bool) {
     // 'inner has statement to break 'outer loop, but it was broken out of early by a labeled child loop
     'outer: loop {
         loop {
-            //~^ ERROR: infinite loop detected
+            //~^ infinite_loop
             'inner: loop {
                 loop {
                     loop {
@@ -181,7 +181,7 @@ enum Foo {
 fn match_like() {
     let opt: Option<u8> = Some(1);
     loop {
-        //~^ ERROR: infinite loop detected
+        //~^ infinite_loop
         match opt {
             Some(v) => {
                 println!("{v}");
@@ -222,12 +222,12 @@ fn match_like() {
     }
 
     loop {
-        //~^ ERROR: infinite loop detected
+        //~^ infinite_loop
         let _x = matches!(result, Ok(v) if v != 0).then_some(0);
     }
 
     loop {
-        //~^ ERROR: infinite loop detected
+        //~^ infinite_loop
         // This `return` does not return the function, so it doesn't count
         let _x = matches!(result, Ok(v) if v != 0).then(|| {
             if true {
@@ -332,7 +332,7 @@ fn exit_directly(cond: bool) {
 trait MyTrait {
     fn problematic_trait_method() {
         loop {
-            //~^ ERROR: infinite loop detected
+            //~^ infinite_loop
             do_something();
         }
     }
@@ -342,7 +342,7 @@ trait MyTrait {
 impl MyTrait for String {
     fn could_be_problematic() {
         loop {
-            //~^ ERROR: infinite loop detected
+            //~^ infinite_loop
             do_something();
         }
     }
@@ -351,7 +351,7 @@ impl MyTrait for String {
 fn inf_loop_in_closure() {
     let _loop_forever = || {
         loop {
-            //~^ ERROR: infinite loop detected
+            //~^ infinite_loop
             do_something();
         }
     };
@@ -365,6 +365,7 @@ fn inf_loop_in_closure() {
 
 fn inf_loop_in_res() -> Result<(), i32> {
     Ok(loop {
+        //~^ infinite_loop
         do_something()
     })
 }
@@ -407,15 +408,16 @@ fn continue_outer() {
 
     // This should lint as we continue the loop itself
     'infinite: loop {
-        //~^ ERROR: infinite loop detected
+        //~^ infinite_loop
         loop {
             continue 'infinite;
         }
     }
     // This should lint as we continue an inner loop
     loop {
-        //~^ ERROR: infinite loop detected
+        //~^ infinite_loop
         'inner: loop {
+            //~^ infinite_loop
             loop {
                 continue 'inner;
             }
@@ -424,7 +426,7 @@ fn continue_outer() {
 
     // This should lint as we continue the loop itself
     loop {
-        //~^ ERROR: infinite loop detected
+        //~^ infinite_loop
         continue;
     }
 }
@@ -445,6 +447,145 @@ mod issue_12338 {
                 do_something();
             }
         };
+    }
+}
+
+#[allow(clippy::let_underscore_future, clippy::empty_loop)]
+mod issue_14000 {
+    use super::do_something;
+
+    async fn foo() {
+        let _ = async move {
+            loop {
+                //~^ infinite_loop
+                do_something();
+            }
+        }
+        .await;
+        let _ = async move {
+            loop {
+                //~^ infinite_loop
+                continue;
+            }
+        }
+        .await;
+    }
+
+    fn bar() {
+        let _ = async move {
+            loop {
+                do_something();
+            }
+        };
+
+        let _ = async move {
+            loop {
+                continue;
+            }
+        };
+    }
+}
+
+#[allow(clippy::let_underscore_future)]
+mod tokio_spawn_test {
+    use super::do_something;
+
+    fn install_ticker() {
+        // This should NOT trigger the lint because the async block is spawned, not awaited
+        std::thread::spawn(move || {
+            async move {
+                loop {
+                    // This loop should not trigger infinite_loop lint
+                    do_something();
+                }
+            }
+        });
+    }
+
+    fn spawn_async_block() {
+        // This should NOT trigger the lint because the async block is not awaited
+        let _handle = async move {
+            loop {
+                do_something();
+            }
+        };
+    }
+
+    fn await_async_block() {
+        // This SHOULD trigger the lint because the async block is awaited
+        let _ = async move {
+            loop {
+                do_something();
+            }
+        };
+    }
+}
+
+mod issue15541 {
+    async fn good() -> ! {
+        loop {
+            std::future::pending().await
+        }
+    }
+
+    async fn bad() {
+        //~v infinite_loop
+        loop {
+            std::future::pending().await
+        }
+    }
+}
+
+mod issue16155 {
+    #![allow(clippy::empty_loop)]
+
+    use super::do_something;
+
+    fn let_then_else(cond: bool) {
+        let true = cond else { loop {} };
+        //~^ infinite_loop
+    }
+
+    fn loop_in_one_if_branch(cond: bool) {
+        if cond {
+            loop {}
+            //~^ infinite_loop
+        }
+    }
+
+    fn loop_in_one_match_arm(x: Option<i32>) {
+        match x {
+            Some(_) => {},
+            None => loop {},
+            //~^ infinite_loop
+        }
+    }
+
+    fn loop_in_if_let_else(x: Option<i32>) {
+        if let Some(_val) = x {
+            do_something();
+        } else {
+            loop {}
+            //~^ infinite_loop
+        }
+    }
+
+    #[expect(clippy::if_same_then_else)]
+    fn all_branches_diverge_if(cond: bool) {
+        if cond {
+            loop {}
+            //~^ infinite_loop
+        } else {
+            loop {}
+            //~^ infinite_loop
+        }
+    }
+
+    fn all_branches_diverge_match(x: Option<i32>) {
+        match x {
+            Some(_) => loop {}, //~ infinite_loop
+            None => loop {},    //~ infinite_loop
+        }
     }
 }
 

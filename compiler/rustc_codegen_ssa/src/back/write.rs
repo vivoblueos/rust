@@ -1,57 +1,54 @@
-use std::any::Any;
-use std::assert_matches::assert_matches;
 use std::marker::PhantomData;
+use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, channel};
-use std::{fs, io, mem, str, thread};
+use std::{assert_matches, fs, io, mem, str, thread};
 
-use jobserver::{Acquired, Client};
-use rustc_ast::attr;
-use rustc_data_structures::fx::{FxHashMap, FxIndexMap};
+use rustc_abi::Size;
+use rustc_data_structures::fx::FxIndexMap;
+use rustc_data_structures::jobserver::{self, Acquired};
 use rustc_data_structures::memmap::Mmap;
 use rustc_data_structures::profiling::{SelfProfilerRef, VerboseTimingGuard};
 use rustc_errors::emitter::Emitter;
-use rustc_errors::translation::Translate;
 use rustc_errors::{
-    Diag, DiagArgMap, DiagCtxt, DiagMessage, ErrCode, FatalError, FluentBundle, Level, MultiSpan,
-    Style, Suggestions,
+    Diag, DiagArgMap, DiagCtxt, DiagCtxtHandle, DiagMessage, ErrCode, FatalError, FatalErrorMarker,
+    Level, MultiSpan, Style, Suggestions, catch_fatal_errors,
 };
 use rustc_fs_util::link_or_copy;
-use rustc_hir::def_id::{CrateNum, LOCAL_CRATE};
+use rustc_hir::find_attr;
 use rustc_incremental::{
     copy_cgu_workproduct_to_incr_comp_cache_dir, in_incr_comp_dir, in_incr_comp_dir_sess,
 };
-use rustc_metadata::EncodedMetadata;
+use rustc_macros::{Decodable, Encodable};
 use rustc_metadata::fs::copy_to_stdout;
 use rustc_middle::bug;
 use rustc_middle::dep_graph::{WorkProduct, WorkProductId};
-use rustc_middle::middle::exported_symbols::SymbolExportInfo;
 use rustc_middle::ty::TyCtxt;
 use rustc_session::Session;
 use rustc_session::config::{
-    self, CrateType, Lto, OutFileName, OutputFilenames, OutputType, Passes, SwitchWithOptPath,
+    self, CrateType, Lto, OptLevel, OutFileName, OutputFilenames, OutputType, Passes,
+    SwitchWithOptPath,
 };
 use rustc_span::source_map::SourceMap;
-use rustc_span::symbol::sym;
-use rustc_span::{BytePos, FileName, InnerSpan, Pos, Span};
+use rustc_span::{FileName, InnerSpan, Span, SpanData};
 use rustc_target::spec::{MergeFunctions, SanitizerSet};
 use tracing::debug;
 
 use super::link::{self, ensure_removed};
 use super::lto::{self, SerializedModule};
-use super::symbol_export::symbol_name_for_instance_in_crate;
+use crate::back::lto::check_lto_allowed;
 use crate::errors::ErrorCreatingRemarkDir;
 use crate::traits::*;
 use crate::{
-    CachedModuleCodegen, CodegenResults, CompiledModule, CrateInfo, ModuleCodegen, ModuleKind,
+    CachedModuleCodegen, CompiledModule, CompiledModules, CrateInfo, ModuleCodegen, ModuleKind,
     errors,
 };
 
 const PRE_LTO_BC_EXT: &str = "pre-lto.bc";
 
 /// What kind of object file to emit.
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Encodable, Decodable)]
 pub enum EmitObj {
     // No object file.
     None,
@@ -65,7 +62,7 @@ pub enum EmitObj {
 }
 
 /// What kind of llvm bitcode section to embed in an object file.
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Encodable, Decodable)]
 pub enum BitcodeSection {
     // No bitcode section.
     None,
@@ -75,15 +72,13 @@ pub enum BitcodeSection {
 }
 
 /// Module-specific configuration for `optimize_and_codegen`.
+#[derive(Encodable, Decodable)]
 pub struct ModuleConfig {
     /// Names of additional optimization passes to run.
     pub passes: Vec<String>,
     /// Some(level) to optimize at a certain level, or None to run
-    /// absolutely no optimizations (used for the metadata module).
+    /// absolutely no optimizations (used for the allocator module).
     pub opt_level: Option<config::OptLevel>,
-
-    /// Some(level) to optimize binary size, or None to not affect program size.
-    pub opt_size: Option<config::OptLevel>,
 
     pub pgo_gen: SwitchWithOptPath,
     pub pgo_use: Option<PathBuf>,
@@ -98,14 +93,11 @@ pub struct ModuleConfig {
 
     // Flags indicating which outputs to produce.
     pub emit_pre_lto_bc: bool,
-    pub emit_no_opt_bc: bool,
     pub emit_bc: bool,
     pub emit_ir: bool,
     pub emit_asm: bool,
     pub emit_obj: EmitObj,
-    pub emit_thin_lto: bool,
     pub emit_thin_lto_summary: bool,
-    pub bc_cmdline: String,
 
     // Miscellaneous flags. These are mostly copied from command-line
     // options.
@@ -113,12 +105,13 @@ pub struct ModuleConfig {
     pub lint_llvm_ir: bool,
     pub no_prepopulate_passes: bool,
     pub no_builtins: bool,
-    pub time_module: bool,
     pub vectorize_loop: bool,
     pub vectorize_slp: bool,
     pub merge_functions: bool,
     pub emit_lifetime_markers: bool,
     pub llvm_plugins: Vec<String>,
+    pub autodiff: Vec<config::AutoDiff>,
+    pub offload: Vec<config::Offload>,
 }
 
 impl ModuleConfig {
@@ -140,7 +133,6 @@ impl ModuleConfig {
             || match kind {
                 ModuleKind::Regular => sess.opts.output_types.contains_key(&OutputType::Object),
                 ModuleKind::Allocator => false,
-                ModuleKind::Metadata => sess.opts.output_types.contains_key(&OutputType::Metadata),
             };
 
         let emit_obj = if !should_emit_obj {
@@ -173,7 +165,6 @@ impl ModuleConfig {
             passes: if_regular!(sess.opts.cg.passes.clone(), vec![]),
 
             opt_level: opt_level_and_size,
-            opt_size: opt_level_and_size,
 
             pgo_gen: if_regular!(
                 sess.opts.cg.profile_generate.clone(),
@@ -184,7 +175,7 @@ impl ModuleConfig {
             debug_info_for_profiling: sess.opts.unstable_opts.debug_info_for_profiling,
             instrument_coverage: if_regular!(sess.instrument_coverage(), false),
 
-            sanitizer: if_regular!(sess.opts.unstable_opts.sanitizer, SanitizerSet::empty()),
+            sanitizer: if_regular!(sess.sanitizers(), SanitizerSet::empty()),
             sanitizer_dataflow_abilist: if_regular!(
                 sess.opts.unstable_opts.sanitizer_dataflow_abilist.clone(),
                 Vec::new()
@@ -202,7 +193,6 @@ impl ModuleConfig {
                 save_temps || need_pre_lto_bitcode_for_incr_comp(sess),
                 false
             ),
-            emit_no_opt_bc: if_regular!(save_temps, false),
             emit_bc: if_regular!(
                 save_temps || sess.opts.output_types.contains_key(&OutputType::Bitcode),
                 save_temps
@@ -216,26 +206,20 @@ impl ModuleConfig {
                 false
             ),
             emit_obj,
-            emit_thin_lto: sess.opts.unstable_opts.emit_thin_lto,
             emit_thin_lto_summary: if_regular!(
                 sess.opts.output_types.contains_key(&OutputType::ThinLinkBitcode),
                 false
             ),
-            bc_cmdline: sess.target.bitcode_llvm_cmdline.to_string(),
 
             verify_llvm_ir: sess.verify_llvm_ir(),
             lint_llvm_ir: sess.opts.unstable_opts.lint_llvm_ir,
             no_prepopulate_passes: sess.opts.cg.no_prepopulate_passes,
             no_builtins: no_builtins || sess.target.no_builtins,
 
-            // Exclude metadata and allocator modules from time_passes output,
-            // since they throw off the "LLVM passes" measurement.
-            time_module: if_regular!(true, false),
-
             // Copy what clang does by turning on loop vectorization at O2 and
             // slp vectorization at O3.
             vectorize_loop: !sess.opts.cg.no_vectorize_loops
-                && (sess.opts.optimize == config::OptLevel::Default
+                && (sess.opts.optimize == config::OptLevel::More
                     || sess.opts.optimize == config::OptLevel::Aggressive),
             vectorize_slp: !sess.opts.cg.no_vectorize_slp
                 && sess.opts.optimize == config::OptLevel::Aggressive,
@@ -259,7 +243,7 @@ impl ModuleConfig {
                 MergeFunctions::Trampolines | MergeFunctions::Aliases => {
                     use config::OptLevel::*;
                     match sess.opts.optimize {
-                        Aggressive | Default | SizeMin | Size => true,
+                        Aggressive | More | SizeMin | Size => true,
                         Less | No => false,
                     }
                 }
@@ -267,6 +251,8 @@ impl ModuleConfig {
 
             emit_lifetime_markers: sess.emit_lifetime_markers(),
             llvm_plugins: if_regular!(sess.opts.unstable_opts.llvm_plugins.clone(), vec![]),
+            autodiff: if_regular!(sess.opts.unstable_opts.autodiff.clone(), vec![]),
+            offload: if_regular!(sess.opts.unstable_opts.offload.clone(), vec![]),
         }
     }
 
@@ -275,6 +261,10 @@ impl ModuleConfig {
             || self.emit_thin_lto_summary
             || self.emit_obj == EmitObj::Bitcode
             || self.emit_obj == EmitObj::ObjectCode(BitcodeSection::Full)
+    }
+
+    pub fn embed_bitcode(&self) -> bool {
+        self.emit_obj == EmitObj::ObjectCode(BitcodeSection::Full)
     }
 }
 
@@ -291,73 +281,64 @@ pub struct TargetMachineFactoryConfig {
 }
 
 impl TargetMachineFactoryConfig {
-    pub fn new(
-        cgcx: &CodegenContext<impl WriteBackendMethods>,
-        module_name: &str,
-    ) -> TargetMachineFactoryConfig {
+    pub fn new(cgcx: &CodegenContext, module_name: &str) -> TargetMachineFactoryConfig {
         let split_dwarf_file = if cgcx.target_can_use_split_dwarf {
             cgcx.output_filenames.split_dwarf_path(
                 cgcx.split_debuginfo,
                 cgcx.split_dwarf_kind,
-                Some(module_name),
+                module_name,
+                cgcx.invocation_temp.as_deref(),
             )
         } else {
             None
         };
 
-        let output_obj_file =
-            Some(cgcx.output_filenames.temp_path(OutputType::Object, Some(module_name)));
+        let output_obj_file = Some(cgcx.output_filenames.temp_path_for_cgu(
+            OutputType::Object,
+            module_name,
+            cgcx.invocation_temp.as_deref(),
+        ));
         TargetMachineFactoryConfig { split_dwarf_file, output_obj_file }
     }
 }
 
 pub type TargetMachineFactoryFn<B> = Arc<
     dyn Fn(
+            DiagCtxtHandle<'_>,
             TargetMachineFactoryConfig,
-        ) -> Result<
-            <B as WriteBackendMethods>::TargetMachine,
-            <B as WriteBackendMethods>::TargetMachineError,
-        > + Send
+        ) -> <B as WriteBackendMethods>::TargetMachine
+        + Send
         + Sync,
 >;
 
-type ExportedSymbols = FxHashMap<CrateNum, Arc<Vec<(String, SymbolExportInfo)>>>;
-
 /// Additional resources used by optimize_and_codegen (not module specific)
-#[derive(Clone)]
-pub struct CodegenContext<B: WriteBackendMethods> {
+#[derive(Clone, Encodable, Decodable)]
+pub struct CodegenContext {
     // Resources needed when running LTO
-    pub prof: SelfProfilerRef,
     pub lto: Lto,
+    pub use_linker_plugin_lto: bool,
+    pub dylib_lto: bool,
+    pub prefer_dynamic: bool,
     pub save_temps: bool,
     pub fewer_names: bool,
     pub time_trace: bool,
-    pub exported_symbols: Option<Arc<ExportedSymbols>>,
-    pub opts: Arc<config::Options>,
     pub crate_types: Vec<CrateType>,
-    pub each_linked_rlib_for_lto: Vec<(CrateNum, PathBuf)>,
     pub output_filenames: Arc<OutputFilenames>,
-    pub regular_module_config: Arc<ModuleConfig>,
-    pub metadata_module_config: Arc<ModuleConfig>,
-    pub allocator_module_config: Arc<ModuleConfig>,
-    pub tm_factory: TargetMachineFactoryFn<B>,
+    pub invocation_temp: Option<String>,
+    pub module_config: Arc<ModuleConfig>,
+    pub opt_level: OptLevel,
+    pub backend_features: Vec<String>,
     pub msvc_imps_needed: bool,
     pub is_pe_coff: bool,
     pub target_can_use_split_dwarf: bool,
     pub target_arch: String,
-    pub target_is_like_osx: bool,
+    pub target_is_like_darwin: bool,
     pub target_is_like_aix: bool,
+    pub target_is_like_gpu: bool,
     pub split_debuginfo: rustc_target::spec::SplitDebuginfo,
     pub split_dwarf_kind: rustc_session::config::SplitDwarfKind,
+    pub pointer_size: Size,
 
-    /// All commandline args used to invoke the compiler, with @file args fully expanded.
-    /// This will only be used within debug info, e.g. in the pdb file on windows
-    /// This is mainly useful for other tools that reads that debuginfo to figure out
-    /// how to call the compiler with the same arguments.
-    pub expanded_args: Vec<String>,
-
-    /// Emitter to use for diagnostics produced during codegen.
-    pub diag_emitter: SharedEmitter,
     /// LLVM optimizations for which we want to print remarks.
     pub remark: Passes,
     /// Directory into which should the LLVM optimization remarks be written.
@@ -366,77 +347,69 @@ pub struct CodegenContext<B: WriteBackendMethods> {
     /// The incremental compilation session directory, or None if we are not
     /// compiling incrementally
     pub incr_comp_session_dir: Option<PathBuf>,
-    /// Channel back to the main control thread to send messages to
-    pub coordinator_send: Sender<Box<dyn Any + Send>>,
     /// `true` if the codegen should be run in parallel.
     ///
-    /// Depends on [`CodegenBackend::supports_parallel()`] and `-Zno_parallel_backend`.
+    /// Depends on [`ExtraBackendMethods::supports_parallel()`] and `-Zno_parallel_backend`.
     pub parallel: bool,
 }
 
-impl<B: WriteBackendMethods> CodegenContext<B> {
-    pub fn create_dcx(&self) -> DiagCtxt {
-        DiagCtxt::new(Box::new(self.diag_emitter.clone()))
-    }
+fn generate_thin_lto_work<B: WriteBackendMethods>(
+    cgcx: &CodegenContext,
+    prof: &SelfProfilerRef,
+    dcx: DiagCtxtHandle<'_>,
+    exported_symbols_for_lto: &[String],
+    each_linked_rlib_for_lto: &[PathBuf],
+    needs_thin_lto: Vec<ThinLtoInput<B>>,
+) -> Vec<(ThinLtoWorkItem<B>, u64)> {
+    let _prof_timer = prof.generic_activity("codegen_thin_generate_lto_work");
 
-    pub fn config(&self, kind: ModuleKind) -> &ModuleConfig {
-        match kind {
-            ModuleKind::Regular => &self.regular_module_config,
-            ModuleKind::Metadata => &self.metadata_module_config,
-            ModuleKind::Allocator => &self.allocator_module_config,
-        }
-    }
+    let (lto_modules, copy_jobs) = B::run_thin_lto(
+        cgcx,
+        prof,
+        dcx,
+        exported_symbols_for_lto,
+        each_linked_rlib_for_lto,
+        needs_thin_lto,
+    );
+    lto_modules
+        .into_iter()
+        .map(|module| {
+            let cost = module.cost();
+            (ThinLtoWorkItem::ThinLto(module), cost)
+        })
+        .chain(copy_jobs.into_iter().map(|wp| {
+            (
+                ThinLtoWorkItem::CopyPostLtoArtifacts(CachedModuleCodegen {
+                    name: wp.cgu_name.clone(),
+                    source: wp,
+                }),
+                0, // copying is very cheap
+            )
+        }))
+        .collect()
 }
 
-fn generate_lto_work<B: ExtraBackendMethods>(
-    cgcx: &CodegenContext<B>,
-    needs_fat_lto: Vec<FatLtoInput<B>>,
-    needs_thin_lto: Vec<(String, B::ThinBuffer)>,
-    import_only_modules: Vec<(SerializedModule<B::ModuleBuffer>, WorkProduct)>,
-) -> Vec<(WorkItem<B>, u64)> {
-    let _prof_timer = cgcx.prof.generic_activity("codegen_generate_lto_work");
-
-    if !needs_fat_lto.is_empty() {
-        assert!(needs_thin_lto.is_empty());
-        let module =
-            B::run_fat_lto(cgcx, needs_fat_lto, import_only_modules).unwrap_or_else(|e| e.raise());
-        // We are adding a single work item, so the cost doesn't matter.
-        vec![(WorkItem::LTO(module), 0)]
-    } else {
-        assert!(needs_fat_lto.is_empty());
-        let (lto_modules, copy_jobs) = B::run_thin_lto(cgcx, needs_thin_lto, import_only_modules)
-            .unwrap_or_else(|e| e.raise());
-        lto_modules
-            .into_iter()
-            .map(|module| {
-                let cost = module.cost();
-                (WorkItem::LTO(module), cost)
-            })
-            .chain(copy_jobs.into_iter().map(|wp| {
-                (
-                    WorkItem::CopyPostLtoArtifacts(CachedModuleCodegen {
-                        name: wp.cgu_name.clone(),
-                        source: wp,
-                    }),
-                    0, // copying is very cheap
-                )
-            }))
-            .collect()
-    }
-}
-
-struct CompiledModules {
-    modules: Vec<CompiledModule>,
-    allocator_module: Option<CompiledModule>,
+enum MaybeLtoModules<B: WriteBackendMethods> {
+    NoLto(CompiledModules),
+    FatLto {
+        cgcx: CodegenContext,
+        exported_symbols_for_lto: Arc<Vec<String>>,
+        each_linked_rlib_file_for_lto: Vec<PathBuf>,
+        needs_fat_lto: Vec<FatLtoInput<B>>,
+    },
+    ThinLto {
+        cgcx: CodegenContext,
+        exported_symbols_for_lto: Arc<Vec<String>>,
+        each_linked_rlib_file_for_lto: Vec<PathBuf>,
+        needs_thin_lto: Vec<ThinLtoInput<B>>,
+    },
 }
 
 fn need_bitcode_in_object(tcx: TyCtxt<'_>) -> bool {
     let sess = tcx.sess;
-    let requested_for_rlib = sess.opts.cg.embed_bitcode
+    sess.opts.cg.embed_bitcode
         && tcx.crate_types().contains(&CrateType::Rlib)
-        && sess.opts.output_types.contains_key(&OutputType::Exe);
-    let forced_by_target = sess.target.forces_embed_bitcode;
-    requested_for_rlib || forced_by_target
+        && sess.opts.output_types.contains_key(&OutputType::Exe)
 }
 
 fn need_pre_lto_bitcode_for_incr_comp(sess: &Session) -> bool {
@@ -453,20 +426,14 @@ fn need_pre_lto_bitcode_for_incr_comp(sess: &Session) -> bool {
 pub(crate) fn start_async_codegen<B: ExtraBackendMethods>(
     backend: B,
     tcx: TyCtxt<'_>,
-    target_cpu: String,
-    metadata: EncodedMetadata,
-    metadata_module: Option<CompiledModule>,
+    crate_info: &CrateInfo,
+    allocator_module: Option<ModuleCodegen<B::Module>>,
 ) -> OngoingCodegen<B> {
     let (coordinator_send, coordinator_receive) = channel();
-    let sess = tcx.sess;
 
-    let crate_attrs = tcx.hir().attrs(rustc_hir::CRATE_HIR_ID);
-    let no_builtins = attr::contains_name(crate_attrs, sym::no_builtins);
-
-    let crate_info = CrateInfo::new(tcx, target_cpu);
+    let no_builtins = find_attr!(tcx, crate, NoBuiltins);
 
     let regular_config = ModuleConfig::new(ModuleKind::Regular, tcx, no_builtins);
-    let metadata_config = ModuleConfig::new(ModuleKind::Metadata, tcx, no_builtins);
     let allocator_config = ModuleConfig::new(ModuleKind::Allocator, tcx, no_builtins);
 
     let (shared_emitter, shared_emitter_main) = SharedEmitter::new();
@@ -475,22 +442,18 @@ pub(crate) fn start_async_codegen<B: ExtraBackendMethods>(
     let coordinator_thread = start_executing_work(
         backend.clone(),
         tcx,
-        &crate_info,
+        crate_info,
         shared_emitter,
         codegen_worker_send,
         coordinator_receive,
-        sess.jobserver.clone(),
         Arc::new(regular_config),
-        Arc::new(metadata_config),
         Arc::new(allocator_config),
+        allocator_module,
         coordinator_send.clone(),
     );
 
     OngoingCodegen {
         backend,
-        metadata,
-        metadata_module,
-        crate_info,
 
         codegen_worker_receive,
         shared_emitter_main,
@@ -532,9 +495,12 @@ fn copy_all_cgu_workproducts_to_incr_comp_cache_dir(
         if let Some(path) = &module.bytecode {
             files.push((OutputType::Bitcode.extension(), path.as_path()));
         }
-        if let Some((id, product)) =
-            copy_cgu_workproduct_to_incr_comp_cache_dir(sess, &module.name, files.as_slice())
-        {
+        if let Some((id, product)) = copy_cgu_workproduct_to_incr_comp_cache_dir(
+            sess,
+            &module.name,
+            files.as_slice(),
+            &module.links_from_incr_cache,
+        ) {
             work_products.insert(id, product);
         }
     }
@@ -542,7 +508,7 @@ fn copy_all_cgu_workproducts_to_incr_comp_cache_dir(
     work_products
 }
 
-fn produce_final_output_artifacts(
+pub fn produce_final_output_artifacts(
     sess: &Session,
     compiled_modules: &CompiledModules,
     crate_output: &OutputFilenames,
@@ -552,24 +518,24 @@ fn produce_final_output_artifacts(
 
     // Produce final compile outputs.
     let copy_gracefully = |from: &Path, to: &OutFileName| match to {
-        OutFileName::Stdout => {
-            if let Err(e) = copy_to_stdout(from) {
-                sess.dcx().emit_err(errors::CopyPath::new(from, to.as_path(), e));
-            }
+        OutFileName::Stdout if let Err(e) = copy_to_stdout(from) => {
+            sess.dcx().emit_err(errors::CopyPath::new(from, to.as_path(), e));
         }
-        OutFileName::Real(path) => {
-            if let Err(e) = fs::copy(from, path) {
-                sess.dcx().emit_err(errors::CopyPath::new(from, path, e));
-            }
+        OutFileName::Real(path) if let Err(e) = fs::copy(from, path) => {
+            sess.dcx().emit_err(errors::CopyPath::new(from, path, e));
         }
+        _ => {}
     };
 
     let copy_if_one_unit = |output_type: OutputType, keep_numbered: bool| {
-        if compiled_modules.modules.len() == 1 {
+        if let [module] = &compiled_modules.modules[..] {
             // 1) Only one codegen unit. In this case it's no difficulty
             //    to copy `foo.0.x` to `foo.x`.
-            let module_name = Some(&compiled_modules.modules[0].name[..]);
-            let path = crate_output.temp_path(output_type, module_name);
+            let path = crate_output.temp_path_for_cgu(
+                output_type,
+                &module.name,
+                sess.invocation_temp.as_deref(),
+            );
             let output = crate_output.path(output_type);
             if !output_type.is_text_output() && output.is_tty() {
                 sess.dcx()
@@ -582,22 +548,15 @@ fn produce_final_output_artifacts(
                 ensure_removed(sess.dcx(), &path);
             }
         } else {
-            let extension = crate_output
-                .temp_path(output_type, None)
-                .extension()
-                .unwrap()
-                .to_str()
-                .unwrap()
-                .to_owned();
-
             if crate_output.outputs.contains_explicit_name(&output_type) {
                 // 2) Multiple codegen units, with `--emit foo=some_name`. We have
                 //    no good solution for this case, so warn the user.
-                sess.dcx().emit_warn(errors::IgnoringEmitPath { extension });
+                sess.dcx()
+                    .emit_warn(errors::IgnoringEmitPath { extension: output_type.extension() });
             } else if crate_output.single_output_file.is_some() {
                 // 3) Multiple codegen units, with `-o some_name`. We have
                 //    no good solution for this case, so warn the user.
-                sess.dcx().emit_warn(errors::IgnoringOutput { extension });
+                sess.dcx().emit_warn(errors::IgnoringOutput { extension: output_type.extension() });
             } else {
                 // 4) Multiple codegen units, but no explicit name. We
                 //    just leave the `foo.0.x` files in place.
@@ -638,30 +597,28 @@ fn produce_final_output_artifacts(
     // Clean up unwanted temporary files.
 
     // We create the following files by default:
-    //  - #crate#.#module-name#.bc
-    //  - #crate#.#module-name#.o
-    //  - #crate#.crate.metadata.bc
-    //  - #crate#.crate.metadata.o
-    //  - #crate#.o (linked from crate.##.o)
-    //  - #crate#.bc (copied from crate.##.bc)
+    //  - #crate#.#module-name#.rcgu.bc
+    //  - #crate#.#module-name#.rcgu.o
+    //  - #crate#.o (linked from crate.##.rcgu.o)
+    //  - #crate#.bc (copied from crate.##.rcgu.bc)
     // We may create additional files if requested by the user (through
     // `-C save-temps` or `--emit=` flags).
 
     if !sess.opts.cg.save_temps {
-        // Remove the temporary .#module-name#.o objects. If the user didn't
+        // Remove the temporary .#module-name#.rcgu.o objects. If the user didn't
         // explicitly request bitcode (with --emit=bc), and the bitcode is not
         // needed for building an rlib, then we must remove .#module-name#.bc as
         // well.
 
-        // Specific rules for keeping .#module-name#.bc:
+        // Specific rules for keeping .#module-name#.rcgu.bc:
         //  - If the user requested bitcode (`user_wants_bitcode`), and
         //    codegen_units > 1, then keep it.
         //  - If the user requested bitcode but codegen_units == 1, then we
-        //    can toss .#module-name#.bc because we copied it to .bc earlier.
+        //    can toss .#module-name#.rcgu.bc because we copied it to .bc earlier.
         //  - If we're not building an rlib and the user didn't request
-        //    bitcode, then delete .#module-name#.bc.
+        //    bitcode, then delete .#module-name#.rcgu.bc.
         // If you change how this works, also update back::link::link_rlib,
-        // where .#module-name#.bc files are (maybe) deleted after making an
+        // where .#module-name#.rcgu.bc files are (maybe) deleted after making an
         // rlib.
         let needs_crate_object = crate_output.outputs.contains_key(&OutputType::Exe);
 
@@ -671,14 +628,12 @@ fn produce_final_output_artifacts(
             needs_crate_object || (user_wants_objects && sess.codegen_units().as_usize() > 1);
 
         for module in compiled_modules.modules.iter() {
-            if let Some(ref path) = module.object {
-                if !keep_numbered_objects {
+            if !keep_numbered_objects {
+                if let Some(ref path) = module.object {
                     ensure_removed(sess.dcx(), path);
                 }
-            }
 
-            if let Some(ref path) = module.dwarf_object {
-                if !keep_numbered_objects {
+                if let Some(ref path) = module.dwarf_object {
                     ensure_removed(sess.dcx(), path);
                 }
             }
@@ -690,18 +645,17 @@ fn produce_final_output_artifacts(
             }
         }
 
-        if !user_wants_bitcode {
-            if let Some(ref allocator_module) = compiled_modules.allocator_module {
-                if let Some(ref path) = allocator_module.bytecode {
-                    ensure_removed(sess.dcx(), path);
-                }
-            }
+        if !user_wants_bitcode
+            && let Some(ref allocator_module) = compiled_modules.allocator_module
+            && let Some(ref path) = allocator_module.bytecode
+        {
+            ensure_removed(sess.dcx(), path);
         }
     }
 
     if sess.opts.json_artifact_notifications {
-        if compiled_modules.modules.len() == 1 {
-            compiled_modules.modules[0].for_each_output(|_path, ty| {
+        if let [module] = &compiled_modules.modules[..] {
+            module.for_each_output(|_path, ty| {
                 if sess.opts.output_types.contains_key(&ty) {
                     let descr = ty.shorthand();
                     // for single cgu file is renamed to drop cgu specific suffix
@@ -724,7 +678,6 @@ fn produce_final_output_artifacts(
 
     // We leave the following files around by default:
     //  - #crate#.o
-    //  - #crate#.crate.metadata.o
     //  - #crate#.bc
     // These are used in linking steps and will be cleaned up afterward.
 }
@@ -735,63 +688,73 @@ pub(crate) enum WorkItem<B: WriteBackendMethods> {
     /// Copy the post-LTO artifacts from the incremental cache to the output
     /// directory.
     CopyPostLtoArtifacts(CachedModuleCodegen),
-    /// Performs (Thin)LTO on the given module.
-    LTO(lto::LtoModuleCodegen<B>),
+}
+
+enum ThinLtoWorkItem<B: WriteBackendMethods> {
+    /// Copy the post-LTO artifacts from the incremental cache to the output
+    /// directory.
+    CopyPostLtoArtifacts(CachedModuleCodegen),
+    /// Performs thin-LTO on the given module.
+    ThinLto(lto::ThinModule<B>),
+}
+
+// `pthread_setname()` on *nix ignores anything beyond the first 15
+// bytes. Use short descriptions to maximize the space available for
+// the module name.
+#[cfg(not(windows))]
+fn desc(short: &str, _long: &str, name: &str) -> String {
+    // The short label is three bytes, and is followed by a space. That
+    // leaves 11 bytes for the CGU name. How we obtain those 11 bytes
+    // depends on the CGU name form.
+    //
+    // - Non-incremental, e.g. `regex.f10ba03eb5ec7975-cgu.0`: the part
+    //   before the `-cgu.0` is the same for every CGU, so use the
+    //   `cgu.0` part. The number suffix will be different for each
+    //   CGU.
+    //
+    // - Incremental (normal), e.g. `2i52vvl2hco29us0`: use the whole
+    //   name because each CGU will have a unique ASCII hash, and the
+    //   first 11 bytes will be enough to identify it.
+    //
+    // - Incremental (with `-Zhuman-readable-cgu-names`), e.g.
+    //   `regex.f10ba03eb5ec7975-re_builder.volatile`: use the whole
+    //   name. The first 11 bytes won't be enough to uniquely identify
+    //   it, but no obvious substring will, and this is a rarely used
+    //   option so it doesn't matter much.
+    //
+    assert_eq!(short.len(), 3);
+    let name = if let Some(index) = name.find("-cgu.") {
+        &name[index + 1..] // +1 skips the leading '-'.
+    } else {
+        name
+    };
+    format!("{short} {name}")
+}
+
+// Windows has no thread name length limit, so use more descriptive names.
+#[cfg(windows)]
+fn desc(_short: &str, long: &str, name: &str) -> String {
+    format!("{long} {name}")
 }
 
 impl<B: WriteBackendMethods> WorkItem<B> {
-    fn module_kind(&self) -> ModuleKind {
-        match *self {
-            WorkItem::Optimize(ref m) => m.kind,
-            WorkItem::CopyPostLtoArtifacts(_) | WorkItem::LTO(_) => ModuleKind::Regular,
-        }
-    }
-
     /// Generate a short description of this work item suitable for use as a thread name.
     fn short_description(&self) -> String {
-        // `pthread_setname()` on *nix ignores anything beyond the first 15
-        // bytes. Use short descriptions to maximize the space available for
-        // the module name.
-        #[cfg(not(windows))]
-        fn desc(short: &str, _long: &str, name: &str) -> String {
-            // The short label is three bytes, and is followed by a space. That
-            // leaves 11 bytes for the CGU name. How we obtain those 11 bytes
-            // depends on the CGU name form.
-            //
-            // - Non-incremental, e.g. `regex.f10ba03eb5ec7975-cgu.0`: the part
-            //   before the `-cgu.0` is the same for every CGU, so use the
-            //   `cgu.0` part. The number suffix will be different for each
-            //   CGU.
-            //
-            // - Incremental (normal), e.g. `2i52vvl2hco29us0`: use the whole
-            //   name because each CGU will have a unique ASCII hash, and the
-            //   first 11 bytes will be enough to identify it.
-            //
-            // - Incremental (with `-Zhuman-readable-cgu-names`), e.g.
-            //   `regex.f10ba03eb5ec7975-re_builder.volatile`: use the whole
-            //   name. The first 11 bytes won't be enough to uniquely identify
-            //   it, but no obvious substring will, and this is a rarely used
-            //   option so it doesn't matter much.
-            //
-            assert_eq!(short.len(), 3);
-            let name = if let Some(index) = name.find("-cgu.") {
-                &name[index + 1..] // +1 skips the leading '-'.
-            } else {
-                name
-            };
-            format!("{short} {name}")
-        }
-
-        // Windows has no thread name length limit, so use more descriptive names.
-        #[cfg(windows)]
-        fn desc(_short: &str, long: &str, name: &str) -> String {
-            format!("{long} {name}")
-        }
-
         match self {
             WorkItem::Optimize(m) => desc("opt", "optimize module", &m.name),
             WorkItem::CopyPostLtoArtifacts(m) => desc("cpy", "copy LTO artifacts for", &m.name),
-            WorkItem::LTO(m) => desc("lto", "LTO module", m.name()),
+        }
+    }
+}
+
+impl<B: WriteBackendMethods> ThinLtoWorkItem<B> {
+    /// Generate a short description of this work item suitable for use as a thread name.
+    fn short_description(&self) -> String {
+        match self {
+            ThinLtoWorkItem::CopyPostLtoArtifacts(m) => {
+                desc("cpy", "copy LTO artifacts for", &m.name)
+            }
+            ThinLtoWorkItem::ThinLto(m) => desc("lto", "thin-LTO module", m.name()),
         }
     }
 }
@@ -801,22 +764,23 @@ pub(crate) enum WorkItemResult<B: WriteBackendMethods> {
     /// The backend has finished compiling a CGU, nothing more required.
     Finished(CompiledModule),
 
-    /// The backend has finished compiling a CGU, which now needs linking
-    /// because `-Zcombine-cgu` was specified.
-    NeedsLink(ModuleCodegen<B::Module>),
-
     /// The backend has finished compiling a CGU, which now needs to go through
     /// fat LTO.
     NeedsFatLto(FatLtoInput<B>),
 
     /// The backend has finished compiling a CGU, which now needs to go through
     /// thin LTO.
-    NeedsThinLto(String, B::ThinBuffer),
+    NeedsThinLto(String, B::ModuleBuffer),
 }
 
 pub enum FatLtoInput<B: WriteBackendMethods> {
-    Serialized { name: String, buffer: B::ModuleBuffer },
+    Serialized { name: String, buffer: SerializedModule<B::ModuleBuffer> },
     InMemory(ModuleCodegen<B::Module>),
+}
+
+pub enum ThinLtoInput<B: WriteBackendMethods> {
+    Red { name: String, buffer: SerializedModule<B::ModuleBuffer> },
+    Green { wp: WorkProduct, buffer: SerializedModule<B::ModuleBuffer> },
 }
 
 /// Actual LTO type we end up choosing based on multiple factors.
@@ -828,26 +792,12 @@ pub(crate) enum ComputedLtoType {
 
 pub(crate) fn compute_per_cgu_lto_type(
     sess_lto: &Lto,
-    opts: &config::Options,
+    linker_does_lto: bool,
     sess_crate_types: &[CrateType],
-    module_kind: ModuleKind,
 ) -> ComputedLtoType {
-    // Metadata modules never participate in LTO regardless of the lto
-    // settings.
-    if module_kind == ModuleKind::Metadata {
-        return ComputedLtoType::No;
-    }
-
     // If the linker does LTO, we don't have to do it. Note that we
     // keep doing full LTO, if it is requested, as not to break the
     // assumption that the output will be a single module.
-    let linker_does_lto = opts.cg.linker_plugin_lto.enabled();
-
-    // When we're automatically doing ThinLTO for multi-codegen-unit
-    // builds we don't actually want to LTO the allocator modules if
-    // it shows up. This is due to various linker shenanigans that
-    // we'll encounter later.
-    let is_allocator = module_kind == ModuleKind::Allocator;
 
     // We ignore a request for full crate graph LTO if the crate type
     // is only an rlib, as there is no full crate graph to process,
@@ -857,38 +807,37 @@ pub(crate) fn compute_per_cgu_lto_type(
     // require LTO so the request for LTO is always unconditionally
     // passed down to the backend, but we don't actually want to do
     // anything about it yet until we've got a final product.
-    let is_rlib = sess_crate_types.len() == 1 && sess_crate_types[0] == CrateType::Rlib;
+    let is_rlib = matches!(sess_crate_types, [CrateType::Rlib]);
 
     match sess_lto {
-        Lto::ThinLocal if !linker_does_lto && !is_allocator => ComputedLtoType::Thin,
+        Lto::ThinLocal if !linker_does_lto => ComputedLtoType::Thin,
         Lto::Thin if !linker_does_lto && !is_rlib => ComputedLtoType::Thin,
         Lto::Fat if !is_rlib => ComputedLtoType::Fat,
         _ => ComputedLtoType::No,
     }
 }
 
-fn execute_optimize_work_item<B: ExtraBackendMethods>(
-    cgcx: &CodegenContext<B>,
-    module: ModuleCodegen<B::Module>,
-    module_config: &ModuleConfig,
-) -> Result<WorkItemResult<B>, FatalError> {
-    let dcx = cgcx.create_dcx();
-    let dcx = dcx.handle();
+fn execute_optimize_work_item<B: WriteBackendMethods>(
+    cgcx: &CodegenContext,
+    prof: &SelfProfilerRef,
+    shared_emitter: SharedEmitter,
+    mut module: ModuleCodegen<B::Module>,
+) -> WorkItemResult<B> {
+    let _timer = prof.generic_activity_with_arg("codegen_module_optimize", &*module.name);
 
-    unsafe {
-        B::optimize(cgcx, dcx, &module, module_config)?;
-    }
+    B::optimize(cgcx, prof, &shared_emitter, &mut module, &cgcx.module_config);
 
     // After we've done the initial round of optimizations we need to
     // decide whether to synchronously codegen this module or ship it
     // back to the coordinator thread for further LTO processing (which
     // has to wait for all the initial modules to be optimized).
 
-    let lto_type = compute_per_cgu_lto_type(&cgcx.lto, &cgcx.opts, &cgcx.crate_types, module.kind);
+    let lto_type =
+        compute_per_cgu_lto_type(&cgcx.lto, cgcx.use_linker_plugin_lto, &cgcx.crate_types);
 
     // If we're doing some form of incremental LTO then we need to be sure to
     // save our module to disk first.
-    let bitcode = if cgcx.config(module.kind).emit_pre_lto_bc {
+    let bitcode = if cgcx.module_config.emit_pre_lto_bc {
         let filename = pre_lto_bitcode_filename(&module.name);
         cgcx.incr_comp_session_dir.as_ref().map(|path| path.join(&filename))
     } else {
@@ -896,37 +845,52 @@ fn execute_optimize_work_item<B: ExtraBackendMethods>(
     };
 
     match lto_type {
-        ComputedLtoType::No => finish_intra_module_work(cgcx, module, module_config),
+        ComputedLtoType::No => {
+            let module = B::codegen(cgcx, &prof, &shared_emitter, module, &cgcx.module_config);
+            WorkItemResult::Finished(module)
+        }
         ComputedLtoType::Thin => {
-            let (name, thin_buffer) = B::prepare_thin(module, false);
+            let thin_buffer = B::serialize_module(module.module_llvm, true);
             if let Some(path) = bitcode {
                 fs::write(&path, thin_buffer.data()).unwrap_or_else(|e| {
                     panic!("Error writing pre-lto-bitcode file `{}`: {}", path.display(), e);
                 });
             }
-            Ok(WorkItemResult::NeedsThinLto(name, thin_buffer))
+            WorkItemResult::NeedsThinLto(module.name, thin_buffer)
         }
         ComputedLtoType::Fat => match bitcode {
             Some(path) => {
-                let (name, buffer) = B::serialize_module(module);
+                let buffer = B::serialize_module(module.module_llvm, false);
                 fs::write(&path, buffer.data()).unwrap_or_else(|e| {
                     panic!("Error writing pre-lto-bitcode file `{}`: {}", path.display(), e);
                 });
-                Ok(WorkItemResult::NeedsFatLto(FatLtoInput::Serialized { name, buffer }))
+                WorkItemResult::NeedsFatLto(FatLtoInput::Serialized {
+                    name: module.name,
+                    buffer: SerializedModule::Local(buffer),
+                })
             }
-            None => Ok(WorkItemResult::NeedsFatLto(FatLtoInput::InMemory(module))),
+            None => WorkItemResult::NeedsFatLto(FatLtoInput::InMemory(module)),
         },
     }
 }
 
-fn execute_copy_from_cache_work_item<B: ExtraBackendMethods>(
-    cgcx: &CodegenContext<B>,
+fn execute_copy_from_cache_work_item(
+    cgcx: &CodegenContext,
+    prof: &SelfProfilerRef,
+    shared_emitter: SharedEmitter,
     module: CachedModuleCodegen,
-    module_config: &ModuleConfig,
-) -> WorkItemResult<B> {
+) -> CompiledModule {
+    let _timer =
+        prof.generic_activity_with_arg("codegen_copy_artifacts_from_incr_cache", &*module.name);
+
+    let dcx = DiagCtxt::new(Box::new(shared_emitter));
+    let dcx = dcx.handle();
+
     let incr_comp_session_dir = cgcx.incr_comp_session_dir.as_ref().unwrap();
 
-    let load_from_incr_comp_dir = |output_path: PathBuf, saved_path: &str| {
+    let mut links_from_incr_cache = Vec::new();
+
+    let mut load_from_incr_comp_dir = |output_path: PathBuf, saved_path: &str| {
         let source_file = in_incr_comp_dir(incr_comp_session_dir, saved_path);
         debug!(
             "copying preexisting module `{}` from {:?} to {}",
@@ -935,13 +899,12 @@ fn execute_copy_from_cache_work_item<B: ExtraBackendMethods>(
             output_path.display()
         );
         match link_or_copy(&source_file, &output_path) {
-            Ok(_) => Some(output_path),
+            Ok(_) => {
+                links_from_incr_cache.push(source_file);
+                Some(output_path)
+            }
             Err(error) => {
-                cgcx.create_dcx().handle().emit_err(errors::CopyPathBuf {
-                    source_file,
-                    output_path,
-                    error,
-                });
+                dcx.emit_err(errors::CopyPathBuf { source_file, output_path, error });
                 None
             }
         }
@@ -951,69 +914,239 @@ fn execute_copy_from_cache_work_item<B: ExtraBackendMethods>(
         module.source.saved_files.get("dwo").as_ref().and_then(|saved_dwarf_object_file| {
             let dwarf_obj_out = cgcx
                 .output_filenames
-                .split_dwarf_path(cgcx.split_debuginfo, cgcx.split_dwarf_kind, Some(&module.name))
+                .split_dwarf_path(
+                    cgcx.split_debuginfo,
+                    cgcx.split_dwarf_kind,
+                    &module.name,
+                    cgcx.invocation_temp.as_deref(),
+                )
                 .expect(
                     "saved dwarf object in work product but `split_dwarf_path` returned `None`",
                 );
             load_from_incr_comp_dir(dwarf_obj_out, saved_dwarf_object_file)
         });
 
-    let load_from_incr_cache = |perform, output_type: OutputType| {
+    let mut load_from_incr_cache = |perform, output_type: OutputType| {
         if perform {
             let saved_file = module.source.saved_files.get(output_type.extension())?;
-            let output_path = cgcx.output_filenames.temp_path(output_type, Some(&module.name));
+            let output_path = cgcx.output_filenames.temp_path_for_cgu(
+                output_type,
+                &module.name,
+                cgcx.invocation_temp.as_deref(),
+            );
             load_from_incr_comp_dir(output_path, &saved_file)
         } else {
             None
         }
     };
 
+    let module_config = &cgcx.module_config;
     let should_emit_obj = module_config.emit_obj != EmitObj::None;
     let assembly = load_from_incr_cache(module_config.emit_asm, OutputType::Assembly);
     let llvm_ir = load_from_incr_cache(module_config.emit_ir, OutputType::LlvmAssembly);
     let bytecode = load_from_incr_cache(module_config.emit_bc, OutputType::Bitcode);
     let object = load_from_incr_cache(should_emit_obj, OutputType::Object);
     if should_emit_obj && object.is_none() {
-        cgcx.create_dcx().handle().emit_fatal(errors::NoSavedObjectFile { cgu_name: &module.name })
+        dcx.emit_fatal(errors::NoSavedObjectFile { cgu_name: &module.name })
     }
 
-    WorkItemResult::Finished(CompiledModule {
-        name: module.name,
+    CompiledModule {
+        links_from_incr_cache,
         kind: ModuleKind::Regular,
+        name: module.name,
         object,
         dwarf_object,
         bytecode,
         assembly,
         llvm_ir,
-    })
+    }
 }
 
-fn execute_lto_work_item<B: ExtraBackendMethods>(
-    cgcx: &CodegenContext<B>,
-    module: lto::LtoModuleCodegen<B>,
-    module_config: &ModuleConfig,
-) -> Result<WorkItemResult<B>, FatalError> {
-    let module = unsafe { module.optimize(cgcx)? };
-    finish_intra_module_work(cgcx, module, module_config)
-}
+fn do_fat_lto<B: WriteBackendMethods>(
+    cgcx: &CodegenContext,
+    prof: &SelfProfilerRef,
+    shared_emitter: SharedEmitter,
+    tm_factory: TargetMachineFactoryFn<B>,
+    exported_symbols_for_lto: &[String],
+    each_linked_rlib_for_lto: &[PathBuf],
+    needs_fat_lto: Vec<FatLtoInput<B>>,
+) -> CompiledModule {
+    let _timer = prof.verbose_generic_activity("LLVM_fatlto");
 
-fn finish_intra_module_work<B: ExtraBackendMethods>(
-    cgcx: &CodegenContext<B>,
-    module: ModuleCodegen<B::Module>,
-    module_config: &ModuleConfig,
-) -> Result<WorkItemResult<B>, FatalError> {
-    let dcx = cgcx.create_dcx();
+    let dcx = DiagCtxt::new(Box::new(shared_emitter.clone()));
     let dcx = dcx.handle();
 
-    if !cgcx.opts.unstable_opts.combine_cgu
-        || module.kind == ModuleKind::Metadata
-        || module.kind == ModuleKind::Allocator
-    {
-        let module = unsafe { B::codegen(cgcx, dcx, module, module_config)? };
-        Ok(WorkItemResult::Finished(module))
-    } else {
-        Ok(WorkItemResult::NeedsLink(module))
+    check_lto_allowed(&cgcx, dcx);
+
+    B::optimize_and_codegen_fat_lto(
+        cgcx,
+        prof,
+        &shared_emitter,
+        tm_factory,
+        exported_symbols_for_lto,
+        each_linked_rlib_for_lto,
+        needs_fat_lto,
+    )
+}
+
+fn do_thin_lto<B: WriteBackendMethods>(
+    cgcx: &CodegenContext,
+    prof: &SelfProfilerRef,
+    shared_emitter: SharedEmitter,
+    tm_factory: TargetMachineFactoryFn<B>,
+    exported_symbols_for_lto: Arc<Vec<String>>,
+    each_linked_rlib_for_lto: Vec<PathBuf>,
+    needs_thin_lto: Vec<ThinLtoInput<B>>,
+) -> Vec<CompiledModule> {
+    let _timer = prof.verbose_generic_activity("LLVM_thinlto");
+
+    let dcx = DiagCtxt::new(Box::new(shared_emitter.clone()));
+    let dcx = dcx.handle();
+
+    check_lto_allowed(&cgcx, dcx);
+
+    let (coordinator_send, coordinator_receive) = channel();
+
+    // First up, convert our jobserver into a helper thread so we can use normal
+    // mpsc channels to manage our messages and such.
+    // After we've requested tokens then we'll, when we can,
+    // get tokens on `coordinator_receive` which will
+    // get managed in the main loop below.
+    let coordinator_send2 = coordinator_send.clone();
+    let helper = jobserver::client()
+        .into_helper_thread(move |token| {
+            drop(coordinator_send2.send(ThinLtoMessage::Token(token)));
+        })
+        .expect("failed to spawn helper thread");
+
+    let mut work_items = vec![];
+
+    // We have LTO work to do. Perform the serial work here of
+    // figuring out what we're going to LTO and then push a
+    // bunch of work items onto our queue to do LTO. This all
+    // happens on the coordinator thread but it's very quick so
+    // we don't worry about tokens.
+    for (work, cost) in generate_thin_lto_work::<B>(
+        cgcx,
+        prof,
+        dcx,
+        &exported_symbols_for_lto,
+        &each_linked_rlib_for_lto,
+        needs_thin_lto,
+    ) {
+        let insertion_index =
+            work_items.binary_search_by_key(&cost, |&(_, cost)| cost).unwrap_or_else(|e| e);
+        work_items.insert(insertion_index, (work, cost));
+        if cgcx.parallel {
+            helper.request_token();
+        }
     }
+
+    let mut codegen_aborted = None;
+
+    // These are the Jobserver Tokens we currently hold. Does not include
+    // the implicit Token the compiler process owns no matter what.
+    let mut tokens = vec![];
+
+    // Amount of tokens that are used (including the implicit token).
+    let mut used_token_count = 0;
+
+    let mut compiled_modules = vec![];
+
+    // Run the message loop while there's still anything that needs message
+    // processing. Note that as soon as codegen is aborted we simply want to
+    // wait for all existing work to finish, so many of the conditions here
+    // only apply if codegen hasn't been aborted as they represent pending
+    // work to be done.
+    loop {
+        if codegen_aborted.is_none() {
+            if used_token_count == 0 && work_items.is_empty() {
+                // All codegen work is done.
+                break;
+            }
+
+            // Spin up what work we can, only doing this while we've got available
+            // parallelism slots and work left to spawn.
+            while used_token_count < tokens.len() + 1
+                && let Some((item, _)) = work_items.pop()
+            {
+                spawn_thin_lto_work(
+                    &cgcx,
+                    prof,
+                    shared_emitter.clone(),
+                    Arc::clone(&tm_factory),
+                    coordinator_send.clone(),
+                    item,
+                );
+                used_token_count += 1;
+            }
+        } else {
+            // Don't queue up any more work if codegen was aborted, we're
+            // just waiting for our existing children to finish.
+            if used_token_count == 0 {
+                break;
+            }
+        }
+
+        // Relinquish accidentally acquired extra tokens. Subtract 1 for the implicit token.
+        tokens.truncate(used_token_count.saturating_sub(1));
+
+        match coordinator_receive.recv().unwrap() {
+            // Save the token locally and the next turn of the loop will use
+            // this to spawn a new unit of work, or it may get dropped
+            // immediately if we have no more work to spawn.
+            ThinLtoMessage::Token(token) => match token {
+                Ok(token) => {
+                    tokens.push(token);
+                }
+                Err(e) => {
+                    let msg = &format!("failed to acquire jobserver token: {e}");
+                    shared_emitter.fatal(msg);
+                    codegen_aborted = Some(FatalError);
+                }
+            },
+
+            ThinLtoMessage::WorkItem { result } => {
+                // If a thread exits successfully then we drop a token associated
+                // with that worker and update our `used_token_count` count.
+                // We may later re-acquire a token to continue running more work.
+                // We may also not actually drop a token here if the worker was
+                // running with an "ephemeral token".
+                used_token_count -= 1;
+
+                match result {
+                    Ok(compiled_module) => compiled_modules.push(compiled_module),
+                    Err(Some(WorkerFatalError)) => {
+                        // Like `CodegenAborted`, wait for remaining work to finish.
+                        codegen_aborted = Some(FatalError);
+                    }
+                    Err(None) => {
+                        // If the thread failed that means it panicked, so
+                        // we abort immediately.
+                        bug!("worker thread panicked");
+                    }
+                }
+            }
+        }
+    }
+
+    if let Some(codegen_aborted) = codegen_aborted {
+        codegen_aborted.raise();
+    }
+
+    compiled_modules
+}
+
+fn execute_thin_lto_work_item<B: WriteBackendMethods>(
+    cgcx: &CodegenContext,
+    prof: &SelfProfilerRef,
+    shared_emitter: SharedEmitter,
+    tm_factory: TargetMachineFactoryFn<B>,
+    module: lto::ThinModule<B>,
+) -> CompiledModule {
+    let _timer = prof.generic_activity_with_arg("codegen_module_perform_lto", module.name());
+
+    B::optimize_and_codegen_thin(cgcx, prof, &shared_emitter, tm_factory, module)
 }
 
 /// Messages sent to the coordinator.
@@ -1024,7 +1157,7 @@ pub(crate) enum Message<B: WriteBackendMethods> {
 
     /// The backend has finished processing a work item for a codegen unit.
     /// Sent from a backend worker thread.
-    WorkItem { result: Result<WorkItemResult<B>, Option<WorkerFatalError>>, worker_id: usize },
+    WorkItem { result: Result<WorkItemResult<B>, Option<WorkerFatalError>> },
 
     /// The frontend has finished generating something (backend IR or a
     /// post-LTO artifact) for a codegen unit, and it should be passed to the
@@ -1047,6 +1180,17 @@ pub(crate) enum Message<B: WriteBackendMethods> {
     CodegenAborted,
 }
 
+/// Messages sent to the coordinator.
+pub(crate) enum ThinLtoMessage {
+    /// A jobserver token has become available. Sent from the jobserver helper
+    /// thread.
+    Token(io::Result<Acquired>),
+
+    /// The backend has finished processing a work item for a codegen unit.
+    /// Sent from a backend worker thread.
+    WorkItem { result: Result<CompiledModule, Option<WorkerFatalError>> },
+}
+
 /// A message sent from the coordinator thread to the main thread telling it to
 /// process another codegen unit.
 pub struct CguMessage;
@@ -1061,6 +1205,7 @@ pub struct CguMessage;
 // - `is_lint`: lints aren't relevant during codegen.
 // - `emitted_at`: not used for codegen diagnostics.
 struct Diagnostic {
+    span: Vec<SpanData>,
     level: Level,
     messages: Vec<(DiagMessage, Style)>,
     code: Option<ErrCode>,
@@ -1071,7 +1216,7 @@ struct Diagnostic {
 // A cut-down version of `rustc_errors::Subdiag` that impls `Send`. It's
 // missing the following fields from `rustc_errors::Subdiag`.
 // - `span`: it doesn't impl `Send`.
-pub(crate) struct Subdiagnostic {
+struct Subdiagnostic {
     level: Level,
     messages: Vec<(DiagMessage, Style)>,
 }
@@ -1094,52 +1239,31 @@ fn start_executing_work<B: ExtraBackendMethods>(
     crate_info: &CrateInfo,
     shared_emitter: SharedEmitter,
     codegen_worker_send: Sender<CguMessage>,
-    coordinator_receive: Receiver<Box<dyn Any + Send>>,
-    jobserver: Client,
+    coordinator_receive: Receiver<Message<B>>,
     regular_config: Arc<ModuleConfig>,
-    metadata_config: Arc<ModuleConfig>,
     allocator_config: Arc<ModuleConfig>,
-    tx_to_llvm_workers: Sender<Box<dyn Any + Send>>,
-) -> thread::JoinHandle<Result<CompiledModules, ()>> {
-    let coordinator_send = tx_to_llvm_workers;
+    mut allocator_module: Option<ModuleCodegen<B::Module>>,
+    coordinator_send: Sender<Message<B>>,
+) -> thread::JoinHandle<Result<MaybeLtoModules<B>, ()>> {
     let sess = tcx.sess;
+    let prof = sess.prof.clone();
 
     let mut each_linked_rlib_for_lto = Vec::new();
-    drop(link::each_linked_rlib(crate_info, None, &mut |cnum, path| {
-        if link::ignored_for_lto(sess, crate_info, cnum) {
-            return;
-        }
-        each_linked_rlib_for_lto.push((cnum, path.to_path_buf()));
-    }));
+    let mut each_linked_rlib_file_for_lto = Vec::new();
+    if sess.lto() != Lto::No && sess.lto() != Lto::ThinLocal {
+        drop(link::each_linked_rlib(crate_info, None, &mut |cnum, path| {
+            if link::ignored_for_lto(sess, crate_info, cnum) {
+                return;
+            }
+
+            each_linked_rlib_for_lto.push(cnum);
+            each_linked_rlib_file_for_lto.push(path.to_path_buf());
+        }));
+    }
 
     // Compute the set of symbols we need to retain when doing LTO (if we need to)
-    let exported_symbols = {
-        let mut exported_symbols = FxHashMap::default();
-
-        let copy_symbols = |cnum| {
-            let symbols = tcx
-                .exported_symbols(cnum)
-                .iter()
-                .map(|&(s, lvl)| (symbol_name_for_instance_in_crate(tcx, s, cnum), lvl))
-                .collect();
-            Arc::new(symbols)
-        };
-
-        match sess.lto() {
-            Lto::No => None,
-            Lto::ThinLocal => {
-                exported_symbols.insert(LOCAL_CRATE, copy_symbols(LOCAL_CRATE));
-                Some(Arc::new(exported_symbols))
-            }
-            Lto::Fat | Lto::Thin => {
-                exported_symbols.insert(LOCAL_CRATE, copy_symbols(LOCAL_CRATE));
-                for &(cnum, ref _path) in &each_linked_rlib_for_lto {
-                    exported_symbols.insert(cnum, copy_symbols(cnum));
-                }
-                Some(Arc::new(exported_symbols))
-            }
-        }
-    };
+    let exported_symbols_for_lto =
+        Arc::new(lto::exported_symbols_for_lto(tcx, &each_linked_rlib_for_lto));
 
     // First up, convert our jobserver into a helper thread so we can use normal
     // mpsc channels to manage our messages and such.
@@ -1147,20 +1271,15 @@ fn start_executing_work<B: ExtraBackendMethods>(
     // get tokens on `coordinator_receive` which will
     // get managed in the main loop below.
     let coordinator_send2 = coordinator_send.clone();
-    let helper = jobserver
+    let helper = jobserver::client()
         .into_helper_thread(move |token| {
-            drop(coordinator_send2.send(Box::new(Message::Token::<B>(token))));
+            drop(coordinator_send2.send(Message::Token::<B>(token)));
         })
         .expect("failed to spawn helper thread");
 
-    let ol =
-        if tcx.sess.opts.unstable_opts.no_codegen || !tcx.sess.opts.output_types.should_codegen() {
-            // If we know that we won’t be doing codegen, create target machines without optimisation.
-            config::OptLevel::No
-        } else {
-            tcx.backend_optimization_level(())
-        };
-    let backend_features = tcx.global_backend_features(());
+    let opt_level = tcx.backend_optimization_level(());
+    let backend_features = tcx.global_backend_features(()).clone();
+    let tm_factory = backend.target_machine_factory(tcx.sess, opt_level, &backend_features);
 
     let remark_dir = if let Some(ref dir) = sess.opts.unstable_opts.remark_dir {
         let result = fs::create_dir_all(dir).and_then(|_| dir.canonicalize());
@@ -1172,36 +1291,34 @@ fn start_executing_work<B: ExtraBackendMethods>(
         None
     };
 
-    let cgcx = CodegenContext::<B> {
+    let cgcx = CodegenContext {
         crate_types: tcx.crate_types().to_vec(),
-        each_linked_rlib_for_lto,
         lto: sess.lto(),
+        use_linker_plugin_lto: sess.opts.cg.linker_plugin_lto.enabled(),
+        dylib_lto: sess.opts.unstable_opts.dylib_lto,
+        prefer_dynamic: sess.opts.cg.prefer_dynamic,
         fewer_names: sess.fewer_names(),
         save_temps: sess.opts.cg.save_temps,
         time_trace: sess.opts.unstable_opts.llvm_time_trace,
-        opts: Arc::new(sess.opts.clone()),
-        prof: sess.prof.clone(),
-        exported_symbols,
         remark: sess.opts.cg.remark.clone(),
         remark_dir,
         incr_comp_session_dir: sess.incr_comp_session_dir_opt().map(|r| r.clone()),
-        coordinator_send,
-        expanded_args: tcx.sess.expanded_args.clone(),
-        diag_emitter: shared_emitter.clone(),
         output_filenames: Arc::clone(tcx.output_filenames(())),
-        regular_module_config: regular_config,
-        metadata_module_config: metadata_config,
-        allocator_module_config: allocator_config,
-        tm_factory: backend.target_machine_factory(tcx.sess, ol, backend_features),
+        module_config: regular_config,
+        opt_level,
+        backend_features,
         msvc_imps_needed: msvc_imps_needed(tcx),
         is_pe_coff: tcx.sess.target.is_like_windows,
         target_can_use_split_dwarf: tcx.sess.target_can_use_split_dwarf(),
         target_arch: tcx.sess.target.arch.to_string(),
-        target_is_like_osx: tcx.sess.target.is_like_osx,
+        target_is_like_darwin: tcx.sess.target.is_like_darwin,
         target_is_like_aix: tcx.sess.target.is_like_aix,
+        target_is_like_gpu: tcx.sess.target.is_like_gpu,
         split_debuginfo: tcx.sess.split_debuginfo(),
         split_dwarf_kind: tcx.sess.opts.unstable_opts.split_dwarf_kind,
         parallel: backend.supports_parallel() && !sess.opts.unstable_opts.no_parallel_backend,
+        pointer_size: tcx.data_layout.pointer_size(),
+        invocation_temp: sess.invocation_temp.clone(),
     };
 
     // This is the "main loop" of parallel work happening for parallel codegen.
@@ -1339,28 +1456,15 @@ fn start_executing_work<B: ExtraBackendMethods>(
     // Each LLVM module is automatically sent back to the coordinator for LTO if
     // necessary. There's already optimizations in place to avoid sending work
     // back to the coordinator if LTO isn't requested.
-    return B::spawn_named_thread(cgcx.time_trace, "coordinator".to_string(), move || {
-        let mut worker_id_counter = 0;
-        let mut free_worker_ids = Vec::new();
-        let mut get_worker_id = |free_worker_ids: &mut Vec<usize>| {
-            if let Some(id) = free_worker_ids.pop() {
-                id
-            } else {
-                let id = worker_id_counter;
-                worker_id_counter += 1;
-                id
-            }
-        };
+    let f = move || {
+        let _profiler = if cgcx.time_trace { B::thread_profiler() } else { Box::new(()) };
 
         // This is where we collect codegen units that have gone all the way
         // through codegen and LLVM.
         let mut compiled_modules = vec![];
-        let mut compiled_allocator_module = None;
-        let mut needs_link = Vec::new();
         let mut needs_fat_lto = Vec::new();
         let mut needs_thin_lto = Vec::new();
         let mut lto_import_only_modules = Vec::new();
-        let mut started_lto = false;
 
         /// Possible state transitions:
         /// - Ongoing -> Completed
@@ -1396,6 +1500,10 @@ fn start_executing_work<B: ExtraBackendMethods>(
         };
 
         let mut llvm_start_time: Option<VerboseTimingGuard<'_>> = None;
+
+        if let Some(allocator_module) = &mut allocator_module {
+            B::optimize(&cgcx, &prof, &shared_emitter, allocator_module, &allocator_config);
+        }
 
         // Run the message loop while there's still anything that needs message
         // processing. Note that as soon as codegen is aborted we simply want to
@@ -1434,8 +1542,10 @@ fn start_executing_work<B: ExtraBackendMethods>(
                         main_thread_state = MainThreadState::Lending;
                         spawn_work(
                             &cgcx,
+                            &prof,
+                            shared_emitter.clone(),
+                            coordinator_send.clone(),
                             &mut llvm_start_time,
-                            get_worker_id(&mut free_worker_ids),
                             item,
                         );
                     }
@@ -1444,38 +1554,8 @@ fn start_executing_work<B: ExtraBackendMethods>(
                 if running_with_any_token(main_thread_state, running_with_own_token) == 0
                     && work_items.is_empty()
                 {
-                    // All codegen work is done. Do we have LTO work to do?
-                    if needs_fat_lto.is_empty()
-                        && needs_thin_lto.is_empty()
-                        && lto_import_only_modules.is_empty()
-                    {
-                        // Nothing more to do!
-                        break;
-                    }
-
-                    // We have LTO work to do. Perform the serial work here of
-                    // figuring out what we're going to LTO and then push a
-                    // bunch of work items onto our queue to do LTO. This all
-                    // happens on the coordinator thread but it's very quick so
-                    // we don't worry about tokens.
-                    assert!(!started_lto);
-                    started_lto = true;
-
-                    let needs_fat_lto = mem::take(&mut needs_fat_lto);
-                    let needs_thin_lto = mem::take(&mut needs_thin_lto);
-                    let import_only_modules = mem::take(&mut lto_import_only_modules);
-
-                    for (work, cost) in
-                        generate_lto_work(&cgcx, needs_fat_lto, needs_thin_lto, import_only_modules)
-                    {
-                        let insertion_index = work_items
-                            .binary_search_by_key(&cost, |&(_, cost)| cost)
-                            .unwrap_or_else(|e| e);
-                        work_items.insert(insertion_index, (work, cost));
-                        if cgcx.parallel {
-                            helper.request_token();
-                        }
-                    }
+                    // All codegen work is done.
+                    break;
                 }
 
                 // In this branch, we know that everything has been codegened,
@@ -1487,8 +1567,10 @@ fn start_executing_work<B: ExtraBackendMethods>(
                             main_thread_state = MainThreadState::Lending;
                             spawn_work(
                                 &cgcx,
+                                &prof,
+                                shared_emitter.clone(),
+                                coordinator_send.clone(),
                                 &mut llvm_start_time,
-                                get_worker_id(&mut free_worker_ids),
                                 item,
                             );
                         } else {
@@ -1523,12 +1605,15 @@ fn start_executing_work<B: ExtraBackendMethods>(
             // Spin up what work we can, only doing this while we've got available
             // parallelism slots and work left to spawn.
             if codegen_state != Aborted {
-                while !work_items.is_empty() && running_with_own_token < tokens.len() {
-                    let (item, _) = work_items.pop().unwrap();
+                while running_with_own_token < tokens.len()
+                    && let Some((item, _)) = work_items.pop()
+                {
                     spawn_work(
                         &cgcx,
+                        &prof,
+                        shared_emitter.clone(),
+                        coordinator_send.clone(),
                         &mut llvm_start_time,
-                        get_worker_id(&mut free_worker_ids),
                         item,
                     );
                     running_with_own_token += 1;
@@ -1538,23 +1623,7 @@ fn start_executing_work<B: ExtraBackendMethods>(
             // Relinquish accidentally acquired extra tokens.
             tokens.truncate(running_with_own_token);
 
-            // If a thread exits successfully then we drop a token associated
-            // with that worker and update our `running_with_own_token` count.
-            // We may later re-acquire a token to continue running more work.
-            // We may also not actually drop a token here if the worker was
-            // running with an "ephemeral token".
-            let mut free_worker = |worker_id| {
-                if main_thread_state == MainThreadState::Lending {
-                    main_thread_state = MainThreadState::Idle;
-                } else {
-                    running_with_own_token -= 1;
-                }
-
-                free_worker_ids.push(worker_id);
-            };
-
-            let msg = coordinator_receive.recv().unwrap();
-            match *msg.downcast::<Message<B>>().ok().unwrap() {
+            match coordinator_receive.recv().unwrap() {
                 // Save the token locally and the next turn of the loop will use
                 // this to spawn a new unit of work, or it may get dropped
                 // immediately if we have no more work to spawn.
@@ -1621,36 +1690,32 @@ fn start_executing_work<B: ExtraBackendMethods>(
                     codegen_state = Aborted;
                 }
 
-                Message::WorkItem { result, worker_id } => {
-                    free_worker(worker_id);
+                Message::WorkItem { result } => {
+                    // If a thread exits successfully then we drop a token associated
+                    // with that worker and update our `running_with_own_token` count.
+                    // We may later re-acquire a token to continue running more work.
+                    // We may also not actually drop a token here if the worker was
+                    // running with an "ephemeral token".
+                    if main_thread_state == MainThreadState::Lending {
+                        main_thread_state = MainThreadState::Idle;
+                    } else {
+                        running_with_own_token -= 1;
+                    }
 
                     match result {
                         Ok(WorkItemResult::Finished(compiled_module)) => {
-                            match compiled_module.kind {
-                                ModuleKind::Regular => {
-                                    assert!(needs_link.is_empty());
-                                    compiled_modules.push(compiled_module);
-                                }
-                                ModuleKind::Allocator => {
-                                    assert!(compiled_allocator_module.is_none());
-                                    compiled_allocator_module = Some(compiled_module);
-                                }
-                                ModuleKind::Metadata => bug!("Should be handled separately"),
-                            }
-                        }
-                        Ok(WorkItemResult::NeedsLink(module)) => {
-                            assert!(compiled_modules.is_empty());
-                            needs_link.push(module);
+                            compiled_modules.push(compiled_module);
                         }
                         Ok(WorkItemResult::NeedsFatLto(fat_lto_input)) => {
-                            assert!(!started_lto);
                             assert!(needs_thin_lto.is_empty());
                             needs_fat_lto.push(fat_lto_input);
                         }
                         Ok(WorkItemResult::NeedsThinLto(name, thin_buffer)) => {
-                            assert!(!started_lto);
                             assert!(needs_fat_lto.is_empty());
-                            needs_thin_lto.push((name, thin_buffer));
+                            needs_thin_lto.push(ThinLtoInput::Red {
+                                name,
+                                buffer: SerializedModule::Local(thin_buffer),
+                            });
                         }
                         Err(Some(WorkerFatalError)) => {
                             // Like `CodegenAborted`, wait for remaining work to finish.
@@ -1665,7 +1730,6 @@ fn start_executing_work<B: ExtraBackendMethods>(
                 }
 
                 Message::AddImportOnlyModule { module_data, work_product } => {
-                    assert!(!started_lto);
                     assert_eq!(codegen_state, Ongoing);
                     assert_eq!(main_thread_state, MainThreadState::Codegenning);
                     lto_import_only_modules.push((module_data, work_product));
@@ -1674,36 +1738,83 @@ fn start_executing_work<B: ExtraBackendMethods>(
             }
         }
 
+        // Drop to print timings
+        drop(llvm_start_time);
+
         if codegen_state == Aborted {
             return Err(());
         }
 
-        let needs_link = mem::take(&mut needs_link);
-        if !needs_link.is_empty() {
+        drop(codegen_state);
+        drop(tokens);
+        drop(helper);
+        assert!(work_items.is_empty());
+
+        if !needs_fat_lto.is_empty() {
             assert!(compiled_modules.is_empty());
-            let dcx = cgcx.create_dcx();
-            let dcx = dcx.handle();
-            let module = B::run_link(&cgcx, dcx, needs_link).map_err(|_| ())?;
-            let module = unsafe {
-                B::codegen(&cgcx, dcx, module, cgcx.config(ModuleKind::Regular)).map_err(|_| ())?
-            };
-            compiled_modules.push(module);
+            assert!(needs_thin_lto.is_empty());
+
+            if let Some(allocator_module) = allocator_module.take() {
+                needs_fat_lto.push(FatLtoInput::InMemory(allocator_module));
+            }
+
+            for (module, wp) in lto_import_only_modules {
+                needs_fat_lto.push(FatLtoInput::Serialized { name: wp.cgu_name, buffer: module })
+            }
+
+            return Ok(MaybeLtoModules::FatLto {
+                cgcx,
+                exported_symbols_for_lto,
+                each_linked_rlib_file_for_lto,
+                needs_fat_lto,
+            });
+        } else if !needs_thin_lto.is_empty() || !lto_import_only_modules.is_empty() {
+            assert!(compiled_modules.is_empty());
+            assert!(needs_fat_lto.is_empty());
+
+            for (buffer, wp) in lto_import_only_modules {
+                needs_thin_lto.push(ThinLtoInput::Green { wp, buffer })
+            }
+
+            if cgcx.lto == Lto::ThinLocal {
+                compiled_modules.extend(do_thin_lto::<B>(
+                    &cgcx,
+                    &prof,
+                    shared_emitter.clone(),
+                    tm_factory,
+                    exported_symbols_for_lto,
+                    each_linked_rlib_file_for_lto,
+                    needs_thin_lto,
+                ));
+            } else {
+                if let Some(allocator_module) = allocator_module.take() {
+                    let thin_buffer = B::serialize_module(allocator_module.module_llvm, true);
+                    needs_thin_lto.push(ThinLtoInput::Red {
+                        name: allocator_module.name,
+                        buffer: SerializedModule::Local(thin_buffer),
+                    });
+                }
+
+                return Ok(MaybeLtoModules::ThinLto {
+                    cgcx,
+                    exported_symbols_for_lto,
+                    each_linked_rlib_file_for_lto,
+                    needs_thin_lto,
+                });
+            }
         }
 
-        // Drop to print timings
-        drop(llvm_start_time);
-
-        // Regardless of what order these modules completed in, report them to
-        // the backend in the same order every time to ensure that we're handing
-        // out deterministic results.
-        compiled_modules.sort_by(|a, b| a.name.cmp(&b.name));
-
-        Ok(CompiledModules {
+        Ok(MaybeLtoModules::NoLto(CompiledModules {
             modules: compiled_modules,
-            allocator_module: compiled_allocator_module,
-        })
-    })
-    .expect("failed to spawn coordinator thread");
+            allocator_module: allocator_module.map(|allocator_module| {
+                B::codegen(&cgcx, &prof, &shared_emitter, allocator_module, &allocator_config)
+            }),
+        }))
+    };
+    return std::thread::Builder::new()
+        .name("coordinator".to_owned())
+        .spawn(f)
+        .expect("failed to spawn coordinator thread");
 
     // A heuristic that determines if we have enough LLVM WorkItems in the
     // queue so that the main thread can do LLVM work instead of codegen
@@ -1767,80 +1878,101 @@ fn start_executing_work<B: ExtraBackendMethods>(
 #[must_use]
 pub(crate) struct WorkerFatalError;
 
-fn spawn_work<'a, B: ExtraBackendMethods>(
-    cgcx: &'a CodegenContext<B>,
+fn spawn_work<'a, B: WriteBackendMethods>(
+    cgcx: &CodegenContext,
+    prof: &'a SelfProfilerRef,
+    shared_emitter: SharedEmitter,
+    coordinator_send: Sender<Message<B>>,
     llvm_start_time: &mut Option<VerboseTimingGuard<'a>>,
-    worker_id: usize,
     work: WorkItem<B>,
 ) {
-    if cgcx.config(work.module_kind()).time_module && llvm_start_time.is_none() {
-        *llvm_start_time = Some(cgcx.prof.verbose_generic_activity("LLVM_passes"));
+    if llvm_start_time.is_none() {
+        *llvm_start_time = Some(prof.verbose_generic_activity("LLVM_passes"));
     }
 
     let cgcx = cgcx.clone();
+    let prof = prof.clone();
 
-    B::spawn_named_thread(cgcx.time_trace, work.short_description(), move || {
-        // Set up a destructor which will fire off a message that we're done as
-        // we exit.
-        struct Bomb<B: ExtraBackendMethods> {
-            coordinator_send: Sender<Box<dyn Any + Send>>,
-            result: Option<Result<WorkItemResult<B>, FatalError>>,
-            worker_id: usize,
-        }
-        impl<B: ExtraBackendMethods> Drop for Bomb<B> {
-            fn drop(&mut self) {
-                let worker_id = self.worker_id;
-                let msg = match self.result.take() {
-                    Some(Ok(result)) => Message::WorkItem::<B> { result: Ok(result), worker_id },
-                    Some(Err(FatalError)) => {
-                        Message::WorkItem::<B> { result: Err(Some(WorkerFatalError)), worker_id }
-                    }
-                    None => Message::WorkItem::<B> { result: Err(None), worker_id },
-                };
-                drop(self.coordinator_send.send(Box::new(msg)));
+    let name = work.short_description();
+    let f = move || {
+        let _profiler = if cgcx.time_trace { B::thread_profiler() } else { Box::new(()) };
+
+        let result = std::panic::catch_unwind(AssertUnwindSafe(|| match work {
+            WorkItem::Optimize(m) => execute_optimize_work_item(&cgcx, &prof, shared_emitter, m),
+            WorkItem::CopyPostLtoArtifacts(m) => WorkItemResult::Finished(
+                execute_copy_from_cache_work_item(&cgcx, &prof, shared_emitter, m),
+            ),
+        }));
+
+        let msg = match result {
+            Ok(result) => Message::WorkItem::<B> { result: Ok(result) },
+
+            // We ignore any `FatalError` coming out of `execute_work_item`, as a
+            // diagnostic was already sent off to the main thread - just surface
+            // that there was an error in this worker.
+            Err(err) if err.is::<FatalErrorMarker>() => {
+                Message::WorkItem::<B> { result: Err(Some(WorkerFatalError)) }
             }
-        }
 
-        let mut bomb =
-            Bomb::<B> { coordinator_send: cgcx.coordinator_send.clone(), result: None, worker_id };
-
-        // Execute the work itself, and if it finishes successfully then flag
-        // ourselves as a success as well.
-        //
-        // Note that we ignore any `FatalError` coming out of `execute_work_item`,
-        // as a diagnostic was already sent off to the main thread - just
-        // surface that there was an error in this worker.
-        bomb.result = {
-            let module_config = cgcx.config(work.module_kind());
-
-            Some(match work {
-                WorkItem::Optimize(m) => {
-                    let _timer =
-                        cgcx.prof.generic_activity_with_arg("codegen_module_optimize", &*m.name);
-                    execute_optimize_work_item(&cgcx, m, module_config)
-                }
-                WorkItem::CopyPostLtoArtifacts(m) => {
-                    let _timer = cgcx.prof.generic_activity_with_arg(
-                        "codegen_copy_artifacts_from_incr_cache",
-                        &*m.name,
-                    );
-                    Ok(execute_copy_from_cache_work_item(&cgcx, m, module_config))
-                }
-                WorkItem::LTO(m) => {
-                    let _timer =
-                        cgcx.prof.generic_activity_with_arg("codegen_module_perform_lto", m.name());
-                    execute_lto_work_item(&cgcx, m, module_config)
-                }
-            })
+            Err(_) => Message::WorkItem::<B> { result: Err(None) },
         };
-    })
-    .expect("failed to spawn work thread");
+        drop(coordinator_send.send(msg));
+    };
+    std::thread::Builder::new().name(name).spawn(f).expect("failed to spawn work thread");
+}
+
+fn spawn_thin_lto_work<B: WriteBackendMethods>(
+    cgcx: &CodegenContext,
+    prof: &SelfProfilerRef,
+    shared_emitter: SharedEmitter,
+    tm_factory: TargetMachineFactoryFn<B>,
+    coordinator_send: Sender<ThinLtoMessage>,
+    work: ThinLtoWorkItem<B>,
+) {
+    let cgcx = cgcx.clone();
+    let prof = prof.clone();
+
+    let name = work.short_description();
+    let f = move || {
+        let _profiler = if cgcx.time_trace { B::thread_profiler() } else { Box::new(()) };
+
+        let result = std::panic::catch_unwind(AssertUnwindSafe(|| match work {
+            ThinLtoWorkItem::CopyPostLtoArtifacts(m) => {
+                execute_copy_from_cache_work_item(&cgcx, &prof, shared_emitter, m)
+            }
+            ThinLtoWorkItem::ThinLto(m) => {
+                execute_thin_lto_work_item(&cgcx, &prof, shared_emitter, tm_factory, m)
+            }
+        }));
+
+        let msg = match result {
+            Ok(result) => ThinLtoMessage::WorkItem { result: Ok(result) },
+
+            // We ignore any `FatalError` coming out of `execute_work_item`, as a
+            // diagnostic was already sent off to the main thread - just surface
+            // that there was an error in this worker.
+            Err(err) if err.is::<FatalErrorMarker>() => {
+                ThinLtoMessage::WorkItem { result: Err(Some(WorkerFatalError)) }
+            }
+
+            Err(_) => ThinLtoMessage::WorkItem { result: Err(None) },
+        };
+        drop(coordinator_send.send(msg));
+    };
+    std::thread::Builder::new().name(name).spawn(f).expect("failed to spawn work thread");
 }
 
 enum SharedEmitterMessage {
     Diagnostic(Diagnostic),
-    InlineAsmError(u32, String, Level, Option<(String, Vec<InnerSpan>)>),
+    InlineAsmError(InlineAsmError),
     Fatal(String),
+}
+
+pub struct InlineAsmError {
+    pub span: SpanData,
+    pub msg: String,
+    pub level: Level,
+    pub source: Option<(String, Vec<InnerSpan>)>,
 }
 
 #[derive(Clone)]
@@ -1859,14 +1991,8 @@ impl SharedEmitter {
         (SharedEmitter { sender }, SharedEmitterMain { receiver })
     }
 
-    pub fn inline_asm_error(
-        &self,
-        cookie: u32,
-        msg: String,
-        level: Level,
-        source: Option<(String, Vec<InnerSpan>)>,
-    ) {
-        drop(self.sender.send(SharedEmitterMessage::InlineAsmError(cookie, msg, level, source)));
+    pub fn inline_asm_error(&self, err: InlineAsmError) {
+        drop(self.sender.send(SharedEmitterMessage::InlineAsmError(err)));
     }
 
     fn fatal(&self, msg: &str) {
@@ -1874,21 +2000,11 @@ impl SharedEmitter {
     }
 }
 
-impl Translate for SharedEmitter {
-    fn fluent_bundle(&self) -> Option<&FluentBundle> {
-        None
-    }
-
-    fn fallback_fluent_bundle(&self) -> &FluentBundle {
-        panic!("shared emitter attempted to translate a diagnostic");
-    }
-}
-
 impl Emitter for SharedEmitter {
     fn emit_diagnostic(&mut self, mut diag: rustc_errors::DiagInner) {
         // Check that we aren't missing anything interesting when converting to
         // the cut-down local `DiagInner`.
-        assert_eq!(diag.span, MultiSpan::new());
+        assert!(!diag.span.has_span_labels());
         assert_eq!(diag.suggestions, Suggestions::Enabled(vec![]));
         assert_eq!(diag.sort_span, rustc_span::DUMMY_SP);
         assert_eq!(diag.is_lint, None);
@@ -1897,6 +2013,7 @@ impl Emitter for SharedEmitter {
         let args = mem::replace(&mut diag.args, DiagArgMap::default());
         drop(
             self.sender.send(SharedEmitterMessage::Diagnostic(Diagnostic {
+                span: diag.span.primary_spans().iter().map(|span| span.data()).collect::<Vec<_>>(),
                 level: diag.level(),
                 messages: diag.messages,
                 code: diag.code,
@@ -1937,6 +2054,9 @@ impl SharedEmitterMain {
                     let dcx = sess.dcx();
                     let mut d =
                         rustc_errors::DiagInner::new_with_messages(diag.level, diag.messages);
+                    d.span = MultiSpan::from_spans(
+                        diag.span.into_iter().map(|span| span.span()).collect(),
+                    );
                     d.code = diag.code; // may be `None`, that's ok
                     d.children = diag
                         .children
@@ -1951,20 +2071,15 @@ impl SharedEmitterMain {
                     dcx.emit_diagnostic(d);
                     sess.dcx().abort_if_errors();
                 }
-                Ok(SharedEmitterMessage::InlineAsmError(cookie, msg, level, source)) => {
-                    assert_matches!(level, Level::Error | Level::Warning | Level::Note);
-                    let msg = msg.strip_prefix("error: ").unwrap_or(&msg).to_string();
-                    let mut err = Diag::<()>::new(sess.dcx(), level, msg);
-
-                    // If the cookie is 0 then we don't have span information.
-                    if cookie != 0 {
-                        let pos = BytePos::from_u32(cookie);
-                        let span = Span::with_root_ctxt(pos, pos);
-                        err.span(span);
-                    };
+                Ok(SharedEmitterMessage::InlineAsmError(inner)) => {
+                    assert_matches!(inner.level, Level::Error | Level::Warning | Level::Note);
+                    let mut err = Diag::<()>::new(sess.dcx(), inner.level, inner.msg);
+                    if !inner.span.is_dummy() {
+                        err.span(inner.span.span());
+                    }
 
                     // Point to the generated assembly if it is available.
-                    if let Some((buffer, spans)) = source {
+                    if let Some((buffer, spans)) = inner.source {
                         let source = sess
                             .source_map()
                             .new_source_file(FileName::inline_asm_source_code(&buffer), buffer);
@@ -1993,48 +2108,47 @@ impl SharedEmitterMain {
     }
 }
 
-pub struct Coordinator<B: ExtraBackendMethods> {
-    pub sender: Sender<Box<dyn Any + Send>>,
-    future: Option<thread::JoinHandle<Result<CompiledModules, ()>>>,
+pub struct Coordinator<B: WriteBackendMethods> {
+    sender: Sender<Message<B>>,
+    future: Option<thread::JoinHandle<Result<MaybeLtoModules<B>, ()>>>,
     // Only used for the Message type.
     phantom: PhantomData<B>,
 }
 
-impl<B: ExtraBackendMethods> Coordinator<B> {
-    fn join(mut self) -> std::thread::Result<Result<CompiledModules, ()>> {
+impl<B: WriteBackendMethods> Coordinator<B> {
+    fn join(mut self) -> std::thread::Result<Result<MaybeLtoModules<B>, ()>> {
         self.future.take().unwrap().join()
     }
 }
 
-impl<B: ExtraBackendMethods> Drop for Coordinator<B> {
+impl<B: WriteBackendMethods> Drop for Coordinator<B> {
     fn drop(&mut self) {
         if let Some(future) = self.future.take() {
             // If we haven't joined yet, signal to the coordinator that it should spawn no more
             // work, and wait for worker threads to finish.
-            drop(self.sender.send(Box::new(Message::CodegenAborted::<B>)));
+            drop(self.sender.send(Message::CodegenAborted::<B>));
             drop(future.join());
         }
     }
 }
 
-pub struct OngoingCodegen<B: ExtraBackendMethods> {
+pub struct OngoingCodegen<B: WriteBackendMethods> {
     pub backend: B,
-    pub metadata: EncodedMetadata,
-    pub metadata_module: Option<CompiledModule>,
-    pub crate_info: CrateInfo,
+    pub output_filenames: Arc<OutputFilenames>,
+    // Field order below is intended to terminate the coordinator thread before two fields below
+    // drop and prematurely close channels used by coordinator thread. See `Coordinator`'s
+    // `Drop` implementation for more info.
+    pub coordinator: Coordinator<B>,
     pub codegen_worker_receive: Receiver<CguMessage>,
     pub shared_emitter_main: SharedEmitterMain,
-    pub output_filenames: Arc<OutputFilenames>,
-    pub coordinator: Coordinator<B>,
 }
 
-impl<B: ExtraBackendMethods> OngoingCodegen<B> {
-    pub fn join(self, sess: &Session) -> (CodegenResults, FxIndexMap<WorkProductId, WorkProduct>) {
-        let _timer = sess.timer("finish_ongoing_codegen");
-
+impl<B: WriteBackendMethods> OngoingCodegen<B> {
+    pub fn join(self, sess: &Session) -> (CompiledModules, FxIndexMap<WorkProductId, WorkProduct>) {
         self.shared_emitter_main.check(sess, true);
-        let compiled_modules = sess.time("join_worker_thread", || match self.coordinator.join() {
-            Ok(Ok(compiled_modules)) => compiled_modules,
+
+        let maybe_lto_modules = sess.time("join_worker_thread", || match self.coordinator.join() {
+            Ok(Ok(maybe_lto_modules)) => maybe_lto_modules,
             Ok(Err(())) => {
                 sess.dcx().abort_if_errors();
                 panic!("expected abort due to worker thread errors")
@@ -2046,37 +2160,89 @@ impl<B: ExtraBackendMethods> OngoingCodegen<B> {
 
         sess.dcx().abort_if_errors();
 
+        let (shared_emitter, shared_emitter_main) = SharedEmitter::new();
+
+        // Catch fatal errors to ensure shared_emitter_main.check() can emit the actual diagnostics
+        let compiled_modules = catch_fatal_errors(|| match maybe_lto_modules {
+            MaybeLtoModules::NoLto(compiled_modules) => {
+                drop(shared_emitter);
+                compiled_modules
+            }
+            MaybeLtoModules::FatLto {
+                cgcx,
+                exported_symbols_for_lto,
+                each_linked_rlib_file_for_lto,
+                needs_fat_lto,
+            } => {
+                let tm_factory = self.backend.target_machine_factory(
+                    sess,
+                    cgcx.opt_level,
+                    &cgcx.backend_features,
+                );
+
+                CompiledModules {
+                    modules: vec![do_fat_lto(
+                        &cgcx,
+                        &sess.prof,
+                        shared_emitter,
+                        tm_factory,
+                        &exported_symbols_for_lto,
+                        &each_linked_rlib_file_for_lto,
+                        needs_fat_lto,
+                    )],
+                    allocator_module: None,
+                }
+            }
+            MaybeLtoModules::ThinLto {
+                cgcx,
+                exported_symbols_for_lto,
+                each_linked_rlib_file_for_lto,
+                needs_thin_lto,
+            } => {
+                let tm_factory = self.backend.target_machine_factory(
+                    sess,
+                    cgcx.opt_level,
+                    &cgcx.backend_features,
+                );
+
+                CompiledModules {
+                    modules: do_thin_lto::<B>(
+                        &cgcx,
+                        &sess.prof,
+                        shared_emitter,
+                        tm_factory,
+                        exported_symbols_for_lto,
+                        each_linked_rlib_file_for_lto,
+                        needs_thin_lto,
+                    ),
+                    allocator_module: None,
+                }
+            }
+        });
+
+        shared_emitter_main.check(sess, true);
+
+        sess.dcx().abort_if_errors();
+
+        let mut compiled_modules =
+            compiled_modules.expect("fatal error emitted but not sent to SharedEmitter");
+
+        // Regardless of what order these modules completed in, report them to
+        // the backend in the same order every time to ensure that we're handing
+        // out deterministic results.
+        compiled_modules.modules.sort_by(|a, b| a.name.cmp(&b.name));
+
         let work_products =
             copy_all_cgu_workproducts_to_incr_comp_cache_dir(sess, &compiled_modules);
         produce_final_output_artifacts(sess, &compiled_modules, &self.output_filenames);
 
-        // FIXME: time_llvm_passes support - does this use a global context or
-        // something?
-        if sess.codegen_units().as_usize() == 1 && sess.opts.unstable_opts.time_llvm_passes {
-            self.backend.print_pass_timings()
-        }
-
-        if sess.print_llvm_stats() {
-            self.backend.print_statistics()
-        }
-
-        (
-            CodegenResults {
-                metadata: self.metadata,
-                crate_info: self.crate_info,
-
-                modules: compiled_modules.modules,
-                allocator_module: compiled_modules.allocator_module,
-                metadata_module: self.metadata_module,
-            },
-            work_products,
-        )
+        (compiled_modules, work_products)
     }
 
     pub(crate) fn codegen_finished(&self, tcx: TyCtxt<'_>) {
         self.wait_for_signal_to_codegen_item();
         self.check_for_errors(tcx.sess);
-        drop(self.coordinator.sender.send(Box::new(Message::CodegenComplete::<B>)));
+        drop(self.coordinator.sender.send(Message::CodegenComplete::<B>));
     }
 
     pub(crate) fn check_for_errors(&self, sess: &Session) {
@@ -2096,29 +2262,26 @@ impl<B: ExtraBackendMethods> OngoingCodegen<B> {
     }
 }
 
-pub(crate) fn submit_codegened_module_to_llvm<B: ExtraBackendMethods>(
-    _backend: &B,
-    tx_to_llvm_workers: &Sender<Box<dyn Any + Send>>,
+pub(crate) fn submit_codegened_module_to_llvm<B: WriteBackendMethods>(
+    coordinator: &Coordinator<B>,
     module: ModuleCodegen<B::Module>,
     cost: u64,
 ) {
     let llvm_work_item = WorkItem::Optimize(module);
-    drop(tx_to_llvm_workers.send(Box::new(Message::CodegenDone::<B> { llvm_work_item, cost })));
+    drop(coordinator.sender.send(Message::CodegenDone::<B> { llvm_work_item, cost }));
 }
 
-pub(crate) fn submit_post_lto_module_to_llvm<B: ExtraBackendMethods>(
-    _backend: &B,
-    tx_to_llvm_workers: &Sender<Box<dyn Any + Send>>,
+pub(crate) fn submit_post_lto_module_to_llvm<B: WriteBackendMethods>(
+    coordinator: &Coordinator<B>,
     module: CachedModuleCodegen,
 ) {
     let llvm_work_item = WorkItem::CopyPostLtoArtifacts(module);
-    drop(tx_to_llvm_workers.send(Box::new(Message::CodegenDone::<B> { llvm_work_item, cost: 0 })));
+    drop(coordinator.sender.send(Message::CodegenDone::<B> { llvm_work_item, cost: 0 }));
 }
 
-pub(crate) fn submit_pre_lto_module_to_llvm<B: ExtraBackendMethods>(
-    _backend: &B,
+pub(crate) fn submit_pre_lto_module_to_llvm<B: WriteBackendMethods>(
     tcx: TyCtxt<'_>,
-    tx_to_llvm_workers: &Sender<Box<dyn Any + Send>>,
+    coordinator: &Coordinator<B>,
     module: CachedModuleCodegen,
 ) {
     let filename = pre_lto_bitcode_filename(&module.name);
@@ -2132,10 +2295,10 @@ pub(crate) fn submit_pre_lto_module_to_llvm<B: ExtraBackendMethods>(
         })
     };
     // Schedule the module to be loaded
-    drop(tx_to_llvm_workers.send(Box::new(Message::AddImportOnlyModule::<B> {
+    drop(coordinator.sender.send(Message::AddImportOnlyModule::<B> {
         module_data: SerializedModule::FromUncompressedFile(mmap),
         work_product: module.source,
-    })));
+    }));
 }
 
 fn pre_lto_bitcode_filename(module_name: &str) -> String {
@@ -2155,7 +2318,7 @@ fn msvc_imps_needed(tcx: TyCtxt<'_>) -> bool {
     // indirectly from ThinLTO. In theory these are not needed as ThinLTO could resolve
     // these, but it currently does not do so.
     let can_have_static_objects =
-        tcx.sess.lto() == Lto::Thin || tcx.crate_types().iter().any(|ct| *ct == CrateType::Rlib);
+        tcx.sess.lto() == Lto::Thin || tcx.crate_types().contains(&CrateType::Rlib);
 
     tcx.sess.target.is_like_windows &&
     can_have_static_objects   &&

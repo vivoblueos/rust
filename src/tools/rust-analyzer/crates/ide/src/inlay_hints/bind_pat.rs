@@ -3,26 +3,27 @@
 //! fn f(a: i32, b: i32) -> i32 { a + b }
 //! let _x /* i32 */= f(4, 4);
 //! ```
-use hir::Semantics;
-use ide_db::{famous_defs::FamousDefs, RootDatabase};
+use hir::{DisplayTarget, Semantics};
+use ide_db::{RootDatabase, famous_defs::FamousDefs};
 
 use itertools::Itertools;
-use span::EditionedFileId;
 use syntax::{
+    TextRange,
     ast::{self, AstNode, HasGenericArgs, HasName},
     match_ast,
 };
 
+use super::TypeHintsPlacement;
 use crate::{
-    inlay_hints::{closure_has_block_body, label_of_ty, ty_to_text_edit},
     InlayHint, InlayHintPosition, InlayHintsConfig, InlayKind,
+    inlay_hints::{closure_has_block_body, label_of_ty, ty_to_text_edit},
 };
 
 pub(super) fn hints(
     acc: &mut Vec<InlayHint>,
     famous_defs @ FamousDefs(sema, _): &FamousDefs<'_, '_>,
-    config: &InlayHintsConfig,
-    file_id: EditionedFileId,
+    config: &InlayHintsConfig<'_>,
+    display_target: DisplayTarget,
     pat: &ast::IdentPat,
 ) -> Option<()> {
     if !config.type_hints {
@@ -30,22 +31,25 @@ pub(super) fn hints(
     }
 
     let parent = pat.syntax().parent()?;
+    let mut enclosing_let_stmt = None;
     let type_ascriptable = match_ast! {
         match parent {
             ast::Param(it) => {
                 if it.ty().is_some() {
                     return None;
                 }
+                if config.hide_closure_parameter_hints && it.syntax().ancestors().nth(2).is_none_or(|n| matches!(ast::Expr::cast(n), Some(ast::Expr::ClosureExpr(_)))) {
+                    return None;
+                }
                 Some(it.colon_token())
             },
             ast::LetStmt(it) => {
-                if config.hide_closure_initialization_hints {
-                    if let Some(ast::Expr::ClosureExpr(closure)) = it.initializer() {
-                        if closure_has_block_body(&closure) {
+                enclosing_let_stmt = Some(it.clone());
+                if config.hide_closure_initialization_hints
+                    && let Some(ast::Expr::ClosureExpr(closure)) = it.initializer()
+                        && closure_has_block_body(&closure) {
                             return None;
                         }
-                    }
-                }
                 if it.ty().is_some() {
                     return None;
                 }
@@ -67,7 +71,7 @@ pub(super) fn hints(
         return None;
     }
 
-    let mut label = label_of_ty(famous_defs, config, &ty, file_id.edition())?;
+    let mut label = label_of_ty(famous_defs, config, &ty, display_target)?;
 
     if config.hide_named_constructor_hints
         && is_named_constructor(sema, pat, &label.to_string()).is_some()
@@ -78,13 +82,15 @@ pub(super) fn hints(
     let text_edit = if let Some(colon_token) = &type_ascriptable {
         ty_to_text_edit(
             sema,
+            config,
             desc_pat.syntax(),
             &ty,
             colon_token
                 .as_ref()
                 .map_or_else(|| pat.syntax().text_range(), |t| t.text_range())
                 .end(),
-            if colon_token.is_some() { String::new() } else { String::from(": ") },
+            &|_| (),
+            if colon_token.is_some() { "" } else { ": " },
         )
     } else {
         None
@@ -99,16 +105,26 @@ pub(super) fn hints(
         Some(name) => name.syntax().text_range(),
         None => pat.syntax().text_range(),
     };
+    let mut range = match type_ascriptable {
+        Some(Some(t)) => text_range.cover(t.text_range()),
+        _ => text_range,
+    };
+
+    let mut pad_left = !render_colons;
+    if matches!(config.type_hints_placement, TypeHintsPlacement::EndOfLine)
+        && let Some(let_stmt) = enclosing_let_stmt
+    {
+        let stmt_range = let_stmt.syntax().text_range();
+        range = TextRange::new(range.start(), stmt_range.end());
+        pad_left = true;
+    }
     acc.push(InlayHint {
-        range: match type_ascriptable {
-            Some(Some(t)) => text_range.cover(t.text_range()),
-            _ => text_range,
-        },
+        range,
         kind: InlayKind::Type,
         label,
         text_edit,
         position: InlayHintPosition::After,
-        pad_left: !render_colons,
+        pad_left,
         pad_right: false,
         resolve_parent: Some(pat.syntax().text_range()),
     });
@@ -178,14 +194,16 @@ mod tests {
     use syntax::{TextRange, TextSize};
     use test_utils::extract_annotations;
 
-    use crate::{fixture, inlay_hints::InlayHintsConfig, ClosureReturnTypeHints};
+    use crate::{ClosureReturnTypeHints, fixture, inlay_hints::InlayHintsConfig};
 
+    use super::TypeHintsPlacement;
     use crate::inlay_hints::tests::{
-        check, check_edit, check_no_edit, check_with_config, DISABLED_CONFIG, TEST_CONFIG,
+        DISABLED_CONFIG, TEST_CONFIG, check, check_edit, check_expect, check_no_edit,
+        check_with_config,
     };
 
     #[track_caller]
-    fn check_types(ra_fixture: &str) {
+    fn check_types(#[rust_analyzer::rust_fixture] ra_fixture: &str) {
         check_with_config(InlayHintsConfig { type_hints: true, ..DISABLED_CONFIG }, ra_fixture);
     }
 
@@ -198,6 +216,76 @@ fn main() {
     let _x = foo(4, 4);
       //^^ i32
 }"#,
+        );
+    }
+
+    #[test]
+    fn type_hints_end_of_line_placement() {
+        let mut config = InlayHintsConfig { type_hints: true, ..DISABLED_CONFIG };
+        config.type_hints_placement = TypeHintsPlacement::EndOfLine;
+        check_expect(
+            config,
+            r#"
+fn main() {
+    let foo = 92_i32;
+}
+            "#,
+            expect![[r#"
+                [
+                    (
+                        20..33,
+                        [
+                            "i32",
+                        ],
+                    ),
+                ]
+            "#]],
+        );
+    }
+
+    #[test]
+    fn type_hints_end_of_line_placement_chain_expr() {
+        let mut config = InlayHintsConfig { type_hints: true, ..DISABLED_CONFIG };
+        config.type_hints_placement = TypeHintsPlacement::EndOfLine;
+        check_expect(
+            config,
+            r#"
+fn main() {
+    struct Builder;
+    impl Builder {
+        fn iter(self) -> Builder { Builder }
+        fn map(self) -> Builder { Builder }
+    }
+    fn make() -> Builder { Builder }
+
+    let foo = make()
+        .iter()
+        .map();
+}
+"#,
+            expect![[r#"
+                [
+                    (
+                        192..236,
+                        [
+                            InlayHintLabelPart {
+                                text: "Builder",
+                                linked_location: Some(
+                                    Computed(
+                                        FileRangeWrapper {
+                                            file_id: FileId(
+                                                0,
+                                            ),
+                                            range: 23..30,
+                                        },
+                                    ),
+                                ),
+                                tooltip: "",
+                            },
+                        ],
+                    ),
+                ]
+            "#]],
         );
     }
 
@@ -337,14 +425,14 @@ fn main(a: SliceIter<'_, Container>) {
     fn lt_hints() {
         check_types(
             r#"
-struct S<'lt>;
+struct S<'lt>(*mut &'lt ());
 
 fn f<'a>() {
-    let x = S::<'static>;
+    let x = S::<'static>(loop {});
       //^ S<'static>
-    let y = S::<'_>;
+    let y = S::<'_>(loop {});
       //^ S<'_>
-    let z = S::<'a>;
+    let z = S::<'a>(loop {});
       //^ S<'a>
 
 }
@@ -378,7 +466,7 @@ fn main() {
     let foo = foo4();
      // ^^^ &dyn Fn(f64, f64) -> u32
     let foo = foo5();
-     // ^^^ &dyn Fn(&dyn Fn(f64, f64) -> u32, f64) -> u32
+     // ^^^ &dyn Fn(&(dyn Fn(f64, f64) -> u32 + 'static), f64) -> u32
     let foo = foo6();
      // ^^^ impl Fn(f64, f64) -> u32
     let foo = foo7();
@@ -391,36 +479,37 @@ fn main() {
     #[test]
     fn check_hint_range_limit() {
         let fixture = r#"
-        //- minicore: fn, sized
-        fn foo() -> impl Fn() { loop {} }
-        fn foo1() -> impl Fn(f64) { loop {} }
-        fn foo2() -> impl Fn(f64, f64) { loop {} }
-        fn foo3() -> impl Fn(f64, f64) -> u32 { loop {} }
-        fn foo4() -> &'static dyn Fn(f64, f64) -> u32 { loop {} }
-        fn foo5() -> &'static dyn Fn(&'static dyn Fn(f64, f64) -> u32, f64) -> u32 { loop {} }
-        fn foo6() -> impl Fn(f64, f64) -> u32 + Sized { loop {} }
-        fn foo7() -> *const (impl Fn(f64, f64) -> u32 + Sized) { loop {} }
+//- minicore: fn, sized
+fn foo() -> impl Fn() { loop {} }
+fn foo1() -> impl Fn(f64) { loop {} }
+fn foo2() -> impl Fn(f64, f64) { loop {} }
+fn foo3() -> impl Fn(f64, f64) -> u32 { loop {} }
+fn foo4() -> &'static dyn Fn(f64, f64) -> u32 { loop {} }
+fn foo5() -> &'static dyn Fn(&'static dyn Fn(f64, f64) -> u32, f64) -> u32 { loop {} }
+fn foo6() -> impl Fn(f64, f64) -> u32 + Sized { loop {} }
+fn foo7() -> *const (impl Fn(f64, f64) -> u32 + Sized) { loop {} }
 
-        fn main() {
-            let foo = foo();
-            let foo = foo1();
-            let foo = foo2();
-             // ^^^ impl Fn(f64, f64)
-            let foo = foo3();
-             // ^^^ impl Fn(f64, f64) -> u32
-            let foo = foo4();
-            let foo = foo5();
-            let foo = foo6();
-            let foo = foo7();
-        }
-        "#;
+fn main() {
+    let foo = foo();
+    let foo = foo1();
+    let foo = foo2();
+     // ^^^ impl Fn(f64, f64)
+    let foo = foo3();
+     // ^^^ impl Fn(f64, f64) -> u32
+    let foo = foo4();
+     // ^^^ &dyn Fn(f64, f64) -> u32
+    let foo = foo5();
+    let foo = foo6();
+    let foo = foo7();
+}
+"#;
         let (analysis, file_id) = fixture::file(fixture);
         let expected = extract_annotations(&analysis.file_text(file_id).unwrap());
         let inlay_hints = analysis
             .inlay_hints(
                 &InlayHintsConfig { type_hints: true, ..DISABLED_CONFIG },
                 file_id,
-                Some(TextRange::new(TextSize::from(500), TextSize::from(600))),
+                Some(TextRange::new(TextSize::from(491), TextSize::from(640))),
             )
             .unwrap();
         let actual =
@@ -629,10 +718,10 @@ fn main() {
     fn multi_dyn_trait_bounds() {
         check_types(
             r#"
-pub struct Vec<T> {}
+pub struct Vec<T>(*mut T);
 
 impl<T> Vec<T> {
-    pub fn new() -> Self { Vec {} }
+    pub fn new() -> Self { Vec(0 as *mut T) }
 }
 
 pub struct Box<T> {}
@@ -643,11 +732,11 @@ auto trait Sync {}
 fn main() {
     // The block expression wrapping disables the constructor hint hiding logic
     let _v = { Vec::<Box<&(dyn Display + Sync)>>::new() };
-      //^^ Vec<Box<&(dyn Display + Sync)>>
+      //^^ Vec<Box<&(dyn Display + Sync + 'static)>>
     let _v = { Vec::<Box<*const (dyn Display + Sync)>>::new() };
-      //^^ Vec<Box<*const (dyn Display + Sync)>>
-    let _v = { Vec::<Box<dyn Display + Sync>>::new() };
-      //^^ Vec<Box<dyn Display + Sync>>
+      //^^ Vec<Box<*const (dyn Display + Sync + 'static)>>
+    let _v = { Vec::<Box<dyn Display + Sync + 'static>>::new() };
+      //^^ Vec<Box<dyn Display + Sync + 'static>>
 }
 "#,
         );
@@ -857,28 +946,6 @@ fn main() {
         check_with_config(
             InlayHintsConfig {
                 type_hints: true,
-                closure_style: ClosureStyle::ClosureWithId,
-                ..DISABLED_CONFIG
-            },
-            r#"
-//- minicore: fn
-fn main() {
-    let x = || 2;
-      //^ {closure#0}
-    let y = |t: i32| x() + t;
-      //^ {closure#1}
-    let mut t = 5;
-          //^ i32
-    let z = |k: i32| { t += k; };
-      //^ {closure#2}
-    let p = (y, z);
-      //^ ({closure#1}, {closure#2})
-}
-            "#,
-        );
-        check_with_config(
-            InlayHintsConfig {
-                type_hints: true,
                 closure_style: ClosureStyle::Hide,
                 ..DISABLED_CONFIG
             },
@@ -928,7 +995,7 @@ fn main() {
     foo(plus_one);
 
     let add_mul = bar(|x: u8| { x + 1 });
-    //  ^^^^^^^ impl FnOnce(u8) -> u8 + ?Sized
+    //  ^^^^^^^ impl FnOnce(u8) -> u8
 
     let closure = if let Some(6) = add_mul(2).checked_sub(1) {
     //  ^^^^^^^ fn(i32) -> i32
@@ -942,6 +1009,36 @@ fn foo(f: impl FnOnce(u8) -> u8) {}
 
 fn bar(f: impl FnOnce(u8) -> u8) -> impl FnOnce(u8) -> u8 {
     move |x: u8| f(x) * 2
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn skip_closure_parameter_hints() {
+        check_with_config(
+            InlayHintsConfig {
+                type_hints: true,
+                hide_closure_parameter_hints: true,
+                ..DISABLED_CONFIG
+            },
+            r#"
+//- minicore: fn
+struct Foo;
+impl Foo {
+    fn foo(self: Self) {}
+    fn bar(self: &Self) {}
+}
+fn main() {
+    let closure = |x, y| x + y;
+    //  ^^^^^^^ impl Fn(i32, i32) -> {unknown}
+    closure(2, 3);
+    let point = (10, 20);
+    //  ^^^^^ (i32, i32)
+    let (x,      y) = point;
+      // ^ i32   ^ i32
+    Foo::foo(Foo);
+    Foo::bar(&Foo);
 }
 "#,
         );
@@ -1106,12 +1203,11 @@ fn test() {
 
     #[test]
     fn no_edit_for_closure_return_without_body_block() {
-        // We can lift this limitation; see FIXME in closure_ret module.
         let config = InlayHintsConfig {
             closure_return_type_hints: ClosureReturnTypeHints::Always,
             ..TEST_CONFIG
         };
-        check_no_edit(
+        check_edit(
             config,
             r#"
 struct S<T>(T);
@@ -1120,6 +1216,13 @@ fn test() {
     let f = |a: S<usize>| S(a);
 }
 "#,
+            expect![[r#"
+            struct S<T>(T);
+            fn test() {
+                let f = || -> i32 { 3 };
+                let f = |a: S<usize>| -> S<S<usize>> { S(a) };
+            }
+            "#]],
         );
     }
 
@@ -1161,6 +1264,224 @@ fn main() {
     let _x = 42;
       //^^ i32
 }"#,
+        );
+    }
+
+    #[test]
+    fn collapses_nested_impl_projections() {
+        check_types(
+            r#"
+//- minicore: sized
+trait T {
+    type Assoc;
+    fn f(self) -> Self::Assoc;
+}
+
+trait T2 {}
+trait T3<T> {}
+
+fn f(it: impl T<Assoc: T2>) {
+    let l = it.f();
+     // ^ impl T2
+}
+
+fn f2<G: T<Assoc: T2 + 'static>>(it: G) {
+    let l = it.f();
+      //^ impl T2 + 'static
+}
+
+fn f3<G: T>(it: G) where <G as T>::Assoc: T2 {
+    let l = it.f();
+      //^ impl T2
+}
+
+fn f4<G: T<Assoc: T2 + T3<()>>>(it: G) {
+    let l = it.f();
+      //^ impl T2 + T3<()>
+}
+
+fn f5<G: T<Assoc = ()>>(it: G) {
+    let l = it.f();
+      //^ ()
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn regression_19007() {
+        check_types(
+            r#"
+trait Foo {
+    type Assoc;
+
+    fn foo(&self) -> Self::Assoc;
+}
+
+trait Bar {
+    type Target;
+}
+
+trait Baz<T> {}
+
+struct Struct<T: Foo> {
+    field: T,
+}
+
+impl<T> Struct<T>
+where
+    T: Foo,
+    T::Assoc: Baz<<T::Assoc as Bar>::Target> + Bar,
+{
+    fn f(&self) {
+        let x = self.field.foo();
+          //^ impl Baz<<<T as Foo>::Assoc as Bar>::Target> + Bar
+    }
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn type_param_inlay_hint_has_location_link() {
+        check_expect(
+            InlayHintsConfig { type_hints: true, ..DISABLED_CONFIG },
+            r#"
+fn identity<T>(t: T) -> T {
+    let x = t;
+    x
+}
+"#,
+            expect![[r#"
+                [
+                    (
+                        36..37,
+                        [
+                            InlayHintLabelPart {
+                                text: "T",
+                                linked_location: Some(
+                                    Computed(
+                                        FileRangeWrapper {
+                                            file_id: FileId(
+                                                0,
+                                            ),
+                                            range: 12..13,
+                                        },
+                                    ),
+                                ),
+                                tooltip: "",
+                            },
+                        ],
+                    ),
+                ]
+            "#]],
+        );
+    }
+
+    #[test]
+    fn const_param_inlay_hint_has_location_link() {
+        check_expect(
+            InlayHintsConfig { type_hints: true, ..DISABLED_CONFIG },
+            r#"
+fn f<const N: usize>() {
+    let x = [0; N];
+}
+"#,
+            expect![[r#"
+                [
+                    (
+                        33..34,
+                        [
+                            "[i32; ",
+                            InlayHintLabelPart {
+                                text: "N",
+                                linked_location: Some(
+                                    Computed(
+                                        FileRangeWrapper {
+                                            file_id: FileId(
+                                                0,
+                                            ),
+                                            range: 11..12,
+                                        },
+                                    ),
+                                ),
+                                tooltip: "",
+                            },
+                            "]",
+                        ],
+                    ),
+                ]
+            "#]],
+        );
+    }
+
+    #[test]
+    fn lifetime_param_inlay_hint_has_location_link() {
+        check_expect(
+            InlayHintsConfig { type_hints: true, ..DISABLED_CONFIG },
+            r#"
+struct S<'lt>(*mut &'lt ());
+
+fn f<'a>() {
+    let x = S::<'a>(loop {});
+}
+"#,
+            expect![[r#"
+                [
+                    (
+                        51..52,
+                        [
+                            InlayHintLabelPart {
+                                text: "S",
+                                linked_location: Some(
+                                    Computed(
+                                        FileRangeWrapper {
+                                            file_id: FileId(
+                                                0,
+                                            ),
+                                            range: 7..8,
+                                        },
+                                    ),
+                                ),
+                                tooltip: "",
+                            },
+                            "<",
+                            InlayHintLabelPart {
+                                text: "'a",
+                                linked_location: Some(
+                                    Computed(
+                                        FileRangeWrapper {
+                                            file_id: FileId(
+                                                0,
+                                            ),
+                                            range: 35..37,
+                                        },
+                                    ),
+                                ),
+                                tooltip: "",
+                            },
+                            ">",
+                        ],
+                    ),
+                ]
+            "#]],
+        );
+    }
+
+    #[test]
+    fn ref_multi_trait_impl_trait() {
+        check_with_config(
+            InlayHintsConfig { type_hints: true, ..DISABLED_CONFIG },
+            r#"
+//- minicore: sized
+trait Eq {}
+trait Ord {}
+
+fn foo(argument: &(impl Eq + Ord)) {
+    let x = argument;
+     // ^ &(impl Eq + Ord)
+}
+        "#,
         );
     }
 }

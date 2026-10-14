@@ -1,7 +1,8 @@
 //@ build-fail
 //@ revisions: normal mir-opt
 //@ [mir-opt]compile-flags: -Zmir-opt-level=4
-
+//@ dont-require-annotations: NOTE
+//@ ignore-parallel-frontend post-monomorphization errors
 trait C {
     const BOO: usize;
 }
@@ -13,11 +14,11 @@ trait Foo<T> {
 struct A<T>(T);
 
 impl<T: C> Foo<T> for A<T> {
-    const BAR: usize = [5, 6, 7][T::BOO]; //~ ERROR evaluation of `<A<()> as Foo<()>>::BAR` failed
+    const BAR: usize = [5, 6, 7][T::BOO]; //~ ERROR index out of bounds: the length is 3 but the index is 42
 }
 
 fn foo<T: C>() -> &'static usize {
-    &<A<T> as Foo<T>>::BAR //~ constant
+    &<A<T> as Foo<T>>::BAR //~ NOTE constant
 }
 
 impl C for () {

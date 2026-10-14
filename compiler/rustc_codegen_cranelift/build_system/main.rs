@@ -17,6 +17,7 @@ mod prepare;
 mod rustc_info;
 mod shared_utils;
 mod tests;
+mod todo;
 mod utils;
 
 fn usage() {
@@ -38,6 +39,7 @@ enum Command {
     Test,
     AbiCafe,
     Bench,
+    CheckTodo,
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -59,11 +61,6 @@ fn main() {
     }
     env::set_var("CG_CLIF_DISABLE_INCR_CACHE", "1");
 
-    // Force incr comp even in release mode unless in CI or incremental builds are explicitly disabled
-    if env::var_os("CARGO_BUILD_INCREMENTAL").is_none() {
-        env::set_var("CARGO_BUILD_INCREMENTAL", "true");
-    }
-
     let mut args = env::args().skip(1);
     let command = match args.next().as_deref() {
         Some("prepare") => Command::Prepare,
@@ -71,6 +68,7 @@ fn main() {
         Some("test") => Command::Test,
         Some("abi-cafe") => Command::AbiCafe,
         Some("bench") => Command::Bench,
+        Some("check-todo") => Command::CheckTodo,
         Some(flag) if flag.starts_with('-') => arg_error!("Expected command found flag {}", flag),
         Some(command) => arg_error!("Unknown command {}", command),
         None => {
@@ -79,10 +77,11 @@ fn main() {
         }
     };
 
-    let mut out_dir = PathBuf::from(".");
+    let mut out_dir = std::env::current_dir().unwrap();
     let mut download_dir = None;
     let mut sysroot_kind = SysrootKind::Clif;
     let mut use_unstable_features = true;
+    let mut panic_unwind_support = false;
     let mut frozen = false;
     let mut skip_tests = vec![];
     let mut use_backend = None;
@@ -108,6 +107,7 @@ fn main() {
                 }
             }
             "--no-unstable-features" => use_unstable_features = false,
+            "--panic-unwind-support" => panic_unwind_support = true,
             "--frozen" => frozen = true,
             "--skip-test" => {
                 // FIXME check that all passed in tests actually exist
@@ -142,6 +142,10 @@ fn main() {
         process::exit(0);
     }
 
+    if command == Command::CheckTodo {
+        todo::run();
+    }
+
     let rustup_toolchain_name = match (env::var("CARGO"), env::var("RUSTC"), env::var("RUSTDOC")) {
         (Ok(_), Ok(_), Ok(_)) => None,
         (_, Err(_), Err(_)) => Some(rustc_info::get_toolchain_name()),
@@ -156,10 +160,8 @@ fn main() {
         let cargo = rustc_info::get_cargo_path();
         let rustc = rustc_info::get_rustc_path();
         let rustdoc = rustc_info::get_rustdoc_path();
-        let triple = std::env::var("HOST_TRIPLE")
-            .ok()
-            .or_else(|| config::get_value("host"))
-            .unwrap_or_else(|| rustc_info::get_host_triple(&rustc));
+        let triple =
+            std::env::var("HOST_TRIPLE").unwrap_or_else(|_| rustc_info::get_host_triple(&rustc));
         Compiler {
             cargo,
             rustc,
@@ -170,10 +172,8 @@ fn main() {
             runner: vec![],
         }
     };
-    let target_triple = std::env::var("TARGET_TRIPLE")
-        .ok()
-        .or_else(|| config::get_value("target"))
-        .unwrap_or_else(|| bootstrap_host_compiler.triple.clone());
+    let target_triple =
+        std::env::var("TARGET_TRIPLE").unwrap_or_else(|_| bootstrap_host_compiler.triple.clone());
 
     let dirs = path::Dirs {
         source_dir: current_dir.clone(),
@@ -185,12 +185,11 @@ fn main() {
         frozen,
     };
 
-    path::RelPath::BUILD.ensure_exists(&dirs);
+    std::fs::create_dir_all(&dirs.build_dir).unwrap();
 
     {
         // Make sure we always explicitly specify the target dir
-        let target =
-            path::RelPath::BUILD.join("target_dir_should_be_set_explicitly").to_path(&dirs);
+        let target = dirs.build_dir.join("target_dir_should_be_set_explicitly");
         env::set_var("CARGO_TARGET_DIR", &target);
         let _ = std::fs::remove_file(&target);
         std::fs::File::create(target).unwrap();
@@ -206,10 +205,11 @@ fn main() {
             &dirs,
             &bootstrap_host_compiler,
             use_unstable_features,
+            panic_unwind_support,
         ))
     };
     match command {
-        Command::Prepare => {
+        Command::Prepare | Command::CheckTodo => {
             // Handled above
         }
         Command::Test => {
@@ -217,6 +217,7 @@ fn main() {
                 &dirs,
                 sysroot_kind,
                 use_unstable_features,
+                panic_unwind_support,
                 &skip_tests.iter().map(|test| &**test).collect::<Vec<_>>(),
                 &cg_clif_dylib,
                 &bootstrap_host_compiler,
@@ -235,6 +236,7 @@ fn main() {
                 &cg_clif_dylib,
                 rustup_toolchain_name.as_deref(),
                 &bootstrap_host_compiler,
+                panic_unwind_support,
             );
         }
         Command::Build => {
@@ -245,18 +247,20 @@ fn main() {
                 &bootstrap_host_compiler,
                 rustup_toolchain_name.as_deref(),
                 target_triple,
+                panic_unwind_support,
             );
         }
         Command::Bench => {
-            build_sysroot::build_sysroot(
+            let compiler = build_sysroot::build_sysroot(
                 &dirs,
                 sysroot_kind,
                 &cg_clif_dylib,
                 &bootstrap_host_compiler,
                 rustup_toolchain_name.as_deref(),
                 target_triple,
+                panic_unwind_support,
             );
-            bench::benchmark(&dirs, &bootstrap_host_compiler);
+            bench::benchmark(&dirs, &compiler);
         }
     }
 }

@@ -1,7 +1,7 @@
 use hir::InFile;
 use syntax::ast;
 
-use crate::{adjusted_display_range, Diagnostic, DiagnosticCode, DiagnosticsContext, Severity};
+use crate::{Diagnostic, DiagnosticCode, DiagnosticsContext, Severity, adjusted_display_range};
 
 // Diagnostic: trait-impl-incorrect-safety
 //
@@ -33,6 +33,7 @@ pub(crate) fn trait_impl_incorrect_safety(
             },
         ),
     )
+    .stable()
 }
 
 #[cfg(test)]
@@ -63,6 +64,7 @@ unsafe trait Unsafe {}
     fn drop_may_dangle() {
         check_diagnostics(
             r#"
+#![feature(lang_items)]
 #[lang = "drop"]
 trait Drop {}
 struct S<T>;
@@ -124,6 +126,15 @@ struct S;
   unsafe impl S {}
 //^^^^^^^^^^^ error: unsafe impl for safe trait
 "#,
+        );
+    }
+
+    #[test]
+    fn unsafe_unresolved_trait() {
+        check_diagnostics(
+            r#"
+unsafe impl TestTrait for u32 {}
+        "#,
         );
     }
 }

@@ -1,5 +1,4 @@
 use rustc_abi::ExternAbi;
-use rustc_middle::ty::layout::LayoutOf;
 
 use self::shims::windows::handle::{EvalContextExt as _, Handle, PseudoHandle};
 use crate::*;
@@ -29,7 +28,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         let thread = if this.ptr_is_null(this.read_pointer(thread_op)?)? {
             None
         } else {
-            let thread_info_place = this.deref_pointer(thread_op)?;
+            let thread_info_place = this.deref_pointer_as(thread_op, this.machine.layouts.u32)?;
             Some(thread_info_place)
         };
 
@@ -59,21 +58,18 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         &mut self,
         handle_op: &OpTy<'tcx>,
         timeout_op: &OpTy<'tcx>,
-    ) -> InterpResult<'tcx, Scalar> {
+        return_dest: &MPlaceTy<'tcx>,
+    ) -> InterpResult<'tcx> {
         let this = self.eval_context_mut();
 
-        let handle = this.read_scalar(handle_op)?;
+        let handle = this.read_handle(handle_op, "WaitForSingleObject")?;
         let timeout = this.read_scalar(timeout_op)?.to_u32()?;
 
-        let thread = match Handle::from_scalar(handle, this)? {
-            Some(Handle::Thread(thread)) =>
-                match this.thread_id_try_from(thread) {
-                    Ok(thread) => thread,
-                    Err(_) => this.invalid_handle("WaitForSingleObject")?,
-                },
+        let joined_thread_id = match handle {
+            Handle::Thread(thread) => thread,
             // Unlike on posix, the outcome of joining the current thread is not documented.
             // On current Windows, it just deadlocks.
-            Some(Handle::Pseudo(PseudoHandle::CurrentThread)) => this.active_thread(),
+            Handle::Pseudo(PseudoHandle::CurrentThread) => this.active_thread(),
             _ => this.invalid_handle("WaitForSingleObject")?,
         };
 
@@ -81,8 +77,12 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
             throw_unsup_format!("`WaitForSingleObject` with non-infinite timeout");
         }
 
-        this.join_thread(thread)?;
+        this.join_thread(
+            joined_thread_id,
+            /* success_retval */ this.eval_windows("c", "WAIT_OBJECT_0"),
+            return_dest,
+        )?;
 
-        interp_ok(this.eval_windows("c", "WAIT_OBJECT_0"))
+        interp_ok(())
     }
 }

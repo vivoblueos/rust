@@ -1,17 +1,19 @@
+use either::{Either, for_both};
 use hir::{PathResolution, Semantics};
 use ide_db::{
+    EditionedFileId, RootDatabase,
     defs::Definition,
     search::{FileReference, FileReferenceNode, UsageSearchResult},
-    EditionedFileId, RootDatabase,
 };
 use syntax::{
-    ast::{self, AstNode, AstToken, HasName},
-    SyntaxElement, TextRange,
+    Direction, TextRange,
+    ast::{self, AstNode, AstToken, HasName, syntax_factory::SyntaxFactory},
+    syntax_editor::{Element, SyntaxEditor},
 };
 
 use crate::{
+    AssistId,
     assist_context::{AssistContext, Assists},
-    AssistId, AssistKind,
 };
 
 // Assist: inline_local_variable
@@ -36,28 +38,15 @@ pub(crate) fn inline_local_variable(acc: &mut Assists, ctx: &AssistContext<'_>) 
     let InlineData { let_stmt, delete_let, references, target } =
         if let Some(path_expr) = ctx.find_node_at_offset::<ast::PathExpr>() {
             inline_usage(&ctx.sema, path_expr, range, file_id)
-        } else if let Some(let_stmt) = ctx.find_node_at_offset::<ast::LetStmt>() {
+        } else if let Some(let_stmt) = ctx.find_node_at_offset() {
             inline_let(&ctx.sema, let_stmt, range, file_id)
         } else {
             None
         }?;
-    let initializer_expr = let_stmt.initializer()?;
-
-    let delete_range = delete_let.then(|| {
-        if let Some(whitespace) = let_stmt
-            .syntax()
-            .next_sibling_or_token()
-            .and_then(SyntaxElement::into_token)
-            .and_then(ast::Whitespace::cast)
-        {
-            TextRange::new(
-                let_stmt.syntax().text_range().start(),
-                whitespace.syntax().text_range().end(),
-            )
-        } else {
-            let_stmt.syntax().text_range()
-        }
-    });
+    let initializer_expr = match &let_stmt {
+        either::Either::Left(it) => it.initializer()?,
+        either::Either::Right(it) => it.expr()?,
+    };
 
     let wrap_in_parens = references
         .into_iter()
@@ -73,73 +62,68 @@ pub(crate) fn inline_local_variable(acc: &mut Assists, ctx: &AssistContext<'_>) 
             }
             let usage_node =
                 name_ref.syntax().ancestors().find(|it| ast::PathExpr::can_cast(it.kind()));
-            let usage_parent_option =
-                usage_node.and_then(|it| it.parent()).and_then(ast::Expr::cast);
+            let usage_parent_option = usage_node.as_ref().and_then(|it| it.parent());
             let usage_parent = match usage_parent_option {
                 Some(u) => u,
-                None => return Some((range, name_ref, false)),
+                None => return Some((name_ref, false)),
             };
-            let initializer = matches!(
-                initializer_expr,
-                ast::Expr::CallExpr(_)
-                    | ast::Expr::IndexExpr(_)
-                    | ast::Expr::MethodCallExpr(_)
-                    | ast::Expr::FieldExpr(_)
-                    | ast::Expr::TryExpr(_)
-                    | ast::Expr::Literal(_)
-                    | ast::Expr::TupleExpr(_)
-                    | ast::Expr::ArrayExpr(_)
-                    | ast::Expr::ParenExpr(_)
-                    | ast::Expr::PathExpr(_)
-                    | ast::Expr::BlockExpr(_),
-            );
-            let parent = matches!(
-                usage_parent,
-                ast::Expr::TupleExpr(_)
-                    | ast::Expr::ArrayExpr(_)
-                    | ast::Expr::ParenExpr(_)
-                    | ast::Expr::ForExpr(_)
-                    | ast::Expr::WhileExpr(_)
-                    | ast::Expr::BreakExpr(_)
-                    | ast::Expr::ReturnExpr(_)
-                    | ast::Expr::MatchExpr(_)
-                    | ast::Expr::BlockExpr(_)
-            );
-            Some((range, name_ref, !(initializer || parent)))
+            let should_wrap = initializer_expr
+                .needs_parens_in_place_of(&usage_parent, usage_node.as_ref().unwrap());
+            Some((name_ref, should_wrap))
         })
         .collect::<Option<Vec<_>>>()?;
 
-    let init_str = initializer_expr.syntax().text().to_string();
-    let init_in_paren = format!("({init_str})");
-
     let target = match target {
-        ast::NameOrNameRef::Name(it) => it.syntax().text_range(),
-        ast::NameOrNameRef::NameRef(it) => it.syntax().text_range(),
+        ast::NameOrNameRef::Name(it) => it.syntax().clone(),
+        ast::NameOrNameRef::NameRef(it) => it.syntax().clone(),
     };
 
     acc.add(
-        AssistId("inline_local_variable", AssistKind::RefactorInline),
+        AssistId::refactor_inline("inline_local_variable"),
         "Inline variable",
-        target,
+        target.text_range(),
         move |builder| {
-            if let Some(range) = delete_range {
-                builder.delete(range);
-            }
-            for (range, name, should_wrap) in wrap_in_parens {
-                let replacement = if should_wrap { &init_in_paren } else { &init_str };
-                if ast::RecordExprField::for_field_name(&name).is_some() {
-                    cov_mark::hit!(inline_field_shorthand);
-                    builder.insert(range.end(), format!(": {replacement}"));
+            let mut editor = builder.make_editor(&target);
+            if delete_let {
+                editor.delete(let_stmt.syntax());
+
+                if let Some(bin_expr) = let_stmt.syntax().parent().and_then(ast::BinExpr::cast)
+                    && let Some(op_token) = bin_expr.op_token()
+                {
+                    editor.delete(&op_token);
+                    remove_whitespace(op_token, Direction::Prev, &mut editor);
+                    remove_whitespace(let_stmt.syntax(), Direction::Prev, &mut editor);
                 } else {
-                    builder.replace(range, replacement.clone())
+                    remove_whitespace(let_stmt.syntax(), Direction::Next, &mut editor);
                 }
             }
+
+            let make = SyntaxFactory::with_mappings();
+
+            for (name, should_wrap) in wrap_in_parens {
+                let replacement = if should_wrap {
+                    make.expr_paren(initializer_expr.clone()).into()
+                } else {
+                    initializer_expr.clone()
+                };
+
+                if let Some(record_field) = ast::RecordExprField::for_field_name(&name) {
+                    cov_mark::hit!(inline_field_shorthand);
+                    let replacement = make.record_expr_field(name, Some(replacement));
+                    editor.replace(record_field.syntax(), replacement.syntax());
+                } else {
+                    editor.replace(name.syntax(), replacement.syntax());
+                }
+            }
+
+            editor.add_mappings(make.finish_with_mappings());
+            builder.add_file_edits(ctx.vfs_file_id(), editor);
         },
     )
 }
 
 struct InlineData {
-    let_stmt: ast::LetStmt,
+    let_stmt: Either<ast::LetStmt, ast::LetExpr>,
     delete_let: bool,
     target: ast::NameOrNameRef,
     references: Vec<FileReference>,
@@ -147,11 +131,11 @@ struct InlineData {
 
 fn inline_let(
     sema: &Semantics<'_, RootDatabase>,
-    let_stmt: ast::LetStmt,
+    let_stmt: Either<ast::LetStmt, ast::LetExpr>,
     range: TextRange,
     file_id: EditionedFileId,
 ) -> Option<InlineData> {
-    let bind_pat = match let_stmt.pat()? {
+    let bind_pat = match for_both!(&let_stmt, it => it.pat())? {
         ast::Pat::IdentPat(pat) => pat,
         _ => return None,
     };
@@ -210,7 +194,7 @@ fn inline_usage(
 
     let bind_pat = source.as_ident_pat()?;
 
-    let let_stmt = ast::LetStmt::cast(bind_pat.syntax().parent()?)?;
+    let let_stmt = AstNode::cast(bind_pat.syntax().parent()?)?;
 
     let UsageSearchResult { mut references } = Definition::Local(local).usages(sema).all();
     let mut references = references.remove(&file_id)?;
@@ -218,6 +202,23 @@ fn inline_usage(
     references.retain(|fref| fref.name.as_name_ref() == Some(&name));
 
     Some(InlineData { let_stmt, delete_let, target: ast::NameOrNameRef::NameRef(name), references })
+}
+
+fn remove_whitespace(elem: impl Element, dir: Direction, editor: &mut SyntaxEditor) {
+    let token = match elem.syntax_element() {
+        syntax::NodeOrToken::Node(node) => match dir {
+            Direction::Next => node.last_token(),
+            Direction::Prev => node.first_token(),
+        },
+        syntax::NodeOrToken::Token(t) => Some(t),
+    };
+    let next_token = match dir {
+        Direction::Next => token.and_then(|it| it.next_token()),
+        Direction::Prev => token.and_then(|it| it.prev_token()),
+    };
+    if let Some(whitespace) = next_token.and_then(ast::Whitespace::cast) {
+        editor.delete(whitespace.syntax());
+    }
 }
 
 #[cfg(test)]
@@ -281,11 +282,11 @@ fn foo() {
             r"
 fn bar(a: usize) {}
 fn foo() {
-    (1 + 1) + 1;
-    if (1 + 1) > 10 {
+    1 + 1 + 1;
+    if 1 + 1 > 10 {
     }
 
-    while (1 + 1) > 10 {
+    while 1 + 1 > 10 {
 
     }
     let b = (1 + 1) * 10;
@@ -350,14 +351,14 @@ fn foo() {
             r"
 fn bar(a: usize) -> usize { a }
 fn foo() {
-    (bar(1) as u64) + 1;
-    if (bar(1) as u64) > 10 {
+    bar(1) as u64 + 1;
+    if bar(1) as u64 > 10 {
     }
 
-    while (bar(1) as u64) > 10 {
+    while bar(1) as u64 > 10 {
 
     }
-    let b = (bar(1) as u64) * 10;
+    let b = bar(1) as u64 * 10;
     bar(bar(1) as u64);
 }",
         );
@@ -423,6 +424,38 @@ fn foo() {
     }
     let b = ( 10 + 1 ) * 10;
     bar(( 10 + 1 ));
+}",
+        );
+    }
+
+    #[test]
+    fn test_inline_let_expr() {
+        check_assist(
+            inline_local_variable,
+            r"
+fn bar(a: usize) {}
+fn foo() {
+    if let a$0 = 1
+        && true
+    {
+        a + 1;
+        if a > 10 {}
+        while a > 10 {}
+        let b = a * 10;
+        bar(a);
+    }
+}",
+            r"
+fn bar(a: usize) {}
+fn foo() {
+    if true
+    {
+        1 + 1;
+        if 1 > 10 {}
+        while 1 > 10 {}
+        let b = 1 * 10;
+        bar(1);
+    }
 }",
         );
     }
@@ -574,7 +607,7 @@ fn foo() {
             r"
 fn foo() {
     let bar = 10;
-    let b = (&bar) * 10;
+    let b = &bar * 10;
 }",
         );
     }
@@ -840,6 +873,70 @@ fn f() {
     }
 
     #[test]
+    fn let_expr_works_on_local_usage() {
+        check_assist(
+            inline_local_variable,
+            r#"
+fn f() {
+    if let xyz = 0
+        && true
+    {
+        xyz$0;
+    }
+}
+"#,
+            r#"
+fn f() {
+    if true
+    {
+        0;
+    }
+}
+"#,
+        );
+
+        check_assist(
+            inline_local_variable,
+            r#"
+fn f() {
+    if let xyz = true
+        && xyz$0
+    {
+    }
+}
+"#,
+            r#"
+fn f() {
+    if true
+    {
+    }
+}
+"#,
+        );
+
+        check_assist(
+            inline_local_variable,
+            r#"
+fn f() {
+    if true
+        && let xyz = 0
+    {
+        xyz$0;
+    }
+}
+"#,
+            r#"
+fn f() {
+    if true
+    {
+        0;
+    }
+}
+"#,
+        );
+    }
+
+    #[test]
     fn does_not_remove_let_when_multiple_usages() {
         check_assist(
             inline_local_variable,
@@ -965,6 +1062,54 @@ fn main() {
             r#"
 fn main() {
     let _ = (|| 2)();
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn test_wrap_in_parens() {
+        check_assist(
+            inline_local_variable,
+            r#"
+fn main() {
+    let $0a = 123 < 456;
+    let b = !a;
+}
+"#,
+            r#"
+fn main() {
+    let b = !(123 < 456);
+}
+"#,
+        );
+        check_assist(
+            inline_local_variable,
+            r#"
+trait Foo {
+    fn foo(&self);
+}
+
+impl Foo for bool {
+    fn foo(&self) {}
+}
+
+fn main() {
+    let $0a = 123 < 456;
+    let b = a.foo();
+}
+"#,
+            r#"
+trait Foo {
+    fn foo(&self);
+}
+
+impl Foo for bool {
+    fn foo(&self) {}
+}
+
+fn main() {
+    let b = (123 < 456).foo();
 }
 "#,
         );

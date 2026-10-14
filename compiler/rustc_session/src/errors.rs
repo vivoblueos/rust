@@ -1,4 +1,4 @@
-use std::num::NonZero;
+use std::num::{NonZero, ParseIntError};
 
 use rustc_ast::token;
 use rustc_ast::util::literal::LitError;
@@ -11,8 +11,17 @@ use rustc_macros::{Diagnostic, Subdiagnostic};
 use rustc_span::{Span, Symbol};
 use rustc_target::spec::{SplitDebuginfo, StackProtector, TargetTuple};
 
-use crate::config::CrateType;
 use crate::parse::ParseSess;
+
+#[derive(Diagnostic)]
+pub(crate) enum AppleDeploymentTarget {
+    #[diag("failed to parse deployment target specified in {$env_var}: {$error}")]
+    Invalid { env_var: &'static str, error: ParseIntError },
+    #[diag(
+        "deployment target in {$env_var} was set to {$version}, but the minimum supported by `rustc` is {$os_min}"
+    )]
+    TooLow { env_var: &'static str, version: String, os_min: String },
+}
 
 pub(crate) struct FeatureGateError {
     pub(crate) span: MultiSpan,
@@ -27,13 +36,13 @@ impl<'a, G: EmissionGuarantee> Diagnostic<'a, G> for FeatureGateError {
 }
 
 #[derive(Subdiagnostic)]
-#[note(session_feature_diagnostic_for_issue)]
+#[note("see issue #{$n} <https://github.com/rust-lang/rust/issues/{$n}> for more information")]
 pub(crate) struct FeatureDiagnosticForIssue {
     pub(crate) n: NonZero<u32>,
 }
 
 #[derive(Subdiagnostic)]
-#[note(session_feature_suggest_upgrade_compiler)]
+#[note("this compiler was built on {$date}; consider upgrading it if it is out of date")]
 pub(crate) struct SuggestUpgradeCompiler {
     date: &'static str,
 }
@@ -51,14 +60,14 @@ impl SuggestUpgradeCompiler {
 }
 
 #[derive(Subdiagnostic)]
-#[help(session_feature_diagnostic_help)]
+#[help("add `#![feature({$feature})]` to the crate attributes to enable")]
 pub(crate) struct FeatureDiagnosticHelp {
     pub(crate) feature: Symbol,
 }
 
 #[derive(Subdiagnostic)]
 #[suggestion(
-    session_feature_diagnostic_suggestion,
+    "add `#![feature({$feature})]` to the crate attributes to enable",
     applicability = "maybe-incorrect",
     code = "#![feature({feature})]\n"
 )]
@@ -69,189 +78,193 @@ pub struct FeatureDiagnosticSuggestion {
 }
 
 #[derive(Subdiagnostic)]
-#[help(session_cli_feature_diagnostic_help)]
+#[help("add `-Zcrate-attr=\"feature({$feature})\"` to the command-line options to enable")]
 pub(crate) struct CliFeatureDiagnosticHelp {
     pub(crate) feature: Symbol,
 }
 
 #[derive(Diagnostic)]
-#[diag(session_not_circumvent_feature)]
+#[diag("must be a name of an associated function")]
+pub struct MustBeNameOfAssociatedFunction {
+    #[primary_span]
+    pub span: Span,
+}
+
+#[derive(Diagnostic)]
+#[diag(
+    "`-Zunleash-the-miri-inside-of-you` may not be used to circumvent feature gates, except when testing error paths in the CTFE engine"
+)]
 pub(crate) struct NotCircumventFeature;
 
 #[derive(Diagnostic)]
-#[diag(session_linker_plugin_lto_windows_not_supported)]
+#[diag(
+    "linker plugin based LTO is not supported together with `-C prefer-dynamic` when targeting Windows-like targets"
+)]
 pub(crate) struct LinkerPluginToWindowsNotSupported;
 
 #[derive(Diagnostic)]
-#[diag(session_profile_use_file_does_not_exist)]
+#[diag("file `{$path}` passed to `-C profile-use` does not exist")]
 pub(crate) struct ProfileUseFileDoesNotExist<'a> {
     pub(crate) path: &'a std::path::Path,
 }
 
 #[derive(Diagnostic)]
-#[diag(session_profile_sample_use_file_does_not_exist)]
+#[diag("file `{$path}` passed to `-C profile-sample-use` does not exist")]
 pub(crate) struct ProfileSampleUseFileDoesNotExist<'a> {
     pub(crate) path: &'a std::path::Path,
 }
 
 #[derive(Diagnostic)]
-#[diag(session_target_requires_unwind_tables)]
+#[diag("target requires unwind tables, they cannot be disabled with `-C force-unwind-tables=no`")]
 pub(crate) struct TargetRequiresUnwindTables;
 
 #[derive(Diagnostic)]
-#[diag(session_instrumentation_not_supported)]
+#[diag("{$us} instrumentation is not supported for this target")]
 pub(crate) struct InstrumentationNotSupported {
     pub(crate) us: String,
 }
 
 #[derive(Diagnostic)]
-#[diag(session_sanitizer_not_supported)]
+#[diag("{$us} sanitizer is not supported for this target")]
 pub(crate) struct SanitizerNotSupported {
     pub(crate) us: String,
 }
 
 #[derive(Diagnostic)]
-#[diag(session_sanitizers_not_supported)]
+#[diag("{$us} sanitizers are not supported for this target")]
 pub(crate) struct SanitizersNotSupported {
     pub(crate) us: String,
 }
 
 #[derive(Diagnostic)]
-#[diag(session_cannot_mix_and_match_sanitizers)]
+#[diag("`-Zsanitizer={$first}` is incompatible with `-Zsanitizer={$second}`")]
 pub(crate) struct CannotMixAndMatchSanitizers {
     pub(crate) first: String,
     pub(crate) second: String,
 }
 
 #[derive(Diagnostic)]
-#[diag(session_cannot_enable_crt_static_linux)]
+#[diag(
+    "sanitizer is incompatible with statically linked libc, disable it using `-C target-feature=-crt-static`"
+)]
 pub(crate) struct CannotEnableCrtStaticLinux;
 
 #[derive(Diagnostic)]
-#[diag(session_sanitizer_cfi_requires_lto)]
+#[diag("`-Zsanitizer=cfi` requires `-Clto` or `-Clinker-plugin-lto`")]
 pub(crate) struct SanitizerCfiRequiresLto;
 
 #[derive(Diagnostic)]
-#[diag(session_sanitizer_cfi_requires_single_codegen_unit)]
+#[diag("`-Zsanitizer=cfi` with `-Clto` requires `-Ccodegen-units=1`")]
 pub(crate) struct SanitizerCfiRequiresSingleCodegenUnit;
 
 #[derive(Diagnostic)]
-#[diag(session_sanitizer_cfi_canonical_jump_tables_requires_cfi)]
+#[diag("`-Zsanitizer-cfi-canonical-jump-tables` requires `-Zsanitizer=cfi`")]
 pub(crate) struct SanitizerCfiCanonicalJumpTablesRequiresCfi;
 
 #[derive(Diagnostic)]
-#[diag(session_sanitizer_cfi_generalize_pointers_requires_cfi)]
+#[diag("`-Zsanitizer-cfi-generalize-pointers` requires `-Zsanitizer=cfi` or `-Zsanitizer=kcfi`")]
 pub(crate) struct SanitizerCfiGeneralizePointersRequiresCfi;
 
 #[derive(Diagnostic)]
-#[diag(session_sanitizer_cfi_normalize_integers_requires_cfi)]
+#[diag("`-Zsanitizer-cfi-normalize-integers` requires `-Zsanitizer=cfi` or `-Zsanitizer=kcfi`")]
 pub(crate) struct SanitizerCfiNormalizeIntegersRequiresCfi;
 
 #[derive(Diagnostic)]
-#[diag(session_sanitizer_kcfi_requires_panic_abort)]
+#[diag("`-Zsanitizer-kcfi-arity` requires `-Zsanitizer=kcfi`")]
+pub(crate) struct SanitizerKcfiArityRequiresKcfi;
+
+#[derive(Diagnostic)]
+#[diag("`-Z sanitizer=kcfi` requires `-C panic=abort`")]
 pub(crate) struct SanitizerKcfiRequiresPanicAbort;
 
 #[derive(Diagnostic)]
-#[diag(session_split_lto_unit_requires_lto)]
+#[diag("`-Zsplit-lto-unit` requires `-Clto`, `-Clto=thin`, or `-Clinker-plugin-lto`")]
 pub(crate) struct SplitLtoUnitRequiresLto;
 
 #[derive(Diagnostic)]
-#[diag(session_unstable_virtual_function_elimination)]
+#[diag("`-Zvirtual-function-elimination` requires `-Clto`")]
 pub(crate) struct UnstableVirtualFunctionElimination;
 
 #[derive(Diagnostic)]
-#[diag(session_unsupported_dwarf_version)]
+#[diag("requested DWARF version {$dwarf_version} is not supported")]
+#[help("supported DWARF versions are 2, 3, 4 and 5")]
 pub(crate) struct UnsupportedDwarfVersion {
     pub(crate) dwarf_version: u32,
 }
 
 #[derive(Diagnostic)]
-#[diag(session_embed_source_insufficient_dwarf_version)]
+#[diag(
+    "`-Zembed-source=y` requires at least `-Z dwarf-version=5` but DWARF version is {$dwarf_version}"
+)]
 pub(crate) struct EmbedSourceInsufficientDwarfVersion {
     pub(crate) dwarf_version: u32,
 }
 
 #[derive(Diagnostic)]
-#[diag(session_embed_source_requires_debug_info)]
+#[diag("`-Zembed-source=y` requires debug information to be enabled")]
 pub(crate) struct EmbedSourceRequiresDebugInfo;
 
 #[derive(Diagnostic)]
-#[diag(session_target_stack_protector_not_supported)]
+#[diag(
+    "`-Z stack-protector={$stack_protector}` is not supported for target {$target_triple} and will be ignored"
+)]
 pub(crate) struct StackProtectorNotSupportedForTarget<'a> {
     pub(crate) stack_protector: StackProtector,
     pub(crate) target_triple: &'a TargetTuple,
 }
 
 #[derive(Diagnostic)]
-#[diag(session_target_small_data_threshold_not_supported)]
+#[diag(
+    "`-Z small-data-threshold` is not supported for target {$target_triple} and will be ignored"
+)]
 pub(crate) struct SmallDataThresholdNotSupportedForTarget<'a> {
     pub(crate) target_triple: &'a TargetTuple,
 }
 
 #[derive(Diagnostic)]
-#[diag(session_branch_protection_requires_aarch64)]
+#[diag("`-Zbranch-protection` is only supported on aarch64")]
 pub(crate) struct BranchProtectionRequiresAArch64;
 
 #[derive(Diagnostic)]
-#[diag(session_split_debuginfo_unstable_platform)]
+#[diag("`-Csplit-debuginfo={$debuginfo}` is unstable on this platform")]
 pub(crate) struct SplitDebugInfoUnstablePlatform {
     pub(crate) debuginfo: SplitDebuginfo,
 }
 
 #[derive(Diagnostic)]
-#[diag(session_file_is_not_writeable)]
+#[diag("output file {$file} is not writeable -- check its permissions")]
 pub(crate) struct FileIsNotWriteable<'a> {
     pub(crate) file: &'a std::path::Path,
 }
 
 #[derive(Diagnostic)]
-#[diag(session_file_write_fail)]
+#[diag("failed to write `{$path}` due to error `{$err}`")]
 pub(crate) struct FileWriteFail<'a> {
     pub(crate) path: &'a std::path::Path,
     pub(crate) err: String,
 }
 
 #[derive(Diagnostic)]
-#[diag(session_crate_name_does_not_match)]
-pub(crate) struct CrateNameDoesNotMatch {
-    #[primary_span]
-    pub(crate) span: Span,
-    pub(crate) s: Symbol,
-    pub(crate) name: Symbol,
-}
-
-#[derive(Diagnostic)]
-#[diag(session_crate_name_invalid)]
-pub(crate) struct CrateNameInvalid<'a> {
-    pub(crate) s: &'a str,
-}
-
-#[derive(Diagnostic)]
-#[diag(session_crate_name_empty)]
+#[diag("crate name must not be empty")]
 pub(crate) struct CrateNameEmpty {
     #[primary_span]
     pub(crate) span: Option<Span>,
 }
 
 #[derive(Diagnostic)]
-#[diag(session_invalid_character_in_create_name)]
+#[diag("invalid character {$character} in crate name: `{$crate_name}`")]
 pub(crate) struct InvalidCharacterInCrateName {
     #[primary_span]
     pub(crate) span: Option<Span>,
     pub(crate) character: char,
     pub(crate) crate_name: Symbol,
-    #[subdiagnostic]
-    pub(crate) crate_name_help: Option<InvalidCrateNameHelp>,
 }
 
 #[derive(Subdiagnostic)]
-pub(crate) enum InvalidCrateNameHelp {
-    #[help(session_invalid_character_in_create_name_help)]
-    AddCrateName,
-}
-
-#[derive(Subdiagnostic)]
-#[multipart_suggestion(session_expr_parentheses_needed, applicability = "machine-applicable")]
+#[multipart_suggestion(
+    "parentheses are required to parse this as an expression",
+    applicability = "machine-applicable"
+)]
 pub struct ExprParenthesesNeeded {
     #[suggestion_part(code = "(")]
     left: Span,
@@ -266,7 +279,7 @@ impl ExprParenthesesNeeded {
 }
 
 #[derive(Diagnostic)]
-#[diag(session_skipping_const_checks)]
+#[diag("skipping const checks")]
 pub(crate) struct SkippingConstChecks {
     #[subdiagnostic]
     pub(crate) unleashed_features: Vec<UnleashedFeatureHelp>,
@@ -274,13 +287,13 @@ pub(crate) struct SkippingConstChecks {
 
 #[derive(Subdiagnostic)]
 pub(crate) enum UnleashedFeatureHelp {
-    #[help(session_unleashed_feature_help_named)]
+    #[help("skipping check for `{$gate}` feature")]
     Named {
         #[primary_span]
         span: Span,
         gate: Symbol,
     },
-    #[help(session_unleashed_feature_help_unnamed)]
+    #[help("skipping check that does not even have a feature gate")]
     Unnamed {
         #[primary_span]
         span: Span,
@@ -288,10 +301,10 @@ pub(crate) enum UnleashedFeatureHelp {
 }
 
 #[derive(Diagnostic)]
-#[diag(session_invalid_literal_suffix)]
+#[diag("suffixes on {$kind} literals are invalid")]
 struct InvalidLiteralSuffix<'a> {
     #[primary_span]
-    #[label]
+    #[label("invalid suffix `{$suffix}`")]
     span: Span,
     // FIXME(#100717)
     kind: &'a str,
@@ -299,8 +312,8 @@ struct InvalidLiteralSuffix<'a> {
 }
 
 #[derive(Diagnostic)]
-#[diag(session_invalid_int_literal_width)]
-#[help]
+#[diag("invalid width `{$width}` for integer literal")]
+#[help("valid widths are 8, 16, 32, 64 and 128")]
 struct InvalidIntLiteralWidth {
     #[primary_span]
     span: Span,
@@ -308,28 +321,32 @@ struct InvalidIntLiteralWidth {
 }
 
 #[derive(Diagnostic)]
-#[diag(session_invalid_num_literal_base_prefix)]
-#[note]
+#[diag("invalid base prefix for number literal")]
+#[note("base prefixes (`0xff`, `0b1010`, `0o755`) are lowercase")]
 struct InvalidNumLiteralBasePrefix {
     #[primary_span]
-    #[suggestion(applicability = "maybe-incorrect", code = "{fixed}")]
+    #[suggestion(
+        "try making the prefix lowercase",
+        applicability = "maybe-incorrect",
+        code = "{fixed}"
+    )]
     span: Span,
     fixed: String,
 }
 
 #[derive(Diagnostic)]
-#[diag(session_invalid_num_literal_suffix)]
-#[help]
+#[diag("invalid suffix `{$suffix}` for number literal")]
+#[help("the suffix must be one of the numeric types (`u32`, `isize`, `f32`, etc.)")]
 struct InvalidNumLiteralSuffix {
     #[primary_span]
-    #[label]
+    #[label("invalid suffix `{$suffix}`")]
     span: Span,
     suffix: String,
 }
 
 #[derive(Diagnostic)]
-#[diag(session_invalid_float_literal_width)]
-#[help]
+#[diag("invalid width `{$width}` for float literal")]
+#[help("valid widths are 32 and 64")]
 struct InvalidFloatLiteralWidth {
     #[primary_span]
     span: Span,
@@ -337,18 +354,18 @@ struct InvalidFloatLiteralWidth {
 }
 
 #[derive(Diagnostic)]
-#[diag(session_invalid_float_literal_suffix)]
-#[help]
+#[diag("invalid suffix `{$suffix}` for float literal")]
+#[help("valid suffixes are `f32` and `f64`")]
 struct InvalidFloatLiteralSuffix {
     #[primary_span]
-    #[label]
+    #[label("invalid suffix `{$suffix}`")]
     span: Span,
     suffix: String,
 }
 
 #[derive(Diagnostic)]
-#[diag(session_int_literal_too_large)]
-#[note]
+#[diag("integer literal is too large")]
+#[note("value exceeds limit of `{$limit}`")]
 struct IntLiteralTooLarge {
     #[primary_span]
     span: Span,
@@ -356,34 +373,27 @@ struct IntLiteralTooLarge {
 }
 
 #[derive(Diagnostic)]
-#[diag(session_hexadecimal_float_literal_not_supported)]
+#[diag("hexadecimal float literal is not supported")]
 struct HexadecimalFloatLiteralNotSupported {
     #[primary_span]
-    #[label(session_not_supported)]
+    #[label("not supported")]
     span: Span,
 }
 
 #[derive(Diagnostic)]
-#[diag(session_octal_float_literal_not_supported)]
+#[diag("octal float literal is not supported")]
 struct OctalFloatLiteralNotSupported {
     #[primary_span]
-    #[label(session_not_supported)]
+    #[label("not supported")]
     span: Span,
 }
 
 #[derive(Diagnostic)]
-#[diag(session_binary_float_literal_not_supported)]
+#[diag("binary float literal is not supported")]
 struct BinaryFloatLiteralNotSupported {
     #[primary_span]
-    #[label(session_not_supported)]
+    #[label("not supported")]
     span: Span,
-}
-
-#[derive(Diagnostic)]
-#[diag(session_unsupported_crate_type_for_target)]
-pub(crate) struct UnsupportedCrateTypeForTarget<'a> {
-    pub(crate) crate_type: CrateType,
-    pub(crate) target_triple: &'a TargetTuple,
 }
 
 pub fn report_lit_error(
@@ -392,6 +402,10 @@ pub fn report_lit_error(
     lit: token::Lit,
     span: Span,
 ) -> ErrorGuaranteed {
+    create_lit_error(psess, err, lit, span).emit()
+}
+
+pub fn create_lit_error(psess: &ParseSess, err: LitError, lit: token::Lit, span: Span) -> Diag<'_> {
     // Checks if `s` looks like i32 or u1234 etc.
     fn looks_like_width_suffix(first_chars: &[char], s: &str) -> bool {
         s.len() > 1 && s.starts_with(first_chars) && s[1..].chars().all(|c| c.is_ascii_digit())
@@ -422,32 +436,32 @@ pub fn report_lit_error(
     let dcx = psess.dcx();
     match err {
         LitError::InvalidSuffix(suffix) => {
-            dcx.emit_err(InvalidLiteralSuffix { span, kind: lit.kind.descr(), suffix })
+            dcx.create_err(InvalidLiteralSuffix { span, kind: lit.kind.descr(), suffix })
         }
         LitError::InvalidIntSuffix(suffix) => {
             let suf = suffix.as_str();
             if looks_like_width_suffix(&['i', 'u'], suf) {
                 // If it looks like a width, try to be helpful.
-                dcx.emit_err(InvalidIntLiteralWidth { span, width: suf[1..].into() })
+                dcx.create_err(InvalidIntLiteralWidth { span, width: suf[1..].into() })
             } else if let Some(fixed) = fix_base_capitalisation(lit.symbol.as_str(), suf) {
-                dcx.emit_err(InvalidNumLiteralBasePrefix { span, fixed })
+                dcx.create_err(InvalidNumLiteralBasePrefix { span, fixed })
             } else {
-                dcx.emit_err(InvalidNumLiteralSuffix { span, suffix: suf.to_string() })
+                dcx.create_err(InvalidNumLiteralSuffix { span, suffix: suf.to_string() })
             }
         }
         LitError::InvalidFloatSuffix(suffix) => {
             let suf = suffix.as_str();
             if looks_like_width_suffix(&['f'], suf) {
                 // If it looks like a width, try to be helpful.
-                dcx.emit_err(InvalidFloatLiteralWidth { span, width: suf[1..].to_string() })
+                dcx.create_err(InvalidFloatLiteralWidth { span, width: suf[1..].to_string() })
             } else {
-                dcx.emit_err(InvalidFloatLiteralSuffix { span, suffix: suf.to_string() })
+                dcx.create_err(InvalidFloatLiteralSuffix { span, suffix: suf.to_string() })
             }
         }
         LitError::NonDecimalFloat(base) => match base {
-            16 => dcx.emit_err(HexadecimalFloatLiteralNotSupported { span }),
-            8 => dcx.emit_err(OctalFloatLiteralNotSupported { span }),
-            2 => dcx.emit_err(BinaryFloatLiteralNotSupported { span }),
+            16 => dcx.create_err(HexadecimalFloatLiteralNotSupported { span }),
+            8 => dcx.create_err(OctalFloatLiteralNotSupported { span }),
+            2 => dcx.create_err(BinaryFloatLiteralNotSupported { span }),
             _ => unreachable!(),
         },
         LitError::IntTooLarge(base) => {
@@ -458,56 +472,65 @@ pub fn report_lit_error(
                 16 => format!("{max:#x}"),
                 _ => format!("{max}"),
             };
-            dcx.emit_err(IntLiteralTooLarge { span, limit })
+            dcx.create_err(IntLiteralTooLarge { span, limit })
         }
     }
 }
 
 #[derive(Diagnostic)]
-#[diag(session_optimization_fuel_exhausted)]
-pub(crate) struct OptimisationFuelExhausted {
-    pub(crate) msg: String,
-}
-
-#[derive(Diagnostic)]
-#[diag(session_incompatible_linker_flavor)]
-#[note]
+#[diag("linker flavor `{$flavor}` is incompatible with the current target")]
+#[note("compatible flavors are: {$compatible_list}")]
 pub(crate) struct IncompatibleLinkerFlavor {
     pub(crate) flavor: &'static str,
     pub(crate) compatible_list: String,
 }
 
 #[derive(Diagnostic)]
-#[diag(session_function_return_requires_x86_or_x86_64)]
+#[diag("`-Zfunction-return` (except `keep`) is only supported on x86 and x86_64")]
 pub(crate) struct FunctionReturnRequiresX86OrX8664;
 
 #[derive(Diagnostic)]
-#[diag(session_function_return_thunk_extern_requires_non_large_code_model)]
+#[diag("`-Zfunction-return=thunk-extern` is only supported on non-large code models")]
 pub(crate) struct FunctionReturnThunkExternRequiresNonLargeCodeModel;
 
 #[derive(Diagnostic)]
-#[diag(session_unsupported_regparm)]
+#[diag("`-Zindirect-branch-cs-prefix` is only supported on x86 and x86_64")]
+pub(crate) struct IndirectBranchCsPrefixRequiresX86OrX8664;
+
+#[derive(Diagnostic)]
+#[diag("`-Zregparm={$regparm}` is unsupported (valid values 0-3)")]
 pub(crate) struct UnsupportedRegparm {
     pub(crate) regparm: u32,
 }
 
 #[derive(Diagnostic)]
-#[diag(session_unsupported_regparm_arch)]
+#[diag("`-Zregparm=N` is only supported on x86")]
 pub(crate) struct UnsupportedRegparmArch;
 
 #[derive(Diagnostic)]
-#[diag(session_failed_to_create_profiler)]
+#[diag("`-Zreg-struct-return` is only supported on x86")]
+pub(crate) struct UnsupportedRegStructReturnArch;
+
+#[derive(Diagnostic)]
+#[diag("failed to create profiler: {$err}")]
 pub(crate) struct FailedToCreateProfiler {
     pub(crate) err: String,
 }
 
 #[derive(Diagnostic)]
-#[diag(session_soft_float_ignored)]
-#[note]
-pub(crate) struct SoftFloatIgnored;
+#[diag("unexpected `--cfg {$cfg}` flag")]
+#[note("config `{$cfg_name}` is only supposed to be controlled by `{$controlled_by}`")]
+#[note("manually setting a built-in cfg can and does create incoherent behaviors")]
+pub(crate) struct UnexpectedBuiltinCfg {
+    pub(crate) cfg: String,
+    pub(crate) cfg_name: Symbol,
+    pub(crate) controlled_by: &'static str,
+}
 
 #[derive(Diagnostic)]
-#[diag(session_soft_float_deprecated)]
-#[note]
-#[note(session_soft_float_deprecated_issue)]
-pub(crate) struct SoftFloatDeprecated;
+#[diag("ThinLTO is not supported by the codegen backend, using fat LTO instead")]
+pub(crate) struct ThinLtoNotSupportedByBackend;
+
+#[derive(Diagnostic)]
+#[diag("`-Zpacked-stack` is only supported on s390x")]
+pub(crate) struct UnsupportedPackedStack;

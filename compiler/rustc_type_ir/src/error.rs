@@ -1,29 +1,25 @@
 use derive_where::derive_where;
-use rustc_type_ir_macros::{TypeFoldable_Generic, TypeVisitable_Generic};
+use rustc_type_ir_macros::{GenericTypeVisitable, TypeFoldable_Generic, TypeVisitable_Generic};
 
 use crate::solve::NoSolution;
 use crate::{self as ty, Interner};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[derive(TypeFoldable_Generic, TypeVisitable_Generic)]
+#[derive(TypeFoldable_Generic, TypeVisitable_Generic, GenericTypeVisitable)]
 pub struct ExpectedFound<T> {
     pub expected: T,
     pub found: T,
 }
 
 impl<T> ExpectedFound<T> {
-    pub fn new(a_is_expected: bool, a: T, b: T) -> Self {
-        if a_is_expected {
-            ExpectedFound { expected: a, found: b }
-        } else {
-            ExpectedFound { expected: b, found: a }
-        }
+    pub fn new(expected: T, found: T) -> Self {
+        ExpectedFound { expected, found }
     }
 }
 
 // Data structures used in type unification
-#[derive_where(Clone, Copy, PartialEq, Eq, Debug; I: Interner)]
-#[derive(TypeVisitable_Generic)]
+#[derive_where(Clone, Copy, PartialEq, Debug; I: Interner)]
+#[derive(TypeVisitable_Generic, GenericTypeVisitable)]
 #[cfg_attr(feature = "nightly", rustc_pass_by_value)]
 pub enum TypeError<I: Interner> {
     Mismatch,
@@ -33,16 +29,16 @@ pub enum TypeError<I: Interner> {
     Mutability,
     ArgumentMutability(usize),
     TupleSize(ExpectedFound<usize>),
-    FixedArraySize(ExpectedFound<u64>),
+    ArraySize(ExpectedFound<I::Const>),
     ArgCount,
 
     RegionsDoesNotOutlive(I::Region, I::Region),
-    RegionsInsufficientlyPolymorphic(I::BoundRegion, I::Region),
+    RegionsInsufficientlyPolymorphic(ty::BoundRegion<I>, I::Region),
     RegionsPlaceholderMismatch,
 
     Sorts(ExpectedFound<I::Ty>),
     ArgumentSorts(ExpectedFound<I::Ty>, usize),
-    Traits(ExpectedFound<I::DefId>),
+    Traits(ExpectedFound<I::TraitId>),
     VariadicMismatch(ExpectedFound<bool>),
 
     /// Instantiating a type variable with the given type would have
@@ -55,9 +51,14 @@ pub enum TypeError<I: Interner> {
     ConstMismatch(ExpectedFound<I::Const>),
 
     IntrinsicCast,
+    /// `#[rustc_force_inline]` functions must be inlined and must not be codegened independently,
+    /// so casting to a function pointer must be prohibited.
+    ForceInlineCast,
     /// Safe `#[target_feature]` functions are not assignable to safe function pointers.
     TargetFeatureCast(I::DefId),
 }
+
+impl<I: Interner> Eq for TypeError<I> {}
 
 impl<I: Interner> TypeError<I> {
     pub fn involves_regions(self) -> bool {
@@ -73,7 +74,7 @@ impl<I: Interner> TypeError<I> {
         use self::TypeError::*;
         match self {
             CyclicTy(_) | CyclicConst(_) | SafetyMismatch(_) | PolarityMismatch(_) | Mismatch
-            | AbiMismatch(_) | FixedArraySize(_) | ArgumentSorts(..) | Sorts(_)
+            | AbiMismatch(_) | ArraySize(_) | ArgumentSorts(..) | Sorts(_)
             | VariadicMismatch(_) | TargetFeatureCast(_) => false,
 
             Mutability
@@ -87,6 +88,7 @@ impl<I: Interner> TypeError<I> {
             | ProjectionMismatched(_)
             | ExistentialMismatch(_)
             | ConstMismatch(_)
+            | ForceInlineCast
             | IntrinsicCast => true,
         }
     }

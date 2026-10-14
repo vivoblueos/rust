@@ -124,8 +124,6 @@ pub const INERT_ATTRIBUTES: &[BuiltinAttribute] = &[
         should_panic, Normal,
         template!(Word, List: r#"expected = "reason""#, NameValueStr: "reason"), FutureWarnFollowing,
     ),
-    // FIXME(Centril): This can be used on stable but shouldn't.
-    ungated!(reexport_test_harness_main, CrateLevel, template!(NameValueStr: "name"), ErrorFollowing),
 
     // Macros:
     ungated!(automatically_derived, Normal, template!(Word), WarnFollowing),
@@ -264,6 +262,13 @@ pub const INERT_ATTRIBUTES: &[BuiltinAttribute] = &[
         test_runner, CrateLevel, template!(List: "path"), ErrorFollowing, custom_test_frameworks,
         "custom test frameworks are an unstable feature",
     ),
+
+    gated!(
+        reexport_test_harness_main, CrateLevel, template!(NameValueStr: "name"),
+        ErrorFollowing, custom_test_frameworks,
+        "custom test frameworks are an unstable feature",
+    ),
+
     // RFC #1268
     gated!(
         marker, Normal, template!(Word), WarnFollowing, @only_local: true,
@@ -429,7 +434,7 @@ pub const INERT_ATTRIBUTES: &[BuiltinAttribute] = &[
     rustc_attr!(rustc_proc_macro_decls, Normal, template!(Word), WarnFollowing, INTERNAL_UNSTABLE),
     rustc_attr!(
         rustc_macro_transparency, Normal,
-        template!(NameValueStr: "transparent|semitransparent|opaque"), ErrorFollowing,
+        template!(NameValueStr: "transparent|semiopaque|opaque"), ErrorFollowing,
         "used internally for testing macro hygiene",
     ),
 
@@ -467,9 +472,6 @@ pub const INERT_ATTRIBUTES: &[BuiltinAttribute] = &[
     // Used by the `rustc::untracked_query_information` lint to warn methods which
     // might break incremental compilation.
     rustc_attr!(rustc_lint_untracked_query_information, Normal, template!(Word), WarnFollowing, INTERNAL_UNSTABLE),
-    // Used by the `rustc::untranslatable_diagnostic` and `rustc::diagnostic_outside_of_impl` lints
-    // to assist in changes to diagnostic APIs.
-    rustc_attr!(rustc_lint_diagnostics, Normal, template!(Word), WarnFollowing, INTERNAL_UNSTABLE),
     // Used by the `rustc::bad_opt_access` lint to identify `DebuggingOptions` and `CodegenOptions`
     // types (as well as any others in future).
     rustc_attr!(rustc_lint_opt_ty, Normal, template!(Word), WarnFollowing, INTERNAL_UNSTABLE),
@@ -486,7 +488,7 @@ pub const INERT_ATTRIBUTES: &[BuiltinAttribute] = &[
         rustc_legacy_const_generics, Normal, template!(List: "N"), ErrorFollowing,
         INTERNAL_UNSTABLE
     ),
-    // Do not const-check this function's body. It will always get replaced during CTFE.
+    // Do not const-check this function's body. It will always get replaced during CTFE via `hook_special_const_fn`.
     rustc_attr!(
         rustc_do_not_const_check, Normal, template!(Word), WarnFollowing, INTERNAL_UNSTABLE
     ),
@@ -562,7 +564,7 @@ pub const INERT_ATTRIBUTES: &[BuiltinAttribute] = &[
     ),
 
     BuiltinAttribute {
-        // name: sym::rustc_diagnostic_item.clone(),
+        // name: sym::rustc_diagnostic_item,
         name: "rustc_diagnostic_item",
         // FIXME: This can be `true` once we always use `tcx.is_diagnostic_item`.
         // only_local: false,
@@ -571,7 +573,7 @@ pub const INERT_ATTRIBUTES: &[BuiltinAttribute] = &[
         // duplicates: ErrorFollowing,
         // gate: Gated(
             // Stability::Unstable,
-            // sym::rustc_attrs.clone(),
+            // sym::rustc_attrs,
             // "diagnostic items compiler internal support for linting",
             // cfg_fn!(rustc_attrs),
         // ),
@@ -665,10 +667,6 @@ pub const INERT_ATTRIBUTES: &[BuiltinAttribute] = &[
     rustc_attr!(TEST, rustc_layout, Normal, template!(List: "field1, field2, ..."), WarnFollowing),
     rustc_attr!(TEST, rustc_abi, Normal, template!(List: "field1, field2, ..."), WarnFollowing),
     rustc_attr!(TEST, rustc_regions, Normal, template!(Word), WarnFollowing),
-    rustc_attr!(
-        TEST, rustc_error, Normal,
-        template!(Word, List: "delayed_bug_from_inside_query"), WarnFollowingWordOnly
-    ),
     rustc_attr!(TEST, rustc_dump_user_args, Normal, template!(Word), WarnFollowing),
     rustc_attr!(TEST, rustc_evaluate_where_clauses, Normal, template!(Word), WarnFollowing),
     rustc_attr!(
@@ -695,7 +693,6 @@ pub const INERT_ATTRIBUTES: &[BuiltinAttribute] = &[
         template!(List: r#"cfg = "...", module = "...", kind = "...""#), DuplicatesOk,
     ),
     rustc_attr!(TEST, rustc_symbol_name, Normal, template!(Word), WarnFollowing),
-    rustc_attr!(TEST, rustc_polymorphize_error, Normal, template!(Word), WarnFollowing),
     rustc_attr!(TEST, rustc_def_path, Normal, template!(Word), WarnFollowing),
     rustc_attr!(TEST, rustc_mir, Normal, template!(List: "arg1, arg2, ..."), DuplicatesOk),
     gated!(

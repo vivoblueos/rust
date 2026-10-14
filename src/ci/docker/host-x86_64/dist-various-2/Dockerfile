@@ -27,9 +27,6 @@ RUN apt-get update && apt-get build-dep -y clang llvm && apt-get install -y --no
   g++-9-arm-linux-gnueabi \
   g++-11-riscv64-linux-gnu
 
-RUN apt-key adv --batch --yes --keyserver keyserver.ubuntu.com --recv-keys 74DA7924C5513486
-RUN add-apt-repository -y 'deb https://apt.dilos.org/dilos dilos2 main'
-
 ENV \
     AR_x86_64_unknown_fuchsia=x86_64-unknown-fuchsia-ar \
     CC_x86_64_unknown_fuchsia=x86_64-unknown-fuchsia-clang \
@@ -43,12 +40,6 @@ ENV \
     CXX_aarch64_unknown_fuchsia=aarch64-unknown-fuchsia-clang++ \
     CXXFLAGS_aarch64_unknown_fuchsia="--target=aarch64-unknown-fuchsia --sysroot=/usr/local/core-linux-amd64-fuchsia-sdk/arch/arm64/sysroot -I/usr/local/core-linux-amd64-fuchsia-sdk/pkg/fdio/include" \
     LDFLAGS_aarch64_unknown_fuchsia="--target=aarch64-unknown-fuchsia --sysroot=/usr/local/core-linux-amd64-fuchsia-sdk/arch/arm64/sysroot -L/usr/local/core-linux-amd64-fuchsia-sdk/arch/arm64/lib" \
-    AR_sparcv9_sun_solaris=sparcv9-sun-solaris2.10-ar \
-    CC_sparcv9_sun_solaris=sparcv9-sun-solaris2.10-gcc \
-    CXX_sparcv9_sun_solaris=sparcv9-sun-solaris2.10-g++ \
-    AR_x86_64_pc_solaris=x86_64-pc-solaris2.10-ar \
-    CC_x86_64_pc_solaris=x86_64-pc-solaris2.10-gcc \
-    CXX_x86_64_pc_solaris=x86_64-pc-solaris2.10-g++ \
     CC_armv7_unknown_linux_gnueabi=arm-linux-gnueabi-gcc-9 \
     CXX_armv7_unknown_linux_gnueabi=arm-linux-gnueabi-g++-9 \
     AR_x86_64_fortanix_unknown_sgx=ar \
@@ -65,11 +56,17 @@ ENV \
     CXX_i686_unknown_uefi=clang++-11 \
     CC_x86_64_unknown_uefi=clang-11 \
     CXX_x86_64_unknown_uefi=clang++-11 \
+    CC_wasm32_unknown_unknown=clang-11 \
+    CXX_wasm32_unknown_unknown=clang++-11 \
+    CC_wasm32v1_none=clang-11 \
+    CXX_wasm32v1_none=clang++-11 \
     CC=gcc-9 \
     CXX=g++-9
 
 WORKDIR /build
 COPY scripts/musl.sh /build
+COPY scripts/musl-cve-2026-6042.diff /build/
+COPY scripts/musl-cve-2026-40200.diff /build/
 RUN env \
     CC=arm-linux-gnueabi-gcc-9 CFLAGS="-march=armv7-a" \
     CXX=arm-linux-gnueabi-g++-9 CXXFLAGS="-march=armv7-a" \
@@ -84,15 +81,12 @@ WORKDIR /tmp
 COPY scripts/shared.sh /tmp/
 COPY scripts/build-fuchsia-toolchain.sh /tmp/
 RUN /tmp/build-fuchsia-toolchain.sh
-COPY host-x86_64/dist-various-2/build-solaris-toolchain.sh /tmp/
-RUN /tmp/build-solaris-toolchain.sh x86_64  amd64   solaris-i386  pc
-RUN /tmp/build-solaris-toolchain.sh sparcv9 sparcv9 solaris-sparc sun
 COPY host-x86_64/dist-various-2/build-x86_64-fortanix-unknown-sgx-toolchain.sh /tmp/
 RUN /tmp/build-x86_64-fortanix-unknown-sgx-toolchain.sh
 
-RUN curl -L https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-23/wasi-sdk-23.0-x86_64-linux.tar.gz | \
+RUN curl -L https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-30/wasi-sdk-30.0-x86_64-linux.tar.gz | \
   tar -xz
-ENV WASI_SDK_PATH=/tmp/wasi-sdk-23.0-x86_64-linux
+ENV WASI_SDK_PATH=/tmp/wasi-sdk-30.0-x86_64-linux
 
 COPY scripts/freebsd-toolchain.sh /tmp/
 RUN /tmp/freebsd-toolchain.sh i686
@@ -100,16 +94,14 @@ RUN /tmp/freebsd-toolchain.sh i686
 COPY scripts/sccache.sh /scripts/
 RUN sh /scripts/sccache.sh
 
-ENV CARGO_TARGET_X86_64_UNKNOWN_FUCHSIA_AR /usr/local/bin/llvm-ar
-ENV CARGO_TARGET_X86_64_UNKNOWN_FUCHSIA_RUSTFLAGS \
--C link-arg=--sysroot=/usr/local/core-linux-amd64-fuchsia-sdk/arch/x64/sysroot \
+ENV CARGO_TARGET_X86_64_UNKNOWN_FUCHSIA_AR="/usr/local/bin/llvm-ar"
+ENV CARGO_TARGET_X86_64_UNKNOWN_FUCHSIA_RUSTFLAGS="-C link-arg=--sysroot=/usr/local/core-linux-amd64-fuchsia-sdk/arch/x64/sysroot \
 -Lnative=/usr/local/core-linux-amd64-fuchsia-sdk/arch/x64/sysroot/lib \
--Lnative=/usr/local/core-linux-amd64-fuchsia-sdk/arch/x64/lib
-ENV CARGO_TARGET_AARCH64_UNKNOWN_FUCHSIA_AR /usr/local/bin/llvm-ar
-ENV CARGO_TARGET_AARCH64_UNKNOWN_FUCHSIA_RUSTFLAGS \
--C link-arg=--sysroot=/usr/local/core-linux-amd64-fuchsia-sdk/arch/arm64/sysroot \
+-Lnative=/usr/local/core-linux-amd64-fuchsia-sdk/arch/x64/lib"
+ENV CARGO_TARGET_AARCH64_UNKNOWN_FUCHSIA_AR="/usr/local/bin/llvm-ar"
+ENV CARGO_TARGET_AARCH64_UNKNOWN_FUCHSIA_RUSTFLAGS="-C link-arg=--sysroot=/usr/local/core-linux-amd64-fuchsia-sdk/arch/arm64/sysroot \
 -Lnative=/usr/local/core-linux-amd64-fuchsia-sdk/arch/arm64/sysroot/lib \
--Lnative=/usr/local/core-linux-amd64-fuchsia-sdk/arch/arm64/lib
+-Lnative=/usr/local/core-linux-amd64-fuchsia-sdk/arch/arm64/lib"
 
 ENV TARGETS=x86_64-unknown-fuchsia
 ENV TARGETS=$TARGETS,aarch64-unknown-fuchsia
@@ -118,8 +110,6 @@ ENV TARGETS=$TARGETS,wasm32-wasip1
 ENV TARGETS=$TARGETS,wasm32-wasip1-threads
 ENV TARGETS=$TARGETS,wasm32-wasip2
 ENV TARGETS=$TARGETS,wasm32v1-none
-ENV TARGETS=$TARGETS,sparcv9-sun-solaris
-ENV TARGETS=$TARGETS,x86_64-pc-solaris
 ENV TARGETS=$TARGETS,x86_64-unknown-linux-gnux32
 ENV TARGETS=$TARGETS,x86_64-fortanix-unknown-sgx
 ENV TARGETS=$TARGETS,nvptx64-nvidia-cuda
@@ -132,6 +122,10 @@ ENV TARGETS=$TARGETS,i686-unknown-uefi
 ENV TARGETS=$TARGETS,x86_64-unknown-uefi
 ENV TARGETS=$TARGETS,riscv64gc-unknown-linux-musl
 
+ENV TARGETS_SANITIZERS=x86_64-unknown-linux-gnuasan
+ENV TARGETS_SANITIZERS=$TARGETS_SANITIZERS,x86_64-unknown-linux-gnumsan
+ENV TARGETS_SANITIZERS=$TARGETS_SANITIZERS,x86_64-unknown-linux-gnutsan
+
 # As per https://bugs.launchpad.net/ubuntu/+source/gcc-defaults/+bug/1300211
 # we need asm in the search path for gcc-9 (for gnux32) but not in the search path of the
 # cross compilers.
@@ -141,8 +135,8 @@ RUN ln -s /usr/include/x86_64-linux-gnu/asm /usr/local/include/asm
 # musl-gcc can't find libgcc_s.so.1 since it doesn't use the standard search paths.
 RUN ln -s /usr/riscv64-linux-gnu/lib/libgcc_s.so.1 /usr/lib/gcc-cross/riscv64-linux-gnu/11/
 
-ENV RUST_CONFIGURE_ARGS --enable-extended --enable-lld --enable-llvm-bitcode-linker --disable-docs \
+ENV RUST_CONFIGURE_ARGS="--enable-extended --enable-lld --enable-llvm-bitcode-linker --disable-docs \
   --musl-root-armv7=/musl-armv7 \
-  --musl-root-riscv64gc=/musl-riscv64gc
+  --musl-root-riscv64gc=/musl-riscv64gc"
 
-ENV SCRIPT python3 ../x.py dist --host='' --target $TARGETS
+ENV SCRIPT="python3 ../x.py dist --host= --target $TARGETS && python3 ../x.py dist --host= --set build.sanitizers=true --target $TARGETS_SANITIZERS"

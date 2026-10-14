@@ -1,6 +1,6 @@
-use std::path::PathBuf;
+use camino::Utf8PathBuf;
 
-use super::{AllowUnused, Emit, LinkToAux, ProcRes, TargetLocation, TestCx};
+use crate::runtest::{AllowUnused, CompilerKind, Emit, LinkToAux, ProcRes, TargetLocation, TestCx};
 
 impl TestCx<'_> {
     pub(super) fn run_assembly_test(&self) {
@@ -19,7 +19,7 @@ impl TestCx<'_> {
         }
     }
 
-    fn compile_test_and_save_assembly(&self) -> (ProcRes, PathBuf) {
+    fn compile_test_and_save_assembly(&self) -> (ProcRes, Utf8PathBuf) {
         // This works with both `--emit asm` (as default output name for the assembly)
         // and `ptx-linker` because the latter can write output at requested location.
         let output_path = self.output_base_name().with_extension("s");
@@ -35,6 +35,7 @@ impl TestCx<'_> {
         };
 
         let rustc = self.make_compile_args(
+            CompilerKind::Rustc,
             input_file,
             TargetLocation::ThisFile(output_path.clone()),
             emit,
@@ -43,7 +44,7 @@ impl TestCx<'_> {
             Vec::new(),
         );
 
-        let proc_res = self.compose_and_run_compiler(rustc, None, self.testpaths);
+        let proc_res = self.compose_and_run_compiler(rustc, None);
         (proc_res, output_path)
     }
 }
